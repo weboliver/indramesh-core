@@ -1,0 +1,67 @@
+# nginx-validate-pod.yaml — committed, disposable in-cluster `nginx -t`
+# validation Pod manifest (IMG-03, D-07). Rendered by scripts/k8s/rebuild.sh
+# (the __TAG__ placeholder is sed-replaced with the freshly built/imported
+# nginx tag into a private TMP_DIR copy before `kubectl apply`) and deleted
+# by an unconditional trap on every exit. Never applied directly — always
+# through the sed-rendered copy.
+#
+# Mirrors deploy/helm/indramesh/templates/nginx-deployment.yaml's mounts and
+# the shared restricted securityContext (indramesh.restrictedSecurityContext
+# in _helpers.tpl) so the validation Pod passes the indramesh namespace's
+# restricted Pod Security Admission and validates against the SAME mount
+# shape the real Deployment renders — except the ConfigMap it mounts is the
+# disposable indramesh-nginx-validate copy rebuild.sh creates from the checked-in
+# nginx.conf right before applying this Pod (D-07), and the Secret is the
+# cert-manager-owned leaf indramesh-local-tls (D-03) so validation exercises the
+# exact TLS material Helm is about to deploy.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: indramesh-nginx-validate
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/name: indramesh-nginx-validate
+spec:
+  restartPolicy: Never
+  containers:
+    - name: nginx-validate
+      image: "indramesh-nginx:__TAG__"
+      imagePullPolicy: Never
+      command: ["nginx", "-t"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: nginx-conf
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+          readOnly: true
+        - name: nginx-certs
+          mountPath: /etc/nginx/certs
+          readOnly: true
+        - name: nginx-cache
+          mountPath: /var/cache/nginx
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: nginx-conf
+      configMap:
+        name: indramesh-nginx-validate
+    - name: nginx-certs
+      secret:
+        secretName: indramesh-local-tls
+        items:
+          - key: tls.crt
+            path: server.crt
+          - key: tls.key
+            path: server.key
+    - name: nginx-cache
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}

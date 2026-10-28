@@ -1,0 +1,31 @@
+{{- /*
+ingressroutetcp.yaml — the k3s Traefik IngressRouteTCP front door (D-04,
+NET-01). Rendered ONLY when apps.enabled AND apps.nginx.enabled are both
+true (decision 2 — the routing object references the nginx Service, which
+exists only under that gate). TLS passthrough to nginx:8443 keeps nginx the
+sole TLS terminator (D-01). Exactly ONE route, HostSNI(`*`) on websecure:
+the stack answers https://localhost and the host's IP address, and a client
+that connects by IP sends no SNI (RFC 6066), so no narrower match can serve
+it. No fallback service (T-259-01); nginx itself accepts any server name.
+*/ -}}
+{{- if and .Values.apps.enabled .Values.apps.nginx.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: indramesh-https
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: HostSNI(`*`)
+      services:
+        - name: nginx
+          port: 8443
+  tls:
+    passthrough: true
+{{- end }}

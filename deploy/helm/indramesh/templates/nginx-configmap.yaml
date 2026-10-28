@@ -1,0 +1,47 @@
+{{- /*
+nginx-configmap.yaml — the ConfigMap embedding the checked-in k8s nginx.conf
+variant (D-02) for the k3s release (IMG-01). Rendered ONLY when apps.enabled
+AND apps.nginx.enabled are both true. The chart never bakes nginx.conf into an
+image — deploy/helm/indramesh/nginx.conf (the single source of truth for this
+ConfigMap) is embedded verbatim via .Files.Get so a config change is a chart
+change, not an image rebuild.
+*/ -}}
+{{- if and .Values.apps.enabled .Values.apps.nginx.enabled }}
+{{- /*
+Phase 311.1 (D-06, the chart half of the component switches). nginx resolves a
+literal proxy_pass target at STARTUP: a name whose Service does not exist is
+fatal (`[emerg] host not found in upstream …`) and nginx never comes up. Two of
+nginx.conf's targets belong to OPTIONAL components — the monitoring stack's
+Grafana and Headlamp — so a lean run (MONITORING_ENABLED=false /
+HEADLAMP_ENABLED=false, the quickstart default) would otherwise render a config
+that can never boot, and the UI would stay empty. Each switched-off component's
+proxy_pass is therefore neutralised to `return 404;` (the location answers for
+itself; no component is referenced, no upstream is resolved). The `replace`
+mechanism is the one this template already uses for the development CSP token,
+and the carefully tuned URI semantics of the untouched switches stay byte-identical.
+*/ -}}
+{{- $conf := .Files.Get "nginx.conf" -}}
+{{- if not (.Values.monitoring.enabled | default false) -}}
+{{- $conf = $conf | replace "proxy_pass http://kube-prometheus-stack-grafana.monitoring.svc.cluster.local;" "return 404;" -}}
+{{- end -}}
+{{- if not (.Values.headlamp.enabled | default false) -}}
+{{- $conf = $conf | replace "proxy_pass http://headlamp:4466;" "return 404;" -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: indramesh-nginx-config
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+data:
+  nginx.conf: |
+{{- if eq (.Values.apps.environment | default "production") "development" }}
+{{ $conf | replace "script-src 'self' 'sha256-v0eyc3ElBkHCqhoUgmd/A7DpL4b64kE4k98h3h3HSjE=' blob:;" "script-src 'self' 'unsafe-inline' blob:;" | indent 4 }}
+{{- else }}
+{{ $conf | indent 4 }}
+{{- end }}
+{{- end }}

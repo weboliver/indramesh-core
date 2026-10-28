@@ -1,0 +1,28 @@
+# Public .gitignore for the Core repository (overlay file, D-07).
+# The develop variant additionally ignores internal planning and agent tooling
+# (.planning/, .gsd/, .claude/, .opencode/, /graphify-out/, .kube, milestone.lock);
+# those entries make no sense in a public checkout and are dropped here.
+#
+# A cloned plugin directory must stay untracked: only the example plugin ships with Core.
+.env
+nginx/certs/
+*.pyc
+__pycache__/
+node_modules/
+dist/
+*.log
+_setup_user.pwd
+.venv/
+.gitgub/
+.superpowers/
+.playwright-mcp/
+.pytest_cache/
+.coverage
+.coverage.*
+.vscode/
+/logs/
+.tmp
+.cache
+
+/plugins/*
+!/plugins/example/

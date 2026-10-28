@@ -1,0 +1,732 @@
+# Pinned Compose project name (Phase 266, D-06) — the project name is fixed to `indramesh`
+# rather than derived from the checkout directory's basename, so a clone under any directory
+# name lands in the same project and stays in step with the `com.docker.compose.project=indramesh`
+# filter the bundled Alloy log collector applies (observability/alloy/base-docker.alloy).
+# Compose resolves the project name as: CLI `-p` > $COMPOSE_PROJECT_NAME env var > this `name:`
+# field > directory basename — so a leftover `COMPOSE_PROJECT_NAME` in your shell or root
+# `.env` outranks this pin and silently renames the project away from `indramesh`. If the project
+# name ever looks wrong, `unset COMPOSE_PROJECT_NAME` and check your `.env` first.
+name: indramesh
+
+# ============================================================================
+# Phase 301 (LOGINFRA-05, D-06): uniform json-file rotation and the
+# com.indramesh.env Docker label for EVERY service, including third-party
+# images. Anchors are defined here so every service can reference them via
+# `logging: *default_logging` / `labels: *log_labels`.
+# NOTE: json-file limits only apply when a container is (re)created — existing
+# containers keep their old logging config (Pitfall 6). The orchestrator
+# recreates the services from the main checkout.
+# ============================================================================
+x-logging: &default_logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-log-labels: &log_labels
+  com.indramesh.env: ${ENVIRONMENT:-development}
+
+# Every service that runs the backend image (backend, worker, storage, cutover)
+# builds it from this one definition, without an `image:` name, so Compose tags
+# each per project and service (`indramesh-backend`, `indramesh-worker`, ...).
+# The builds share the layer cache; only the first one does real work.
+x-backend-build: &backend_build
+  context: ./backend
+  dockerfile: Dockerfile
+  args:
+    APP_UID: ${LOCAL_UID:-1001}
+    APP_GID: ${LOCAL_GID:-1001}
+
+services:
+  postgres:
+    # Pinned 2026-08-07: postgres:18.4-alpine (current stable major, single hop 15→18). Data migrated via dump/restore (app + jira databases) — NEW volume postgres18_data mounted at /var/lib/postgresql (PG18 pg_ctlcluster-compatible layout, docker-library/postgres#1259); old postgres_data untouched as rollback.
+    #
+    # Phase 312.1 (D-10/D-11/D-12, PGAGE-01/PGAGE-02): the service builds the own
+    # wrapper image — Apache AGE 1.8.0 + pgvector v0.8.7 compiled onto the same
+    # postgres:18.4-alpine base (musl + major 18, so the existing data directory is
+    # reused exactly as it is: no dump, no restore, no collation change) — and runs
+    # it on a content-version tag, the same build-plus-image convention the
+    # backend and worker services use. The image bakes the two restart-time
+    # server settings (shared_preload_libraries='age', wal_level=logical) and
+    # applies them itself; no `command:` and no `args:` exists for them here (D-12).
+    build:
+      context: ./deploy/k8s-images/stateful/postgres
+      dockerfile: Dockerfile
+    image: indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7
+    logging: *default_logging
+    labels: *log_labels
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${DB_USER:?set DB_USER in .env (POSTGRES_* was replaced by DB_*)}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (POSTGRES_* was replaced by DB_*)}
+      POSTGRES_DB: ${DB_NAME:?set DB_NAME in .env (POSTGRES_* was replaced by DB_*)}
+    volumes:
+      - postgres18_data:/var/lib/postgresql
+    ports:
+      # Phase 311 (D-13): data and application ports are published on the host
+      # loopback only. nginx is the sole externally reachable entry point.
+      - "127.0.0.1:${DB_PORT:-5434}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:?set DB_USER in .env (POSTGRES_* was replaced by DB_*)}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  valkey:
+    # Pinned 2026-08-07: Valkey 9.1.1 (BSD-licensed fork of Redis, avoids Redis 8 AGPLv3).
+    # Phase 312.1 (D-15/D-17): the service, volume and variables are named after the server;
+    # the valkey_data volume starts EMPTY by design — the cache and the queue are derived
+    # state, so the old volume was removed by hand and nothing is carried over.
+    # Do NOT revert to redis:7-alpine.
+    image: valkey/valkey:9.1.1-alpine
+    logging: *default_logging
+    labels: *log_labels
+    command: ["valkey-server", "--requirepass", "${VALKEY_PASSWORD:?set VALKEY_PASSWORD in .env (see .env.example)}"]
+    environment:
+      - VALKEY_PASSWORD=${VALKEY_PASSWORD:?set VALKEY_PASSWORD in .env (see .env.example)}
+    ports:
+      - "127.0.0.1:${VALKEY_PORT:-6379}:6379"
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      # `$$` keeps Compose's own interpolation out of the test string, so the credential
+      # stays out of the rendered healthcheck spec and the check fails closed: the explicit
+      # `ping` argument is what makes an AUTH failure exit non-zero, and `grep -q PONG`
+      # keeps every non-PONG answer (NOAUTH, connection refused) failing.
+      test: ["CMD-SHELL", "valkey-cli -a \"$${VALKEY_PASSWORD}\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: *backend_build
+    volumes:
+      - import_uploads:/data/imports
+      - export_files:/tmp/exports
+      - import_folders:/tmp/imports
+      - ./plugins:/opt/indramesh/plugins:ro
+    env_file:
+      - .env
+    environment:
+      # Phase 255 (D-12): explicit compose-mode signal — same strict resolver
+      # contract as the backend service.
+      - INDRAMESH_RUNTIME_MODE=compose
+      # Phase 275 (D-06/D-10): explicit root-mode propagation so shell-selected
+      # values are not masked by env_file contents. The worker stays a direct
+      # ARQ process in every mode; only the backend Uvicorn invocation branches.
+      - ENVIRONMENT=${ENVIRONMENT}
+      # Phase 298 (D-15/D-18): explicit LOG_FORMAT propagation (like
+      # ENVIRONMENT) so a shell-selected value is not masked by env_file. Empty
+      # means console under ENVIRONMENT=development and json under production.
+      - LOG_FORMAT=${LOG_FORMAT:-}
+      # Phase 299 (D-17/LVL-01): the env level basis every process that calls
+      # configure_logging reads. Deliberately empty by default — a missing/empty
+      # value preserves the Foundation noisy defaults; there is NO INFO default
+      # that would break D-17. Overrides at runtime go through the API, not here.
+      - LOG_LEVEL=${LOG_LEVEL:-}
+      - LOG_LEVELS=${LOG_LEVELS:-}
+      # Phase 300 (D-12/TLOG-05): task-log cap per task and retention window in
+      # days. Explicit propagation (not masked by env_file); defaults match the
+      # code defaults in TaskLogConfig.
+      - TASK_LOG_MAX_LINES=${TASK_LOG_MAX_LINES:-10000}
+      - TASK_LOG_RETENTION_DAYS=${TASK_LOG_RETENTION_DAYS:-30}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      # Phase 312.1 (D-15/D-16): the URL scheme stays `redis://` — it names the wire
+      # protocol, not the service; only service, host and variable names changed.
+      - VALKEY_URL=redis://:${VALKEY_PASSWORD}@valkey:6379/0
+      - OPENSEARCH_URL=${OPENSEARCH_URL}
+      # The Jira connection URL left the base file with the jira service — it is a Jira
+      # consumer, not a Core consumer; docker-compose.jira.yml supplies it.
+      - IMPORT_UPLOAD_DIR=/data/imports
+      - EXPORT_ROOT=/tmp/exports
+      - IMPORT_ROOT=/tmp/imports
+      - STORAGE_SERVICE_URL=http://storage:8001
+      - STORAGE_BUCKET=indramesh
+      - INDRAMESH_PLUGINS_DIR=/opt/indramesh/plugins
+    # Phase 298 (D-18): arq's incremental log dict replaces its plaintext
+    # handler setup; the option stays appended so the existing entrypoint
+    # substring (bootstrap test) is preserved.
+    entrypoint: ["arq", "app.worker_entry.WorkerSettings", "--custom-log-dict", "app.logging.arq.LOG_DICT"]
+    logging: *default_logging
+    labels: *log_labels
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - default
+      - storage_internal
+
+  storage:
+    # Phase 278 (D-01/D-02/D-06): self-developed filesystem-backed storage
+    # service sharing the backend image; reachable ONLY by backend/worker via
+    # the storage_internal network (SC-01) — no host port, mirrors worker.
+    build: *backend_build
+    # No entrypoint/user override — runs as the image's default appuser, like worker.
+    # Phase 298 (D-18): --no-access-log keeps Uvicorn's plaintext access log
+    # off; the central layer emits the structured access record.
+    command: ["uvicorn", "app.storage_service.main:app", "--host", "0.0.0.0", "--port", "8001", "--no-access-log"]
+    logging: *default_logging
+    labels: *log_labels
+    volumes:
+      - storage_data:/data/storage
+    environment:
+      # Phase 298 (D-15): storage has no env_file, so ENVIRONMENT and LOG_FORMAT
+      # are declared explicitly — without ENVIRONMENT the service could not pick
+      # the production json default, and LOG_FORMAT lets an operator override.
+      - ENVIRONMENT=${ENVIRONMENT}
+      - LOG_FORMAT=${LOG_FORMAT:-}
+      # Phase 299 (D-17/LVL-01): the env level basis every process that calls
+      # configure_logging reads. Deliberately empty by default — a missing/empty
+      # value preserves the Foundation noisy defaults; there is NO INFO default
+      # that would break D-17. Overrides at runtime go through the API, not here.
+      - LOG_LEVEL=${LOG_LEVEL:-}
+      - LOG_LEVELS=${LOG_LEVELS:-}
+      - STORAGE_BLOB_ROOT=/data/storage
+      - STORAGE_BUCKET=indramesh
+    networks:
+      - storage_internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  opensearch:
+    # Phase 312.1 (D-01/D-03/D-04): the search backend, replacing the retired service.
+    # Base image pinned to opensearchproject/opensearch:3.9.0 (tag pin only — digest pinning
+    # stays FUTURE-02), built through the wrapper at
+    # deploy/k8s-images/stateful/opensearch/Dockerfile, whose group-readable security-plugin
+    # tools let the SAME image also serve an arbitrary-UID Kubernetes pod.
+    # The security plugin stays ON (D-01): on a fresh config directory the image's entrypoint
+    # installs the demo security configuration and REQUIRES OPENSEARCH_INITIAL_ADMIN_PASSWORD,
+    # whose rule (8-100 characters, upper+lower+digit+special, not similar to the user name)
+    # the installer's generated value satisfies (scripts/lib/secrets.sh). Transport TLS stays
+    # as the plugin requires. No `command:`/`args:` block: the entrypoint converts dotted
+    # environment variables into `-E` flags, which is how the HTTP-TLS override travels.
+    # No OpenSearch Dashboards service exists, not even behind a profile (D-04).
+    build:
+      context: ./deploy/k8s-images/stateful/opensearch
+      dockerfile: Dockerfile
+    image: indramesh-stateful-opensearch:3.9.0-r1
+    logging: *default_logging
+    labels: *log_labels
+    environment:
+      - discovery.type=single-node
+      # The demo configuration would force HTTPS on the REST listener; the internal listener
+      # is plain HTTP (loopback-published, Basic Auth enforced by the security plugin), so the
+      # backend/worker client never needs TLS parameters.
+      - plugins.security.ssl.http.enabled=false
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_PASSWORD:?set OPENSEARCH_PASSWORD in .env (see .env.example)}
+      # JVM heap for the single search node, unchanged from the service this replaces.
+      - "OPENSEARCH_JAVA_OPTS=-Xms1024m -Xmx2048m"
+      # Skips the performance-analyzer agent CLI the image would otherwise run at start.
+      - DISABLE_PERFORMANCE_ANALYZER_AGENT_CLI=true
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    ports:
+      # Phase 311 (D-13): loopback only, like every other stateful service; nginx remains
+      # the sole externally reachable entry point.
+      - "127.0.0.1:${OPENSEARCH_PORT:-9200}:9200"
+    healthcheck:
+      # Authenticated against the cluster health endpoint. The container shell expands its own
+      # variable (`$$` keeps Compose out of it) and the credential is quoted, so a password can
+      # never word-split or glob its way into a wrong argument (review 2026-10-18, M4).
+      test: ["CMD-SHELL", "curl -fsS -u \"admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD}\" 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=10s' || exit 1"]
+      start_period: 60s
+      interval: 15s
+      timeout: 15s
+      retries: 10
+
+  backend:
+    build: *backend_build
+    # Phase 235 (CR-01 fix): root here is transient — docker-entrypoint.sh chowns
+    # the frontend/locales bind mount to appuser, then drops privileges via
+    # setpriv before exec'ing `command` below. Only this service overrides
+    # entrypoint/user; worker keeps the image's default (non-root) appuser.
+    user: root
+    entrypoint: ["/app/docker-entrypoint.sh"]
+    command: ["./start.sh"]
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    environment:
+      # Phase 255 (D-12): explicit non-secret runtime signal — the strict
+      # resolver in app/services/runtime_mode.py fails closed on a missing
+      # INDRAMESH_RUNTIME_MODE, and Compose must declare the compose path.
+      - INDRAMESH_RUNTIME_MODE=compose
+      # Phase 275 (COMPOSE-PROD-01, D-07/D-08): explicit root-mode propagation
+      # (not masked by env_file); backend/start.sh selects the Uvicorn reload
+      # argument only for the exact production value, after migrations.
+      - ENVIRONMENT=${ENVIRONMENT}
+      # Phase 298 (D-15/D-18): explicit LOG_FORMAT propagation so an operator
+      # override in the shell/CI is not masked by env_file. Empty means console
+      # under ENVIRONMENT=development and json under production.
+      - LOG_FORMAT=${LOG_FORMAT:-}
+      # Phase 299 (D-17/LVL-01): the env level basis every process that calls
+      # configure_logging reads. Deliberately empty by default — a missing/empty
+      # value preserves the Foundation noisy defaults; there is NO INFO default
+      # that would break D-17. Overrides at runtime go through the API, not here.
+      - LOG_LEVEL=${LOG_LEVEL:-}
+      - LOG_LEVELS=${LOG_LEVELS:-}
+      # Phase 300 (D-12/TLOG-05): the worker runs the hourly retention purge, so
+      # it carries the same task-log cap/retention window as the backend.
+      - TASK_LOG_MAX_LINES=${TASK_LOG_MAX_LINES:-10000}
+      - TASK_LOG_RETENTION_DAYS=${TASK_LOG_RETENTION_DAYS:-30}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      # Phase 287.1 (PLUGDB-07, D-01/D-08): the optional plugin migration role
+      # credentials. Only `backend` runs start.sh — the sole caller of
+      # bootstrap_role and the plugin runner — so only it declares them here.
+      # Both empty is the documented weakened fallback; the role name defaults
+      # to indramesh_plugin when PLUGIN_DB_USER is empty. They never replace the
+      # privileged DB_* values above: runtime PluginContext.db() stays
+      # privileged (D-12). NOTE: `env_file: .env` still passes any value present
+      # in the root .env to every service that uses it, worker included; this
+      # block only pins the intended explicit surface for backend.
+      - PLUGIN_DB_USER=${PLUGIN_DB_USER}
+      - PLUGIN_DB_PASSWORD=${PLUGIN_DB_PASSWORD}
+      # Phase 312.1 (D-15/D-16): scheme unchanged (protocol name), names renamed.
+      - VALKEY_URL=redis://:${VALKEY_PASSWORD}@valkey:6379/0
+      - OPENSEARCH_URL=${OPENSEARCH_URL}
+      # Phase 311 (D-07/D-08/D-12): the two signing keys and the initial admin
+      # password are REQUIRED. Compose interpolates the whole file regardless of
+      # the active profiles, so each guard is a project-level assertion: a
+      # blanked or deleted key aborts the render and names the variable.
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env (see .env.example)}
+      - FERNET_KEY=${FERNET_KEY:?set FERNET_KEY in .env (see .env.example)}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env — used only at first admin creation (see .env.example)}
+      # The Jira connection URL left the base file with the jira service — it is a Jira
+      # consumer, not a Core consumer; docker-compose.jira.yml supplies it.
+      - STORAGE_SERVICE_URL=http://storage:8001
+      - STORAGE_BUCKET=indramesh
+      - NGINX_TRUSTED_IP=${NGINX_TRUSTED_IP:-172.28.0.10}
+      - DB_POOL_SIZE=10
+      - DB_MAX_OVERFLOW=20
+      - DB_POOL_RECYCLE=1800
+      - DB_POOL_PRE_PING=true
+      - IMPORT_UPLOAD_DIR=/data/imports
+      - EXPORT_ROOT=/tmp/exports
+      - IMPORT_ROOT=/tmp/imports
+      # Phase 235 / EXP-01: fixed dev-only export root for the systemui
+      # filesystem export — bind-mounted below, never a client-selected path.
+      - INDRAMESH_PLUGINS_DIR=/opt/indramesh/plugins
+      - UI_TRANSLATION_EXPORT_ROOT=/workspace/frontend-locales
+      # Phase 305 (LOGX-01/LOGX-03/LOGX-04): the Loki query base the
+      # log-explorer plugin reads at call time — a bare http(s) base, distinct
+      # from the Alloy push `LOKI_URL`. The inline default keeps the bundled
+      # Loki working over the `logging_query` network below; an operator
+      # pointing at an external Loki sets LOKI_QUERY_URL in the root .env
+      # before recreating the backend (an explicit `environment:` entry
+      # overrides `env_file`). LOG_EXPLORER_EXTERNAL_ONLY is the declared
+      # external-only switch (never inferred from unreachability); the Grafana
+      # pair enables the Explore deep link (empty = no link, D-13).
+      - LOKI_QUERY_URL=${LOKI_QUERY_URL:-http://loki:3100}
+      - LOG_EXPLORER_EXTERNAL_ONLY=${LOG_EXPLORER_EXTERNAL_ONLY:-false}
+      - GRAFANA_EXPLORE_URL=${GRAFANA_EXPLORE_URL:-}
+      - GRAFANA_LOKI_DATASOURCE=${GRAFANA_LOKI_DATASOURCE:-}
+    logging: *default_logging
+    labels: *log_labels
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    volumes:
+      - import_uploads:/data/imports
+      - export_files:/tmp/exports
+      - import_folders:/tmp/imports
+      - ./frontend/locales:/workspace/frontend-locales
+      - ./plugins:/opt/indramesh/plugins:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Phase 278 (D-06/SC-01): dual-homed — default keeps the existing reach to
+    # postgres/valkey/opensearch/jira and nginx; storage_internal is the new
+    # network the storage service lives on.
+    # Phase 305 (LOGX-01/Carry-01): logging_query is the bounded query path to
+    # loki:3100 — the backend must NOT join logging_internal (the read-only
+    # docker socket proxy and the raw log network live there).
+    networks:
+      - default
+      - storage_internal
+      - logging_query
+
+  # Phase 296 (CLEAN-05, D-10): the one-shot final-code cut-over path for the
+  # Compose stack. The old API/worker (and every external queue producer) must
+  # be stopped by the operator BEFORE this service runs; it then clears the ARQ
+  # queue, runs the Core migration, bootstraps the plugin DB role and purges the
+  # scoped caches, in that fixed fatal order. It is NOT part of the default dev
+  # stack (`maintenance` profile only), never runs the plugin runner, never
+  # calls `docker compose down` and never deletes a volume.
+  #
+  # Operator sequence for the one-way drop:
+  #   1. docker compose stop backend worker            # quiesce old producers
+  #   2. docker compose --profile maintenance run --rm cutover
+  #   3. docker compose up -d backend                  # final API/plugin ready
+  #   4. docker compose up -d worker                   # worker reads the same code
+  # Stop any non-Compose queue producer before step 2. After the destructive
+  # drop there is no rollback to old images — only forward correction.
+  cutover:
+    build: *backend_build
+    profiles:
+      - maintenance
+    logging: *default_logging
+    labels: *log_labels
+    env_file:
+      - .env
+    environment:
+      - INDRAMESH_RUNTIME_MODE=compose
+      - ENVIRONMENT=${ENVIRONMENT}
+      # Phase 298 (D-15/D-18): the one-shot cutover logs JSON structure like the
+      # other production containers; explicit propagation mirrors ENVIRONMENT.
+      - LOG_FORMAT=${LOG_FORMAT:-}
+      # Phase 299 (D-17/LVL-01): the env level basis every process that calls
+      # configure_logging reads. Deliberately empty by default — a missing/empty
+      # value preserves the Foundation noisy defaults; there is NO INFO default
+      # that would break D-17. Overrides at runtime go through the API, not here.
+      - LOG_LEVEL=${LOG_LEVEL:-}
+      - LOG_LEVELS=${LOG_LEVELS:-}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      # Phase 287.1 (PLUGDB-07): same optional plugin role credentials the
+      # backend declares — only the bootstrap step consumes them.
+      - PLUGIN_DB_USER=${PLUGIN_DB_USER}
+      - PLUGIN_DB_PASSWORD=${PLUGIN_DB_PASSWORD}
+      - VALKEY_URL=redis://:${VALKEY_PASSWORD}@valkey:6379/0
+      # Historical Alembic data migrations call app.crypto.init_fernet().
+      - FERNET_KEY=${FERNET_KEY}
+      - STORAGE_SERVICE_URL=http://storage:8001
+      - STORAGE_BUCKET=indramesh
+      - INDRAMESH_PLUGINS_DIR=/opt/indramesh/plugins
+    # Fatal ordered chain (`sh -ec` + `&&`): clear the queue, then the Core
+    # migration, then the plugin role bootstrap, then the scoped cache purge.
+    # The plugin runner is intentionally absent — it keeps its normal place in
+    # the backend start path.
+    command:
+      - sh
+      - -ec
+      - "python -m app.maintenance clear-queue && alembic upgrade head && python -m app.plugin_system.bootstrap_role && python -m app.maintenance purge-cache"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    # The dev overlay adds the same source mount as `backend` (docker-compose.dev.yml), so a dev
+    # one-shot runs the final code (revision 295 + app.maintenance), never a stale baked image;
+    # the production-shaped base file mounts no source and runs the built image. No host ports
+    # and no data-volume writes either way.
+    volumes:
+      - ./plugins:/opt/indramesh/plugins:ro
+    networks:
+      - default
+      - storage_internal
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Phase 275 (COMPOSE-PROD-02, D-01/D-03): an exact production build bakes
+        # the static bundle into /srv/frontend-dist (outside the /app bind mount
+        # the dev overlay adds).
+        #
+        # Phase 317.3 (D-03): the base file is the production-shaped quickstart a
+        # new user clones, so the value is the literal `production` and not the
+        # root ENVIRONMENT anymore. The develop overlay
+        # (`docker-compose.dev.yml`) is the only place that builds the
+        # development image back.
+        ENVIRONMENT: production
+    # Phase 311 (D-04): the frontend no longer consumes the shared root environment
+    # file — that handed it the JWT, Fernet and database secrets it never needs. It
+    # receives only the two explicit entries an image build/runtime selection requires.
+    environment:
+      # Phase 275 (D-04/D-05): the mode selects the container command (vite
+      # preview on port 5173 for exact production, vite dev otherwise).
+      # Phase 317.3 (D-03): pinned to production here for the same reason as the
+      # build arg — the base stack serves the built SPA and never the dev server;
+      # the develop overlay overrides both entries back to development.
+      - ENVIRONMENT=production
+      # Phase 272/K8SFIX-03: leitet die eine Root-.env-Variable (ENVIRONMENT)
+      # an Vite weiter, damit der Compose-Stack genauso production fahren kann
+      # wie k8s — kein fester Override auf development.
+      # Phase 317.3 (D-03): the base stack is production, matching the baked bundle.
+      - VITE_ENVIRONMENT=production
+    logging: *default_logging
+    labels: *log_labels
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-5173}:5173"
+
+  nginx:
+    # Pinned 2026-08-07: 1.30.x is the stable line (even minor); 1.31.x = mainline (odd minor) — INFRA-01. Do not bump to mainline.
+    image: nginx:1.30.6-alpine
+    ports:
+      # Non-standard defaults, deliberately: 8080 is already Jira's host port
+      # (line 39 above) and 80/443 are reserved for the k3s stack's
+      # indramesh-local-forward bridge (docs/DEPLOYMENT.md) — 8180/8443 avoid both.
+      - "${HTTP_PORT:-8180}:80"
+      - "${HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs
+      - ./nginx/docker-entrypoint.d/05-dev-cert.sh:/docker-entrypoint.d/05-dev-cert.sh:ro
+    environment:
+      - CERT_UID=${CERT_UID:-1000}
+      - CERT_GID=${CERT_GID:-1000}
+    logging: *default_logging
+    labels: *log_labels
+    networks:
+      default:
+        # Phase 311 (D-15): overridable through .env. The SAME variable feeds the
+        # backend's trusted-proxy list below, so the static address and the
+        # trusted-host check can never drift apart.
+        ipv4_address: ${NGINX_TRUSTED_IP:-172.28.0.10}
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+
+  # ==========================================================================
+  # Phase 301 (LOGINFRA-01/02, Carry-D3/D6/D7): log infrastructure.
+  # Phase 311 (D-16): optional through real Compose profiles — loki, alloy and
+  # docker-socket-proxy under [logging, observability]; grafana under
+  # `observability`. None of them is wired into backend/worker/frontend (D-09),
+  # so the app stack starts with every profile off.
+  # ==========================================================================
+  loki:
+    # Pinned 2026-10-06: grafana/loki:3.7.8 (current stable, TSDB v13 +
+    # structured metadata). No published host port and no nginx route.
+    image: grafana/loki:3.7.8
+    # Phase 311 (D-16): the log stack is optional through real profile names now;
+    # the former deploy-replicas off-switch is gone and profile activation
+    # replaces it. An interpolated EMPTY profile string must never be used
+    # instead — a service whose profile string is empty renders in the default
+    # set and then DISAPPEARS the moment any other profile is active (reproduced
+    # with Compose v5.5.0/v5.6.0), which would drop Loki exactly when Grafana
+    # needs it.
+    profiles:
+      - logging
+      - observability
+    logging: *default_logging
+    labels: *log_labels
+    command:
+      - -config.file=/etc/loki/loki-config.yaml
+      - -config.expand-env=true
+    environment:
+      - LOKI_RETENTION_PERIOD=${LOKI_RETENTION_PERIOD:-336h}
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    # T-301-02 / Pitfall 7 + Phase 305 (LOGX-01): dual-homed —
+    # logging_internal for the collector/socket-proxy side, logging_query for
+    # the bounded backend query path. Loki has no auth, so it must never be
+    # reachable from the shared default network; no published port, no nginx
+    # route (Carry-01).
+    networks:
+      - logging_internal
+      - logging_query
+    restart: unless-stopped
+
+  alloy:
+    # Pinned 2026-10-06: grafana/alloy:v1.20.1 (moby client v0.6.0).
+    image: grafana/alloy:v1.20.1
+    # Phase 311 (D-16): the whole log stack lives behind the same two profiles.
+    profiles:
+      - logging
+      - observability
+    logging: *default_logging
+    labels: *log_labels
+    # D-02/OQ1: Alloy has no native include. The entry file is a `cat` of the
+    # checked-in base fragment plus exactly one sink fragment selected by
+    # $ALLOY_SINK. `$$` is Compose-escaped so the container shell expands it.
+    # NOTE: alloy v1.20.1 takes the config path as a POSITIONAL argument; the
+    # old `--config.file` flag was removed (verified: `unknown flag`).
+    # The image ENTRYPOINT is `/bin/alloy`, so the shell must be declared as
+    # the entrypoint — a bare `command: [sh, -c, ...]` runs `alloy sh -c ...`
+    # and crash-loops with `unknown command "sh"` (found 2026-10-09 while
+    # starting the Phase 305 plan-end E2E stack).
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - "sed \"s/__INDRAMESH_COMPOSE_PROJECT__/$${ALLOY_COMPOSE_PROJECT:-indramesh}/g\" /etc/alloy/base-docker.alloy > /tmp/base.alloy && cat /tmp/base.alloy /etc/alloy/sinks/$${ALLOY_SINK:-loki}.alloy > /tmp/alloy.run.alloy && exec alloy run --server.http.listen-addr=0.0.0.0:12345 --storage.path=/var/lib/alloy /tmp/alloy.run.alloy"
+    environment:
+      - ALLOY_SINK=${ALLOY_SINK:-loki}
+      # Phase 318: the discovery label filter is built from the real Compose
+      # project name, so a renamed project still collects its own containers.
+      - ALLOY_COMPOSE_PROJECT=${COMPOSE_PROJECT_NAME:-indramesh}
+      - OTLP_ENDPOINT=${OTLP_ENDPOINT:-}
+      - OTLP_AUTHORIZATION=${OTLP_AUTHORIZATION:-}
+      # false = TLS (shared documented default, mirrored in Plan 02/04).
+      - OTLP_TLS_INSECURE=${OTLP_TLS_INSECURE:-false}
+      - LOKI_URL=${LOKI_URL:-http://loki:3100/loki/api/v1/push}
+    volumes:
+      - ./observability/alloy:/etc/alloy:ro
+      - alloy_data:/var/lib/alloy
+    # Dual-homed: logging_internal reaches the read-only socket proxy; default
+    # provides egress for an external OTLP target (Plan 02/04).
+    networks:
+      - default
+      - logging_internal
+    # Phase 311 (D-16): Alloy reads the daemon through the socket proxy, so the
+    # edge is declared — with `required: false`, mandatory because the target is
+    # profile-gated: without it Compose refuses the whole project whenever the
+    # profile is off (`service "alloy" depends on undefined service
+    # "docker-socket-proxy": invalid compose project`).
+    depends_on:
+      docker-socket-proxy:
+        condition: service_started
+        required: false
+    restart: unless-stopped
+
+  docker-socket-proxy:
+    # Pinned 2026-10-06 (tag corrected 2026-10-09: upstream releases use the "v" prefix): ghcr.io/tecnativa/docker-socket-proxy:v0.5.0.
+    # The bare ":0.5.0" tag does not exist on ghcr.io and made `docker compose up` fail.
+    # Carry-D6 / T-301-01: Alloy never mounts the raw docker socket. Every API
+    # section is set EXPLICITLY — no section may inherit an image default
+    # (EVENTS and VERSION are granted by default upstream). CONTAINERS=1,
+    # NETWORKS=1 and PING=1 are read-only (GET/HEAD) and required: discovery
+    # calls GET /networks unconditionally, and the moby client negotiates the
+    # API version via /_ping (Docker 29.7.2 caps at API 1.55). POST=0 makes the
+    # whole surface read-only by construction.
+    image: ghcr.io/tecnativa/docker-socket-proxy:v0.5.0
+    # Phase 311 (D-16): the raw-socket surface is profile-gated too — absent from
+    # the default render.
+    profiles:
+      - logging
+      - observability
+    logging: *default_logging
+    labels: *log_labels
+    environment:
+      - CONTAINERS=1
+      - NETWORKS=1
+      - PING=1
+      - POST=0
+      - EVENTS=0
+      - VERSION=0
+      - AUTH=0
+      - SECRETS=0
+      - BUILD=0
+      - COMMIT=0
+      - CONFIGS=0
+      - DISTRIBUTION=0
+      - EXEC=0
+      - GRPC=0
+      - IMAGES=0
+      - INFO=0
+      - NODES=0
+      - PLUGINS=0
+      - SERVICES=0
+      - SESSION=0
+      - SWARM=0
+      - SYSTEM=0
+      - TASKS=0
+      - VOLUMES=0
+      - ALLOW_START=0
+      - ALLOW_STOP=0
+      - ALLOW_RESTARTS=0
+      - ALLOW_PAUSE=0
+      - ALLOW_UNPAUSE=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # T-301-01: internal network only; never on default.
+    networks:
+      - logging_internal
+    restart: unless-stopped
+
+  grafana:
+    # Pinned 2026-10-06: grafana/grafana:13.2.3 (Compose-only; the k8s stack
+    # reuses kube-prometheus-stack's Grafana via additionalDataSources).
+    image: grafana/grafana:13.2.3
+    logging: *default_logging
+    labels: *log_labels
+    # D-07: only with the observability profile, and only bound to the host
+    # loopback. No nginx route in Compose — a static upstream would 502 while
+    # the profile is off (Pitfall 8). Image-default admin/admin credentials are
+    # acceptable here solely because of the loopback binding (documented in
+    # docs/LOGGING-INFRASTRUCTURE.md, Plan 02).
+    profiles:
+      - observability
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    # Dual-homed: logging_internal reaches loki:3100 (the provisioned
+    # datasource URL); default keeps it out of the log network otherwise.
+    networks:
+      - default
+      - logging_internal
+    # Phase 311 (D-16): the provisioned datasource points at loki:3100, so the
+    # ordering edge is declared — with `required: false`, mandatory because loki
+    # is profile-gated (see the alloy note above).
+    depends_on:
+      loki:
+        condition: service_started
+        required: false
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        # Phase 311 (D-15): overridable through .env (a "Pool overlaps with other
+        # one on this address space" error is answered by changing COMPOSE_SUBNET).
+        - subnet: ${COMPOSE_SUBNET:-172.28.0.0/16}
+  # Phase 278 (T-278-01-02/SC-01): internal-only network for the storage
+  # service — `internal: true` means no external routing; only services
+  # explicitly dual-homed onto it (backend, worker) can resolve/route to
+  # `storage`. frontend and nginx stay default-only.
+  storage_internal:
+    internal: true
+  # Phase 301 (T-301-02/Pitfall 7): internal-only network for the log stack.
+  # `internal: true` mirrors storage_internal — no external routing. Loki and
+  # docker-socket-proxy live ONLY here; alloy and grafana are dual-homed.
+  logging_internal:
+    internal: true
+  # Phase 305 (LOGX-01/Carry-01): internal-only query network. Loki is
+  # dual-homed onto it and the backend reaches loki:3100 only here — it never
+  # joins logging_internal, so the read-only docker socket proxy stays
+  # unreachable from the backend. No published port, no nginx route.
+  logging_query:
+    internal: true
+
+volumes:
+  # postgres_data (PG15) was declared but mounted by nothing — `docker compose config` already
+  # dropped it from the render, and removing the declaration cannot touch an existing local
+  # volume. jira_data lives in docker-compose.jira.yml now.
+  postgres18_data:
+  valkey_data:
+  opensearch_data:
+  import_uploads:
+  export_files:
+  import_folders:
+  storage_data:
+  loki_data:
+  alloy_data:
+  grafana_data:

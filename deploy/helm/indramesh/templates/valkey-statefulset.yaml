@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: valkey
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: valkey
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: valkey
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  serviceName: valkey
+  replicas: 1
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: valkey
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: valkey
+    spec:
+      # D-06 boundary relaxation (user-approved): pod-level fsGroup grants the
+      # wrapper UID 999 group ownership on the local-path PVC. OnRootMismatch
+      # avoids rescanning the whole volume when ownership already matches. The
+      # container-level restricted helper stays unchanged (runAsNonRoot, no
+      # escalation, read-only root).
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: valkey
+          image: "{{ .Values.valkey.image.repository }}:{{ .Values.valkey.image.tag }}"
+          imagePullPolicy: {{ .Values.valkey.image.pullPolicy }}
+          command: ["valkey-server", "--requirepass", "$(VALKEY_PASSWORD)"]
+          ports:
+            - name: valkey
+              containerPort: 6379
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-valkey
+                  key: VALKEY_PASSWORD
+          resources:
+            {{- toYaml .Values.valkey.resources | nindent 12 }}
+          startupProbe:
+            exec:
+              command: ["sh", "-ec", "valkey-cli -a \"${VALKEY_PASSWORD}\" ping"]
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["sh", "-ec", "valkey-cli -a \"${VALKEY_PASSWORD}\" ping"]
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["sh", "-ec", "valkey-cli -a \"${VALKEY_PASSWORD}\" ping"]
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: {{ toYaml .Values.valkey.persistence.accessModes | nindent 10 }}
+        storageClassName: {{ .Values.valkey.persistence.storageClassName }}
+        resources:
+          requests:
+            storage: {{ .Values.valkey.persistence.storage }}

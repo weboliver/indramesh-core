@@ -1,0 +1,3 @@
+# Optional pip dependencies for future entry-point-discovered plugins.
+# Keep this file comment-only until an entry-point plugin requires a dependency.
+# The directory-scan example plugin does not use this installation path.

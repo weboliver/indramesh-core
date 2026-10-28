@@ -1,0 +1,88 @@
+# monitoring-values.yaml — checked-in, non-secret kube-prometheus-stack values for
+# the Phase 261 monitoring install (MON-01..03; D-03, D-05, D-08; T-261-SC,
+# T-254-02). Consumed by scripts/k8s/lib/monitoring.sh as `helm upgrade --install
+# --values`. Pinned chart: kube-prometheus-stack 88.6.2 (KUBE_PROMETHEUS_STACK_VERSION
+# in versions.env) — every trim key below re-verified against the pinned chart's own
+# values.yaml at execution (open question 1: 88.6.2 kept, the research-verified pin).
+#
+# k3s trim (D-03): the embedded k3s control plane has no separate metric endpoints,
+# so the control-plane scrapers are disabled. Chart defaults are the OPPOSITE —
+# alertmanager.enabled: true, kubeEtcd/kubeScheduler/kubeControllerManager/kubeProxy
+# each enabled: true — every one of these must be flipped off for MON-01.
+kubeEtcd: { enabled: false }
+kubeScheduler: { enabled: false }
+kubeControllerManager: { enabled: false }
+kubeProxy: { enabled: false }
+alertmanager: { enabled: false }
+defaultRules:
+  rules:
+    etcd: false
+    kubeScheduler: false
+    kubeProxy: false
+    kubeControllerManager: false
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    retention: 7d
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { cpu: 500m, memory: 1Gi }
+    # Option A (Pattern 3, Pitfall 1): select ALL ServiceMonitors across
+    # namespaces so the Plan-03 indramesh-chart ServiceMonitor (indramesh namespace,
+    # no release: label) is discoverable. The chart default
+    # serviceMonitorSelectorNilUsesHelmValues: true only matches ServiceMonitors
+    # labelled release: kube-prometheus-stack in the current namespace.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelector: {}
+    serviceMonitorNamespaceSelector: {}
+# WSL2 fix (live-verified 2026-09-03): node-exporter's hostPath / -> /host/root
+# mount fails on WSL2 ("path / is mounted on / but it is not a shared or slave
+# mount" — no mount propagation on the WSL2 root fs). Disabling hostRootFsMount
+# drops the root mount and the --path.rootfs/--path.udev.data args. Irrelevant
+# for our dashboards (kubelet/kube-state-metrics sources only, D-04).
+prometheus-node-exporter:
+  hostRootFsMount:
+    enabled: false
+grafana:
+  # Raised 2026-09-03 (live 502s, Phase 261 D-05 caps too tight in practice):
+  # kubectl top showed the grafana container pinned at its 200m CPU limit
+  # (throttled) with memory at 470Mi/512Mi (near its ceiling too), causing
+  # intermittent readiness/liveness probe timeouts ("context deadline
+  # exceeded" / 503) -> the Service briefly had no ready endpoint -> nginx
+  # 502. Confirmed live: this got materially worse once both the Compose dev
+  # stack and the k3s stack started running simultaneously (the port-collision
+  # fix earlier this session made that the normal case, not an exception) —
+  # matches the WSL2 RAM-budget risk the Phase 261 research already flagged
+  # (Pitfall 7) but under-provisioned for.
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 768Mi }
+  # Phase 301 (LOGINFRA-03, D-11): the existing kube-prometheus-stack Grafana
+  # gains the Loki datasource — no second Grafana is installed in k8s. The
+  # datasource targets the in-cluster Loki Service installed by loki.sh
+  # (http://loki.monitoring.svc.cluster.local:3100). provision_monitoring_stack
+  # re-applies this file with --reset-values on every installer run, so the
+  # datasource converges with the chart. Non-secret (T-254-02): no credential
+  # or password keys here — the Loki endpoint is unauthenticated by design and
+  # reachable only from the monitoring namespace (D-12 networkPolicy).
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      access: proxy
+      url: http://loki.monitoring.svc.cluster.local:3100
+      uid: indramesh-loki
+      isDefault: false
+      editable: false
+  grafana.ini:
+    server:
+      domain: localhost
+      root_url: https://localhost/grafana/
+      serve_from_sub_path: true
+    # Grafana 13 background plugin installer (live-verified 2026-09-03): the
+    # default preinstall list hits grafana.com on every start; on this host the
+    # egress to grafana.com times out and the installer's churn OOM-kills the
+    # container at the 256Mi cap. preinstall_disabled stops the background
+    # installer entirely; memory limit raised to 512Mi for headroom.
+    plugins:
+      preinstall_disabled: true
+      preinstall_auto_update: false

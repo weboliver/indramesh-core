@@ -1,0 +1,13 @@
+# Phase 301 (D-07): Grafana Loki datasource, provisioned by the Compose Grafana.
+# The url resolves on the internal logging_internal network. The uid is pinned
+# so the starter dashboard's panels can reference it stably.
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    uid: indramesh-loki
+    isDefault: false
+    editable: false

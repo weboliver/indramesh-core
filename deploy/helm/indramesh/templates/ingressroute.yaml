@@ -1,0 +1,31 @@
+{{- /*
+ingressroute.yaml — the http→https redirect IngressRoute (D-06, NET-01).
+Rendered ONLY when apps.enabled AND apps.nginx.enabled are both true
+(decision 2 — the routing object references the nginx Service, which exists
+only under that gate). entryPoint web, PathPrefix(`/`) → nginx:8080 for any
+host name (localhost, the host IP),
+whose existing 8080 server completes the 301 to HTTPS (D-06;
+deploy/helm/indramesh/nginx.conf:57-61). NO tls block and NO tls.passthrough
+— that field exists only on the IngressRouteTCP CRD (research Pitfall 1;
+T-259-02).
+*/ -}}
+{{- if and .Values.apps.enabled .Values.apps.nginx.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: indramesh-http
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  entryPoints: [web]
+  routes:
+    - match: PathPrefix(`/`)
+      kind: Rule
+      services:
+        - name: nginx
+          port: 8080
+{{- end }}

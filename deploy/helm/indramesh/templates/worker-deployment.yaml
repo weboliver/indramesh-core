@@ -1,0 +1,205 @@
+{{- /*
+worker-deployment.yaml — the ARQ worker one-replica RollingUpdate Deployment for
+the k3s release (APP-02/APP-04, D-09..D-15; T-257-04..06). Rendered ONLY when
+apps.enabled is true. The worker has NO inbound Service (no HTTP entrypoint).
+It uses the SAME locally built backend image as the backend Deployment (D-12)
+with the existing ARQ WorkerSettings entrypoint as its explicit command — it
+never duplicates worker setup and never runs the Compose migration-plus-server
+path (D-14). Bounded same-image init checks gate startup on Postgres, Valkey,
+and OpenSearch (D-09/D-10). Consumes only existing split Secret references
+(T-257-05) and the shared restricted helper (T-257-04).
+*/ -}}
+{{- if .Values.apps.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: indramesh-worker
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: indramesh-worker
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.apps.worker.replicas }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: indramesh-worker
+  template:
+    metadata:
+      annotations:
+        checksum/external-api: {{ .Values.apps.externalApiRevision | default "" | quote }}
+      labels:
+        app.kubernetes.io/name: indramesh-worker
+    spec:
+      # D-09/D-10: bounded same-image dependency checks mirroring the backend
+      # tier. Uses bash's `/dev/tcp` raw TCP-connect probe, not curl telnet://
+      # (curl's telnet handler blocks waiting to read a server greeting, which
+      # Postgres/Valkey never send — live finding 2026-09-01, see
+      # backend-deployment.yaml for the full explanation).
+      initContainers:
+        - name: wait-postgres
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.worker.wait.attempts }}); do timeout 2 bash -c 'exec 3<>/dev/tcp/postgres/5432' >/dev/null 2>&1 && exit 0; sleep {{ .Values.apps.worker.wait.sleepSeconds }}; done; echo 'postgres:5432 not reachable after {{ .Values.apps.worker.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+        - name: wait-valkey
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.worker.wait.attempts }}); do timeout 2 bash -c 'exec 3<>/dev/tcp/valkey/6379' >/dev/null 2>&1 && exit 0; sleep {{ .Values.apps.worker.wait.sleepSeconds }}; done; echo 'valkey:6379 not reachable after {{ .Values.apps.worker.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+        - name: wait-opensearch
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.worker.wait.attempts }}); do curl -fsS --max-time 2 -u \"${OPENSEARCH_USERNAME}:${OPENSEARCH_PASSWORD}\" 'http://opensearch:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null 2>&1 && exit 0; sleep {{ .Values.apps.worker.wait.sleepSeconds }}; done; echo 'opensearch:9200 not ready after {{ .Values.apps.worker.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          env:
+            - name: OPENSEARCH_USERNAME
+              value: {{ .Values.opensearch.user | quote }}
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-opensearch
+                  key: OPENSEARCH_PASSWORD
+      containers:
+        - name: indramesh-worker
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          # D-12/D-14: the existing ARQ WorkerSettings entrypoint as an explicit
+          # command — no duplicated worker setup, no Compose migration-plus-server
+          # path, and the schema upgrade stays owned by the migration Job (D-05).
+          command: ["arq", "app.worker_entry.WorkerSettings", "--custom-log-dict", "app.logging.arq.LOG_DICT"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          env:
+            {{- include "indramesh.kubernetesEnv" . | nindent 12 }}
+            {{- include "indramesh.loggingEnv" . | nindent 12 }}
+            {{- include "indramesh.taskLogEnv" . | nindent 12 }}
+            - name: DB_HOST
+              value: postgres
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: DB_PASSWORD
+            - name: DB_NAME
+              value: {{ .Values.postgres.database | quote }}
+            # Live finding (2026-09-01): Kubernetes only expands a $(VAR) reference
+            # in an env value when VAR is defined EARLIER in this same env list —
+            # VALKEY_PASSWORD must precede VALKEY_URL, or $(VALKEY_PASSWORD) is left
+            # as a literal, unexpanded string and Valkey auth fails.
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-valkey
+                  key: VALKEY_PASSWORD
+            - name: VALKEY_URL
+              value: "redis://:$(VALKEY_PASSWORD)@valkey:6379/0"
+            - name: OPENSEARCH_URL
+              value: http://opensearch:9200
+            - name: OPENSEARCH_USERNAME
+              value: {{ .Values.opensearch.user | quote }}
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-opensearch
+                  key: OPENSEARCH_PASSWORD
+            # Phase 278: the storage service's DNS name + port (same as Plan
+            # 278-01's Compose STORAGE_SERVICE_URL) — plain non-secret value,
+            # no secretKeyRef, no $(VAR) expansion needed. Backend/worker do
+            # not call storage at process startup this phase (Phase 279/281
+            # endpoints will), so no wait-storage init container.
+            - name: STORAGE_SERVICE_URL
+              value: http://storage:8001
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-backend-auth
+                  key: JWT_SECRET_KEY
+            - name: FERNET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-backend-auth
+                  key: FERNET_KEY
+            # SEC313-69 rotation: the previous key, read by MultiFernet so
+            # ciphertext written before the rotation stays readable while new
+            # writes use FERNET_KEY. Present in the Secret only while a rotation
+            # runs, so `optional: true` keeps an install that never had it
+            # working. Finish the rotation with
+            # `python -m app.maintenance rotate-fernet-key`; remove the
+            # FERNET_KEY_OLD key from the Secret only once it exits 0 with
+            # "FERNET_KEY_OLD can be removed".
+            - name: FERNET_KEY_OLD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-backend-auth
+                  key: FERNET_KEY_OLD
+                  optional: true
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-backend-auth
+                  key: ADMIN_PASSWORD
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-external-api
+                  key: LLM_API_KEY
+                  optional: true
+            - name: LLM_PROVIDER
+              value: {{ .Values.apps.worker.llm.provider | quote }}
+            - name: LLM_MODE
+              value: {{ .Values.apps.worker.llm.mode | quote }}
+            - name: LLM_BASE_URL
+              value: {{ .Values.apps.worker.llm.baseUrl | quote }}
+            - name: LLM_MODEL
+              value: {{ .Values.apps.worker.llm.model | quote }}
+            - name: IMPORT_UPLOAD_DIR
+              value: /data/imports
+            - name: EXPORT_ROOT
+              value: /tmp/exports
+            # Phase 317 (CR314-23): same claim and same value as the backend
+            # Deployment — a different path here means the worker cannot open
+            # the file the backend wrote.
+            - name: IMPORT_ROOT
+              value: /data/imports/folders
+            - name: INDRAMESH_PLUGINS_DIR
+              value: {{ .Values.plugins.mountPath | quote }}
+          resources:
+            {{- toYaml .Values.apps.worker.resources | nindent 12 }}
+          # D-15: read-only-root (restricted helper) requires an explicit writable
+          # emptyDir at every declared path in the backend/worker write inventory.
+          volumeMounts:
+            - name: exports
+              mountPath: /tmp/exports
+            # CR314-23: identical claim and mountPath as backend-deployment.yaml
+            # — this is what makes the file the backend uploaded readable here.
+            - name: imports-storage
+              mountPath: /data/imports
+            - name: tmp
+              mountPath: /tmp
+            - name: plugins
+              mountPath: {{ .Values.plugins.mountPath }}
+              readOnly: true
+      volumes:
+        - name: exports
+          emptyDir: {}
+        - name: imports-storage
+          persistentVolumeClaim:
+            claimName: imports-storage
+        - name: tmp
+          emptyDir: {}
+        - name: plugins
+          persistentVolumeClaim:
+            claimName: plugins-storage
+{{- end }}

@@ -1,0 +1,49 @@
+# deploy/k8s-images/frontend/Caddyfile — routing contract for the production
+# static frontend (APP-01, D-01/D-02, T-257-08). Serves the compiled SPA from
+# /srv on unprivileged port 8080 (D-03) with a probe-only /healthz responder,
+# direct file_server for dot-suffixed static asset paths, and SPA fallback to
+# /index.html for every complementary client route (D-02).
+
+{
+  # Probe-only contract: the admin API is disabled so the read-only-root
+  # restricted runtime needs no writable config storage, and the image never
+  # opens the default 2019 admin port.
+  admin off
+}
+
+:8080 {
+  root * /srv
+
+  # D-03 probe path: plain text, non-HTML, never SPA fallback (UI-SPEC rule 4).
+  @healthz path /healthz
+  handle @healthz {
+    respond "ok" 200
+  }
+
+  # Phase 285 (D-11): the plugin-runtime shims are deliberately hash-free (the
+  # import map must stay a byte-stable literal), but each one imports a HASHED
+  # vendor chunk. Revalidate them on every load — a heuristically cached stale
+  # shim would import() a chunk that no longer exists after a host deploy.
+  # file_server still emits an ETag, so an unchanged shim stays a cheap 304.
+  # Plugin bundles keep D-11's immutable caching (this matcher is host-only).
+  @shims path /plugin-runtime/*
+  header @shims Cache-Control "no-cache"
+
+  # Dot-suffixed static asset paths go straight to file_server so a genuinely
+  # missing asset keeps its HTTP 404 instead of falling back to index.html (D-02).
+  @static path_regexp static "\.[A-Za-z0-9]+(/|$)"
+  handle @static {
+    file_server
+  }
+
+  # Complementary SPA matcher: excludes /healthz and the static asset paths, so
+  # only client-side application routes fall back to the entry document (D-02).
+  @spa {
+    not path /healthz
+    not path_regexp static "\.[A-Za-z0-9]+(/|$)"
+  }
+  handle @spa {
+    try_files {path} /index.html
+    file_server
+  }
+}

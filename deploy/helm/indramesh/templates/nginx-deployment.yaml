@@ -1,0 +1,164 @@
+{{- /*
+nginx-deployment.yaml — the nginx ClusterIP Service and one-replica
+RollingUpdate Deployment for the k3s release (IMG-01, D-01..D-04, D-06,
+D-08, D-11; Phase 259 D-02/D-03). Rendered ONLY when apps.enabled AND
+apps.nginx.enabled are both true (see Plan objective: nginx cannot exist in
+containerd on a fresh install, so it stays off by default and the rebuild
+wrapper flips it on together with the real tag + tlsContentHash). Phase 259:
+the certs volume sources the cert-manager-owned leaf Secret
+(apps.nginx.tlsSecretName, default indramesh-local-tls) — the installer-owned
+indramesh-nginx-tls Secret is superseded (D-03). Certificate renewal reaches the
+running nginx process through the Restricted-compatible sidecar marker bridge
+(D-02): the cert-reloader sidecar hashes server.crt+server.key and writes the
+marker atomically (tmp+mv) into the shared reload emptyDir; the nginx
+container's own background loop validates with `nginx -t` and reloads on
+marker change — no shareProcessNamespace, no SYS_PTRACE. The checksum/config +
+checksum/secret Pod-template annotations stay as the manual/reinstall rollout
+path (D-02). Uses the shared restricted helper (T-255-04); emptyDir volumes
+back the cache dir + /tmp since the root filesystem is read-only.
+*/ -}}
+{{- if and .Values.apps.enabled .Values.apps.nginx.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nginx
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nginx
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: https
+      port: 8443
+      targetPort: https
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nginx
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.apps.nginx.replicas }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nginx
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nginx
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/nginx-configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ .Values.apps.nginx.tlsContentHash | default "" }}
+    spec:
+      containers:
+        - name: nginx
+          image: "{{ .Values.apps.nginx.image.repository }}:{{ .Values.apps.nginx.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.nginx.image.pullPolicy }}
+          # Phase 259 (D-02): command override keeps nginx as PID 1 and runs the
+          # local reload loop — on a marker change from the cert-reloader sidecar
+          # it validates with `nginx -t` BEFORE `nginx -s reload` and acknowledges
+          # into the shared /run/reload/ack (a failed -t leaves the marker
+          # unacknowledged so the change is retried and the failure lands in
+          # container logs). The mounted ConfigMap nginx.conf is fully static (no
+          # /etc/nginx/templates envsubst), so skipping the stock
+          # docker-entrypoint.sh is safe.
+          command: ["sh", "-ec", "while :; do h=$(cat /run/reload/ack 2>/dev/null || echo -); if [ -f /run/reload/request ] && [ \"$(cat /run/reload/request)\" != \"$h\" ]; then nginx -t && nginx -s reload && cp /run/reload/request /run/reload/ack; fi; sleep {{ .Values.apps.nginx.reloadPollSeconds }}; done & exec nginx -g 'daemon off;'"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: https
+              containerPort: 8443
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.apps.nginx.resources | nindent 12 }}
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: nginx-certs
+              mountPath: /etc/nginx/certs
+              readOnly: true
+            - name: reload
+              mountPath: /run/reload
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 30
+            failureThreshold: 3
+        - name: cert-reloader
+          image: "{{ .Values.apps.nginx.image.repository }}:{{ .Values.apps.nginx.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.nginx.image.pullPolicy }}
+          # Phase 259 (D-02): Restricted-compatible marker bridge — hashes the
+          # mounted server.crt+server.key and, on change, writes the new hash
+          # atomically (tmp+mv) into the shared reload emptyDir. Baseline hash =
+          # no startup write; the nginx container's own loop performs the
+          # validated reload. No shared process namespaces, no ptrace.
+          command: ["sh", "-ec", "last=$(sha256sum /etc/nginx/certs/server.crt /etc/nginx/certs/server.key); while :; do cur=$(sha256sum /etc/nginx/certs/server.crt /etc/nginx/certs/server.key); if [ \"$cur\" != \"$last\" ]; then last=$cur; echo \"$cur\" > /run/reload/request.tmp && mv /run/reload/request.tmp /run/reload/request; fi; sleep {{ .Values.apps.nginx.reloadPollSeconds }}; done"]
+          volumeMounts:
+            - name: nginx-certs
+              mountPath: /etc/nginx/certs
+              readOnly: true
+            - name: reload
+              mountPath: /run/reload
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.apps.nginx.resources | nindent 12 }}
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: indramesh-nginx-config
+        - name: nginx-certs
+          secret:
+            secretName: {{ .Values.apps.nginx.tlsSecretName | default "indramesh-local-tls" }}
+            items:
+              - key: tls.crt
+                path: server.crt
+              - key: tls.key
+                path: server.key
+        - name: reload
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+{{- end }}

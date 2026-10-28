@@ -1,0 +1,116 @@
+# loki-values.yaml — checked-in, non-secret trimmed values for the Phase 301
+# Loki community-chart release (LOGINFRA-03; D-04, D-05, D-11, D-12; T-254-02,
+# T-261-SC, T-301-08..10). Consumed by scripts/k8s/lib/loki.sh as a
+# `helm upgrade --install --values` argument. Pinned chart: Loki community
+# chart 18.13.8 (LOKI_CHART_VERSION in versions.env) — every trim key below was
+# re-verified against the pinned chart's own values.yaml at execution.
+#
+# Re-verify on every pin change: the chart defaults are hostile to a single-node
+# WSL2 k3s (Pitfall 1) — singleBinary.replicas defaults to 0, chunksCache ships
+# enabled with allocatedMemory 8192 (MB), a canary DaemonSet, an nginx gateway,
+# a helm-test job and a rules sidecar are all on by default. Re-read the live
+# values.yaml of the new chart version and re-confirm every key below before
+# moving the pin (D-10).
+#
+# Review-Korrekturen 2026-10-06 (verified against the real chart loki-18.13.8
+# via `helm template`; binding):
+#   1. backend/read/write.replicas MUST be 0 — chart defaults are 3 each, and
+#      validate.yaml aborts the render when both monolithic and simple-scalable
+#      replicas are non-zero.
+#   2. loki.commonConfig.replication_factor MUST be 1 — chart default 3 lands
+#      verbatim in the rendered config.yaml and a single ingester cannot reach
+#      quorum.
+#   3. rbac.namespaced: true + sidecar.rules.enabled: false — without both the
+#      chart renders a cluster-wide ClusterRole loki-clusterrole on
+#      secrets/configmaps plus a ClusterRoleBinding.
+#   4. networkPolicy.metrics.namespaceSelector MUST be set — the chart's
+#      loki-ingress-metrics policy otherwise opens the unauthenticated
+#      http-metrics port 3100 to the whole cluster (NetworkPolicies are
+#      additive).
+#   5. LOGINFRA_ENABLED=false leaves the Grafana datasource in place (it points
+#      into empty space); documented in docs/LOGGING-INFRASTRUCTURE.md.
+
+# Monolithic single-binary target (chart default; SingleBinary is the
+# deprecated alias). One node, filesystem store.
+deploymentMode: Monolithic
+
+loki:
+  # Default true — every query would otherwise need an X-Scope-OrgID header.
+  auth_enabled: false
+  # Default s3. This stack has no object storage; use the local filesystem.
+  storage:
+    type: filesystem
+  # Default {} — "a real Loki install requires a proper schemaConfig".
+  schemaConfig:
+    configs:
+      - from: 2026-01-01        # epoch before the first write
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index: { prefix: index_, period: 24h }
+  # Review-Korrektur 2: chart default 3 would land unchanged in config.yaml and
+  # a single ingester can never satisfy a 3-of-3 write quorum.
+  commonConfig:
+    replication_factor: 1
+  # Retention triple (D-04; Pitfall 2): all three keys are required together or
+  # retention is silently not applied / Loki refuses to start.
+  limits_config:
+    retention_period: 336h       # 14 days
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+  # rbac.sccEnabled deliberately not set (default false); the OpenShift SCC
+  # overlay's hook is documented, not activated here.
+
+singleBinary:
+  replicas: 1                    # chart default 0 — no pods without this
+  sidecar: false                 # chart default true — rules sidecar image
+  # WSL2 resource corridor (D-05). The chart sets GOMEMLIMIT to 0.85x the
+  # container memory limit itself.
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 1Gi }
+
+# Every heavy chart extra is off by default and must be trimmed (Pitfall 1).
+chunksCache: { enabled: false }   # default true with 8192 MB memcached
+resultsCache: { enabled: false }  # default true with 1024 MB memcached
+lokiCanary: { enabled: false }    # default true — extra DaemonSet + image
+gateway: { enabled: false }       # default true — nginx-unprivileged + auth path
+test: { enabled: false }          # default true — loki-helm-test image
+
+# Review-Korrektur 1: these default to 3; validate.yaml fails the render for
+# any non-zero value while the monolithic target is active.
+backend: { replicas: 0 }
+read: { replicas: 0 }
+write: { replicas: 0 }
+
+# Review-Korrektur 3: prevents the cluster-wide ClusterRole/ClusterRoleBinding
+# on secrets/configmaps and, together with sidecar.rules.enabled: false, the
+# namespaced Role as well.
+rbac:
+  namespaced: true
+sidecar:
+  rules:
+    enabled: false
+
+# Review-Korrektur 4 / D-12: enable the chart's NetworkPolicies and close the
+# http-metrics port to the monitoring namespace only. The effective boundary is
+# "reachable from the monitoring namespace" (Alloy, the
+# kube-prometheus-stack Grafana and Prometheus) — NOT from indramesh or any
+# other namespace. "Alloy exclusively" is not reachable with this chart's
+# namespace-only ingress policy and would also be wrong, because the Grafana
+# datasource must reach Loki. The indramesh chart is untouched in 301
+# (backend→Loki egress is Phase 305).
+networkPolicy:
+  enabled: true
+  ingress:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: alloy
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: monitoring
+  metrics:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: monitoring

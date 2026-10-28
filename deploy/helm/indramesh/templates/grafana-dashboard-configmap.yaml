@@ -1,0 +1,30 @@
+{{- /*
+grafana-dashboard-configmap.yaml — the MON-03 dashboards-as-code contract
+(D-07, T-261-04..06): the 7-services dashboard JSON is a checked-in chart file
+(deploy/helm/indramesh/dashboards/indramesh-7-services.json) embedded via
+.Files.Get into a ConfigMap labelled grafana_dashboard: "1". Grafana's
+dashboard sidecar (default-on in the stack, searchNamespace: ALL) copies it to
+the provisioning dir — the exact idiom backup-cronjob.yaml:19-31 uses for
+backup.sh. Because the chart owns the file, the dashboard survives `helm
+uninstall`/reinstall (D-07).
+
+Rendered ONLY when monitoring.enabled is true (the dashboard ConfigMap is pure
+monitoring surface; unlike the ServiceMonitor it does not need apps.enabled —
+nothing in it references an app Service).
+*/ -}}
+{{- if .Values.monitoring.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: indramesh-services-dashboard
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    grafana_dashboard: "1"            # sidecar-Pickup-Label (labelValue "1")
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+data:
+  indramesh-7-services.json: |
+{{ .Files.Get "dashboards/indramesh-7-services.json" | indent 4 }}
+{{- end }}

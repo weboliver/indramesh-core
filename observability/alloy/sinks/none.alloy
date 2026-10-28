@@ -1,0 +1,28 @@
+// Phase 301 (D-02): the explicit "off" sink position. ALLOY_SINK=none collects
+// and parses (discovery + stage chain) but forwards nowhere, so an operator can
+// disable local and external shipping without changing the base fragment.
+//
+// Deliberately no loki.echo here: echoing processed lines back into the
+// container's own log stream would create a self-amplifying loop with the
+// Docker discovery.
+
+loki.process "app" {
+  forward_to = []
+
+  stage.json {
+    expressions    = { level = "", category = "", request_id = "", task_id = "", user_id = "", plugin = "" }
+    drop_malformed = false
+  }
+
+  stage.logfmt {
+    mapping = { level = "", category = "", request_id = "", task_id = "", user_id = "", plugin = "" }
+  }
+
+  stage.labels {
+    values = { level = "", category = "" }
+  }
+
+  stage.structured_metadata {
+    values = { request_id = "", task_id = "", user_id = "", plugin = "" }
+  }
+}

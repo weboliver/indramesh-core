@@ -1,0 +1,85 @@
+{{- /*
+plugins-pvc.yaml — shared, operator-managed plugin code storage for the
+backend and worker Deployments (Phase 284, PLUGDEPLOY-01, D-13). A single
+ReadWriteOnce local-path PVC mounted into two Deployments works on the
+current single-node k3s development target only by node-scheduling
+coincidence. In a multi-node cluster, local-path can fail with a
+multi-attach error; use ReadWriteMany/sharedFileSystemPath support before
+deploying this chart there. This limitation is accepted and documented
+here, not resolved by a binding Job.
+
+Gated on plugins.enabled, NOT apps.enabled, mirroring backup.enabled — an
+operator can disable plugin storage without disabling the app tier.
+
+An ORDINARY resource, deliberately not a Helm hook (2026-09-22 history — read
+before changing this file again). Two things were tried and reverted:
+
+  1. apps.enabled gating: this template was originally gated the same as
+     migration-job.yaml. install.sh's stateful-only bootstrap pass
+     (apps.enabled=false, no --wait) never rendered it, so on any release
+     whose migration Job mounted this claim from a pre-upgrade hook, the
+     claim could only ever be created by the very pass whose hook already
+     required it — Pending until activeDeadlineSeconds, release failed, on
+     every fresh install too. Fixed by decoupling from apps.enabled.
+
+  2. pre-install/pre-upgrade hook with a negative weight: this made the claim
+     available before migration-job.yaml's hook, closing (1) — but converting
+     an already-released ORDINARY resource into a hook resource triggers a
+     DIFFERENT Helm mechanism: manifest-diff pruning. Helm's upgrade deletes
+     resources present in the previous release's tracked manifest but absent
+     from the new one; hooks are tracked separately from that manifest, so
+     the transition read as "removed from the release" and Helm issued a
+     delete for the very claim its own hook was simultaneously recreating —
+     confirmed by decoding the release secrets for the two revisions on
+     either side of that change (`kubectl get secret
+     sh.helm.release.v1.indramesh.v<N> -o jsonpath='{.data.release}' |
+     base64 -d | base64 -d | gunzip`, inspecting the JSON's `manifest` vs.
+     `hooks` fields) and by the live object's own history:
+     `managedFields` shows `helm / Apply` twelve seconds before
+     `metadata.deletionTimestamp` was set, same UID throughout.
+     `hook-delete-policy: hook-failed` does nothing against this — that
+     annotation governs deletion based on hook OUTCOME, not manifest
+     pruning, an entirely different code path. A PVC held by
+     `kubernetes.io/pvc-protection` (still mounted by backend/worker) then
+     sits "being deleted" — not gone, but the scheduler refuses to schedule
+     ANY new pod against it, including a fresh rolling-update pod for the
+     very Deployments already using it. Full account:
+     .planning/todos/pending/2026-09-22-plugins-pvc-deadlocks-pre-upgrade-migration-hook.md
+
+The actual fix: the plugin-migration runner moved out of the pre-upgrade Job
+entirely (migration-job.yaml now runs only the core `alembic upgrade head`)
+and into its own post-install/post-upgrade Job. `--wait` makes Helm wait for
+every ordinary resource — including this claim AND the backend/worker
+Deployments — to be ready before any post-* hook fires. By the time the
+plugin runner needs plugins-storage, it is not a special case at all: an
+ordinary resource, already bound, already mounted by already-Ready
+Deployments. No hook annotations belong on a claim with long-lived
+Deployment consumers; only the genuinely short-lived, PVC-less core
+migration stays a hook.
+*/ -}}
+{{- /* Fail closed on the one combination that reintroduces the original
+deadlock: the backend/worker Deployments and the post-upgrade plugin-migration
+Job all mount plugins-storage unconditionally once apps.enabled is true, so
+disabling only this claim would leave three consumers referencing a claim
+nothing renders. */ -}}
+{{- if and .Values.apps.enabled (not .Values.plugins.enabled) }}
+{{- fail "plugins.enabled=false is incompatible with apps.enabled=true — backend-deployment.yaml, worker-deployment.yaml and migration-job.yaml's plugin-migration Job all mount the plugins-storage claim rendered here" }}
+{{- end }}
+{{- if .Values.plugins.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: plugins-storage
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  accessModes: {{ toYaml .Values.plugins.persistence.accessModes | nindent 4 }}
+  storageClassName: {{ .Values.plugins.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.plugins.persistence.storage }}
+{{- end }}

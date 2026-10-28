@@ -1,0 +1,109 @@
+[tool.vulture]
+exclude = ["alembic/", "tests/", ".venv/", "__pycache__/"]
+# CLEAN-01 (Phase 308): `vulture_whitelist.py` holds the reviewed per-symbol
+# survivors (framework reflection, API/SDK contract fields), each with its
+# vulture-generated `# unused <kind> (path:line)` comment and a category
+# comment — the counterpart to the name-level `ignore_names` below.
+paths = ["app", "vulture_whitelist.py"]
+ignore_names = [
+    # Alembic migration lifecycle
+    "setUp",
+    "tearDown",
+    "test_*",
+    "upgrade",
+    "downgrade",
+    "run_migrations_online",
+    "run_migrations_offline",
+    "process_revision_directives",
+    # FastAPI dependency injection — each router defines its own get_db generator
+    "get_db",
+    # ARQ WorkerSettings class attributes (read by ARQ at runtime)
+    "functions",
+    "redis_settings",
+    "on_startup",
+    "on_shutdown",
+    "job_timeout",
+    "keep_result",
+    "health_check_interval",
+    "health_check_key",
+    # Pydantic model config (read by metaclass at class creation)
+    "model_config",
+    "from_attributes",
+    # Pydantic inner Config class pattern
+    "Config",
+    # SQLAlchemy relationship back-populates
+    "references_from",
+    "references_to",
+    "children",
+    "referenced_object_type",
+    "role_id",
+    "role",
+    "profile",
+    "linked_object_type",
+    # Computed @property fields serialized in API responses
+    "icon_local_name",
+    "to_object_name",
+    "from_object_name",
+    "attribute_name",
+    # SQLAlchemy model columns (vulture sees no call sites since ORM reads them via mapped column names)
+    "processed_at",
+    "is_system",
+    "last_run_at",
+    "next_run_at",
+    "first_name",
+    "last_name",
+    "avatar_url",
+    # Pydantic schema fields (serialized to JSON — vulture cannot see JSON serialization as a call site)
+    "token_type",
+    "score",
+    "highlights",
+    "total_schemas",
+    "recent_audit_entries",
+    "parent_name",
+    "schema_description",
+    "reason",
+    "icon_local_name",
+    "attribute_name",
+    # TemplateLightColorsUpdate / TemplateDarkColorsUpdate fields
+    "primary",
+    "header",
+    "sidebar",
+    "section",
+    "surface",
+    # Pydantic @model_validator classmethod — called by Pydantic metaclass, not by user code
+    "reject_null_template_data",
+    "cls",
+    # Module-level constant used in Elasticsearch query construction
+    "METADATA_FIELDS",
+    # Enum values — used via ClassName.VALUE attribute access at runtime
+    "INTERNAL",
+    "API",
+    "INACTIVE",
+    "SKIPPED",
+    "METADATA",
+    "STATUSES",
+    "OBJECTTYPES",
+    "ATTRIBUTES",
+    "OBJECTS",
+    "VALUES",
+    "REFERENCES",
+    "PARTIAL_SUCCESS",
+    "INDEX",
+    "REMOVE",
+    # Pydantic schema classes used in router type annotations and dependency injection
+    "LoginRequest",
+    "IndexOutboxOperation",
+]
+ignore_decorators = [
+    "@app.get",
+    "@app.post",
+    "@app.patch",
+    "@app.delete",
+    "@app.put",
+    "@router.get",
+    "@router.post",
+    "@router.patch",
+    "@router.delete",
+    "@router.put",
+]
+min_confidence = 60

@@ -1,0 +1,46 @@
+{{- /*
+imports-pvc.yaml — the one owner of import payloads for the backend and worker
+Deployments (Phase 317, CR314-23, D-18). Both pods mount this single claim at
+/data/imports: the backend writes IMPORT_ROOT (/data/imports/folders) and the
+worker opens the file by the absolute path the folder scan hands it. Before
+this, both paths were per-pod emptyDir volumes — an uploaded CSV was invisible
+to the worker and gone after a pod restart (Compose hid the defect with its
+shared named volume; the chart did not).
+
+A single ReadWriteOnce local-path claim mounted into two Deployments works on
+the chart's current single-node k3s target only by node-scheduling coincidence.
+In a multi-node cluster, local-path can fail with a multi-attach error; use
+ReadWriteMany/sharedFileSystemPath support before deploying this chart there.
+The limitation is accepted and documented here, not resolved by a hook.
+
+Gated on apps.enabled, unlike plugins-pvc.yaml's plugins.enabled. Do NOT
+"fix" the gate into agreement with that sibling file: the plugin claim needs
+its own toggle (and is decoupled from apps.enabled) because a post-upgrade
+Job depends on it and an operator may want plugin storage without the app
+tier. This claim has exactly two consumers, the backend and worker
+Deployments, both gated on apps.enabled, and no hook ever mounts it — so the
+bootstrap-pass failure recorded in plugins-pvc.yaml's header (a hook needing a
+claim that the apps.enabled=false pass never renders) cannot occur here. Off
+when there are no app pods is the correct, self-consistent state.
+
+An ORDINARY resource, not a Helm hook — same reasoning as plugins-pvc.yaml:
+a long-lived Deployment consumer must never sit behind a hook's ordering.
+*/ -}}
+{{- if .Values.apps.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: imports-storage
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  accessModes: {{ toYaml .Values.apps.imports.persistence.accessModes | nindent 4 }}
+  storageClassName: {{ .Values.apps.imports.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.apps.imports.persistence.storage }}
+{{- end }}

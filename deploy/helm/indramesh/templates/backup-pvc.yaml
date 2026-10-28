@@ -1,0 +1,87 @@
+{{- /*
+backup-pvc.yaml — the dedicated, retained postgres-backups
+PersistentVolumeClaim (D-08..D-11). A bare (StatefulSet-less) PVC is never
+deleted, shrunk, or replaced by Helm upgrade/uninstall unless explicitly
+removed from the chart — Retain semantics hold by construction here, so no
+persistentVolumeClaimRetentionPolicy field is needed or valid (that field is
+StatefulSet-only API surface). The stable, release-independent name
+`postgres-backups` (D-10, never a Helm-templated/release-qualified name)
+keeps this claim uniquely discoverable for operators and the restore
+runbook regardless of Helm release name/revision.
+*/ -}}
+{{- if .Values.backup.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-backups
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  accessModes: {{ toYaml .Values.backup.persistence.accessModes | nindent 4 }}
+  storageClassName: {{ .Values.backup.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.persistence.storage }}
+{{- end }}
+---
+{{- /*
+Live-cluster finding (2026-09-03, Plan 260-02 Task 3): local-path's
+volumeBindingMode is WaitForFirstConsumer (matches every other stateful PVC
+in this chart), so a bare PVC with no Pod referencing it at apply time stays
+Pending forever — nothing ever consumes postgres-backups until the
+indramesh-backup CronJob's first scheduled/manual run, which can be days away.
+`helm upgrade --wait` checks every PVC's Bound status as part of release
+readiness, so without an early consumer EVERY future `helm upgrade` against
+this release fails with "PVC is not Bound... context deadline exceeded" —
+not a one-time bootstrap hiccup. This pre-upgrade hook Job (same
+revision-qualified-name/hook-delete-policy shape as migration-job.yaml)
+mounts the PVC just long enough to trigger WaitForFirstConsumer binding
+before the main --wait check ever inspects it; it never runs on `helm
+upgrade --install`'s no-wait stateful-only pass (D-16 pass 1), only pre-
+upgrade of the full pass (D-16 pass 2 / sole pass), which is the pass that
+actually enables --wait.
+*/ -}}
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: indramesh-backup-pvc-init-{{ .Release.Revision }}
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 60
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: indramesh-backup
+    spec:
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 70
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: bind-pvc
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          command: ["sh", "-ec", "echo 'postgres-backups PVC bound for first use'"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: backups
+              mountPath: /backups
+      volumes:
+        - name: backups
+          persistentVolumeClaim:
+            claimName: postgres-backups
+{{- end }}

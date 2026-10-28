@@ -1,0 +1,145 @@
+#!/bin/bash
+# IndraMesh k3s lifecycle wrapper (BOOT-02, D-16..D-20).
+#
+# Starts the k3s systemd service directly: `sudo systemctl start k3s` when a
+# transition is needed, then polls `systemctl is-active` for the target state
+# within a short bounded timeout (default 30s; override only for tests).
+# Idempotent: an already-active service is a successful no-op. Never touches
+# Helm, workloads, PVCs, uninstall, or Compose (D-19, T-254-04).
+#
+# Also (re)starts the indramesh-local-forward@{80,443} reachability bridge
+# (scripts/k8s/lib/local_forward.sh) if it is installed — symmetric with
+# ./stop, which stops it. Without this, https://localhost would stay unreachable
+# after ./start even though k3s itself is up, because the
+# bridge is a separate systemd unit with no dependency on k3s.service.
+# Best-effort: absence of the unit (no ./install_indramesh_k8s.sh run yet) is
+# not an error, and a start failure here does not fail k3s startup itself
+# (the cluster is usable via `kubectl` either way).
+#
+# `--enable`: also restores the boot-time enablement of `k3s.service` and of the
+# local-forward bridge that `./stop --disable` cleared. Plain `./start` starts
+# them for the current boot only and leaves persistence as it found it (D-19:
+# service enablement is configured by the installer, not by `./start`). Runs in
+# the already-active path too, so "running" and "comes back after a reboot" can
+# be set independently.
+set -euo pipefail
+
+K3S_UNIT="k3s"
+STATE_TIMEOUT_SECS="${K3S_START_TIMEOUT_SECS:-30}"
+POLL_INTERVAL=1
+LOCAL_FORWARD_PORTS="80 443"
+ENABLE_UNITS=0
+
+k3s_state() {
+  systemctl is-active "$K3S_UNIT" 2>/dev/null || true
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+start_local_forward_bridge() {
+  # Best-effort, non-fatal: the bridge only exists on a host where
+  # ./install_indramesh_k8s.sh has run (scripts/k8s/lib/local_forward.sh
+  # reconcile_local_forward). Absence is not an error. Does NOT try to
+  # provision the unit from scratch — only starts an already-installed one;
+  # provisioning remains install.sh's job.
+  #
+  # `systemctl list-unit-files` matches unit FILE names on disk — the
+  # template `indramesh-local-forward@.service`, never an instantiated name
+  # like `indramesh-local-forward@80.service` (confirmed live, 2026-09-03:
+  # `systemctl list-unit-files indramesh-local-forward@80.service` -> "0 unit
+  # files listed", exit 1, even though the template is installed and
+  # enabled) — checking the instantiated name here silently skipped every
+  # port and made this whole function a no-op. Check the TEMPLATE once.
+  local port unit any_started=0
+  if ! systemctl list-unit-files 'indramesh-local-forward@.service' >/dev/null 2>&1; then
+    return 0
+  fi
+  for port in $LOCAL_FORWARD_PORTS; do
+    unit="indramesh-local-forward@${port}.service"
+    if ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+      echo "Starting ${unit} (reachability bridge, port ${port})..."
+      if sudo systemctl start "$unit"; then
+        any_started=1
+      else
+        echo "WARNING: failed to start ${unit} — https://localhost may be unreachable (diagnose with: systemctl status ${unit})" >&2
+      fi
+    fi
+  done
+  if [ "$any_started" -eq 1 ]; then
+    echo "Local-forward bridge started — https://localhost is reachable again (if another process isn't already holding ports 80/443)."
+  fi
+}
+
+enable_lifecycle_units() {
+  # --enable: restore the boot-time enablement ./stop --disable cleared (see
+  # header comment). `systemctl enable` never starts a unit and never touches
+  # cluster data; the start itself happens further below, so ordering here is
+  # independent of the k3s state check. Best-effort for the bridge, fatal for
+  # k3s — "started, but silently not persistent" is exactly the state the
+  # operator asked to leave behind. `list-unit-files` matches unit FILE names on
+  # disk — the template, never an instantiated name (see start_local_forward_bridge).
+  local port unit
+  echo "Enabling ${K3S_UNIT}.service for the next boot..."
+  if ! sudo systemctl enable "$K3S_UNIT" >/dev/null 2>&1; then
+    die "failed to enable $K3S_UNIT — diagnose with: systemctl status $K3S_UNIT"
+  fi
+  if systemctl list-unit-files 'indramesh-local-forward@.service' >/dev/null 2>&1; then
+    for port in $LOCAL_FORWARD_PORTS; do
+      unit="indramesh-local-forward@${port}.service"
+      if sudo systemctl enable "$unit" >/dev/null 2>&1; then
+        echo "Enabled ${unit} (port ${port})."
+      else
+        echo "WARNING: failed to enable ${unit} — https://localhost may stay unreachable after a reboot (diagnose with: systemctl status ${unit})" >&2
+      fi
+    done
+  fi
+  echo "k3s and the reachability bridge start again on boot (undo with: ./stop --disable)."
+}
+
+main() {
+  local current elapsed arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --enable) ENABLE_UNITS=1 ;;
+      *) die "unknown argument: $arg (usage: ./start [--enable])" ;;
+    esac
+  done
+
+  if [ "$ENABLE_UNITS" -eq 1 ]; then
+    enable_lifecycle_units
+  fi
+
+  current="$(k3s_state)"
+
+  if [ "$current" = "active" ]; then
+    echo "k3s is already active (no-op)."
+    start_local_forward_bridge
+    echo "Next: kubectl get nodes"
+    exit 0
+  fi
+
+  echo "Starting k3s service..."
+  if ! sudo systemctl start "$K3S_UNIT"; then
+    die "failed to start k3s — missing service or sudo failure; run ./install_indramesh_k8s.sh (diagnose with: systemctl status k3s)"
+  fi
+
+  elapsed=0
+  while [ "$elapsed" -lt "$STATE_TIMEOUT_SECS" ]; do
+    if [ "$(k3s_state)" = "active" ]; then
+      echo "k3s is active."
+      start_local_forward_bridge
+      echo "Next: kubectl get nodes"
+      exit 0
+    fi
+    sleep "$POLL_INTERVAL"
+    elapsed=$((elapsed + POLL_INTERVAL))
+  done
+
+  die "k3s did not become active within ${STATE_TIMEOUT_SECS}s — diagnose with: systemctl status k3s"
+}
+
+main "$@"

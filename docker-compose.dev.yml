@@ -1,0 +1,66 @@
+# docker-compose.dev.yml — the mirrored dev overlay (Phase 311, D-02).
+#
+# Layered on top of the production-shaped public base file (`docker-compose.yml`) it adds the
+# source bind mounts that give the develop checkout hot reload. The base file itself carries no
+# dev source mount, so the public artifact a new user clones stays production-shaped.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Compose merges service `volumes:` by target path, so this overlay can only ADD a mount — it can
+# never remove one. Nothing the production shape must not have may therefore live in the base file.
+#
+# YAML anchors never cross Compose files, so the two log anchors are re-declared here with the
+# same names and the same bodies as in the base file.
+
+x-logging: &default_logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-log-labels: &log_labels
+  com.indramesh.env: ${ENVIRONMENT:-development}
+
+services:
+  backend:
+    volumes:
+      - ./backend:/app
+
+  worker:
+    volumes:
+      - ./backend:/app
+
+  storage:
+    # storage runs `uvicorn app.storage_service.main:app` from the same tree — without this mount
+    # the dev stack would silently keep running stale image code for it.
+    volumes:
+      - ./backend:/app
+
+  cutover:
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    # Phase 317.3 (D-03): the base file builds and serves the production SPA
+    # (literal `ENVIRONMENT: production`, `vite preview`, strict nginx CSP). The
+    # overlay is the only place that selects the development image and the Vite
+    # dev server again — HMR exists with this overlay and nowhere else.
+    build:
+      args:
+        ENVIRONMENT: development
+    environment:
+      - ENVIRONMENT=development
+      - VITE_ENVIRONMENT=development
+    command: ["npm", "run", "dev", "--", "--host"]
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+  nginx:
+    # Phase 317.3 (D-03): the base nginx config carries the strict production SPA
+    # policy. The dev overlay swaps in the development policy (the previous
+    # nginx/nginx.conf, moved verbatim) so the Vite dev client and its HMR
+    # WebSocket keep working. Same container target path → the overlay mount
+    # replaces the base mount.
+    volumes:
+      - ./nginx/nginx.dev.conf:/etc/nginx/nginx.conf:ro

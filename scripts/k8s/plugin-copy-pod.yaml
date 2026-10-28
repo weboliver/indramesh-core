@@ -1,0 +1,53 @@
+# plugin-copy-pod.yaml — committed, disposable in-cluster helper Pod that lets
+# an operator `kubectl cp` a plugin directory onto the shared `plugins-storage`
+# claim (PLUGDEPLOY-01). Rendered by scripts/k8s/install_plugin.sh (the
+# __IMAGE__ placeholder is sed-replaced with the CURRENTLY DEPLOYED backend
+# image — never a hardcoded tag — into a private tmpdir copy before `kubectl
+# apply`) and deleted unconditionally on every exit.
+#
+# Why this Pod has to exist at all: backend-deployment.yaml, worker-deployment.yaml
+# and migration-job.yaml's plugin-migration Job all mount plugins-storage
+# `readOnly: true` (deliberate — no application process may write plugin
+# files). No currently-running Pod can be `kubectl cp`'d into; this one exists
+# only to hold a writable mount open long enough for one `kubectl cp`.
+#
+# Reuses the CURRENTLY DEPLOYED backend image rather than a separate one so
+# the Pod is guaranteed compatible with the namespace's restricted Pod
+# Security Admission without re-deriving that proof — the same image already
+# runs under indramesh.restrictedSecurityContext (_helpers.tpl) as
+# indramesh-backend/indramesh-worker/the migration Jobs, non-root by its own
+# Dockerfile `USER ${APP_UID}`, and ships tar (kubectl cp's own dependency)
+# and sleep. `sleep 1800` (not `sleep infinity`) is a bounded self-cleanup net
+# in case the driving script is interrupted before its own `kubectl delete`.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: indramesh-plugin-copy
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/name: indramesh-plugin-copy
+spec:
+  restartPolicy: Never
+  containers:
+    - name: plugin-copy
+      image: "__IMAGE__"
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "1800"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: plugins
+          mountPath: /opt/indramesh/plugins
+          # Deliberately NOT readOnly — the one property that distinguishes
+          # this Pod from every real consumer of the claim.
+  volumes:
+    - name: plugins
+      persistentVolumeClaim:
+        claimName: plugins-storage

@@ -1,0 +1,80 @@
+// Phase 301 (LOGINFRA-04/D-01/D-03): tee sink fragment for an external OTLP
+// gRPC endpoint. Selected by ALLOY_SINK=otlp. It is `cat`ed after
+// base-docker.alloy, so it defines loki.process "app" (the base forwards into
+// it) and BOTH tee branches: the bundled Loki AND the external exporter.
+//
+// Tee semantics (D-03): forward_to lists loki.write.bundled.receiver and
+// otelcol.receiver.loki.bridge.receiver. A set external target alone never
+// silences the bundled Loki. The whole bundled log stack runs only while the
+// `logging` profile is active; the external-only recipe activates that profile,
+// points LOKI_QUERY_URL at the external Loki and sets
+// LOG_EXPLORER_EXTERNAL_ONLY=true (see docs/LOGGING-INFRASTRUCTURE.md).
+//
+// Pitfall 9: otelcol.exporter.otlp uses gRPC, which does NOT allow sensitive
+// credentials over insecure channels — this fragment therefore has NO headers
+// block. Header/token auth belongs in sinks/otlphttp.alloy (or behind TLS).
+//
+// TLS default (D-02 mirror): `insecure` is true ONLY when OTLP_TLS_INSECURE is
+// the explicit string "true"; unset/false = TLS. The same default applies in
+// Compose and k8s (Plan 04).
+
+loki.process "app" {
+  forward_to = [loki.write.bundled.receiver, otelcol.receiver.loki.bridge.receiver]
+
+  // App JSON line (LOG_FORMAT=json in Compose-prod and k8s). drop_malformed
+  // stays false so non-JSON lines (postgres, nginx, valkey, elasticsearch)
+  // pass through with only the service/env labels instead of being dropped.
+  stage.json {
+    expressions    = { level = "", category = "", request_id = "", task_id = "", user_id = "", plugin = "" }
+    drop_malformed = false
+  }
+
+  // Dev Compose runs LOG_FORMAT=console (the renderer emits key=value), so the
+  // same frozen fields are parsed a second time by logfmt. One config serves
+  // every LOG_FORMAT (OQ1 dual-stage); logfmt ignores non-key=value tokens.
+  stage.logfmt {
+    mapping = { level = "", category = "", request_id = "", task_id = "", user_id = "", plugin = "" }
+  }
+
+  // Low-cardinality labels only. Level values are lowercase (structlog
+  // add_log_level). request_id/task_id/user_id/plugin must NEVER be labels.
+  stage.labels {
+    values = { level = "", category = "" }
+  }
+
+  // High-cardinality identifiers stay structured metadata.
+  stage.structured_metadata {
+    values = { request_id = "", task_id = "", user_id = "", plugin = "" }
+  }
+}
+
+loki.write "bundled" {
+  endpoint {
+    url = sys.env("LOKI_URL")
+  }
+}
+
+otelcol.receiver.loki "bridge" {
+  output {
+    logs = [otelcol.processor.batch.bridge.input]
+  }
+}
+
+// Batching is disabled by default. The pinned Alloy v1.20.1 has NO exporter
+// `batch {}` block (verified: `alloy validate` rejects it as an unrecognized
+// block name), so batching is enabled with the documented
+// `otelcol.processor.batch` component instead.
+otelcol.processor.batch "bridge" {
+  output {
+    logs = [otelcol.exporter.otlp.external.input]
+  }
+}
+
+otelcol.exporter.otlp "external" {
+  client {
+    endpoint = sys.env("OTLP_ENDPOINT")
+    tls {
+      insecure = sys.env("OTLP_TLS_INSECURE") == "true"
+    }
+  }
+}

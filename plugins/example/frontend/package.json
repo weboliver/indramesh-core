@@ -1,0 +1,20 @@
+{
+  "name": "@indramesh/plugin-example-frontend",
+  "private": true,
+  "version": "0.7.0",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "description": "Plugin-local frontend build for the Example plugin: the lightweight registration bundle that demonstrates the plugin registration and extension-point contract.",
+  "scripts": {
+    "build": "vite build --config vite.config.mjs",
+    "build:registration": "vite build --config vite.config.mjs",
+    "verify": "node verify-bundle.mjs"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "6.0.5",
+    "postcss": "8.5.29",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "vite": "8.3.5"
+  }
+}

@@ -1,0 +1,132 @@
+{{- /*
+backup-cronjob.yaml — the BAK-01 scheduled pg_dump CronJob (D-01..D-18,
+T-260-01..05). Rendered ONLY when backup.enabled is true (D-06). The dump/
+verify/rename body lives in the checked-in deploy/helm/indramesh/backup.sh,
+embedded into the ConfigMap below via .Files.Get — the exact idiom
+nginx-configmap.yaml already uses for nginx.conf — so the same logic that
+runs in the cluster is also what tests/bootstrap/test_backup.sh sources and
+asserts hermetically.
+
+The backup container and its wait-postgres init container both reuse
+.Values.postgres.image.repository/.tag verbatim — the same value the
+Postgres StatefulSet itself consumes — never a separate backup.image.*
+value. This is the entire mechanism that guarantees pg_dump/pg_restore and
+the Postgres server are always the same binary/version (D-15, research
+Pattern 1): there is no version-skew scenario to defend against as long as
+this value is reused rather than duplicated.
+*/ -}}
+{{- if .Values.backup.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: indramesh-backup-script
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+data:
+  backup.sh: |
+{{ .Files.Get "backup.sh" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: indramesh-backup
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  # D-16: no overlapping runs. D-03/Pitfall 2: startingDeadlineSeconds — not
+  # concurrencyPolicy alone — is what actually skips a run that missed its
+  # scheduled time (e.g. the cluster was down at 02:00 UTC) instead of
+  # firing it late once the CronJob controller comes back.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ .Values.backup.startingDeadlineSeconds }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.backup.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.backup.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: indramesh-backup
+        spec:
+          restartPolicy: Never
+          # D-06 boundary relaxation (same precedent as
+          # postgres-statefulset.yaml): the reused Postgres image's fixed
+          # UID 70/GID 0 needs pod-level fsGroup to write the freshly
+          # provisioned postgres-backups local-path volume.
+          securityContext:
+            fsGroup: 70
+            fsGroupChangePolicy: OnRootMismatch
+          # Live finding (migration-job.yaml, 2026-09-01): `curl telnet://`
+          # blocks waiting for an unsolicited server greeting Postgres never
+          # sends. bash's /dev/tcp pseudo-device performs a bare TCP
+          # handshake and returns immediately — reused verbatim here.
+          initContainers:
+            - name: wait-postgres
+              image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+              imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+              command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.backup.wait.attempts }}); do timeout 2 bash -c 'exec 3<>/dev/tcp/postgres/5432' >/dev/null 2>&1 && exit 0; sleep {{ .Values.backup.wait.sleepSeconds }}; done; echo 'postgres:5432 not reachable after {{ .Values.backup.wait.attempts }} attempts'; exit 1"]
+              securityContext:
+                {{- include "indramesh.restrictedSecurityContext" . | nindent 16 }}
+          containers:
+            - name: backup
+              image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+              imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+              command: ["sh", "/scripts/backup.sh"]
+              securityContext:
+                {{- include "indramesh.restrictedSecurityContext" . | nindent 16 }}
+              env:
+                - name: PGHOST
+                  value: postgres
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  value: {{ .Values.postgres.user | quote }}
+                - name: PGDATABASE
+                  value: {{ .Values.postgres.database | quote }}
+                # D-18: the only source of the Postgres password — never a
+                # Helm value, --set argument, CLI argument, or literal in the
+                # rendered manifest.
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: indramesh-database
+                      key: POSTGRES_PASSWORD
+                - name: BACKUP_DIR
+                  value: /backups
+                - name: BACKUP_MAX_AGE_DAYS
+                  value: {{ .Values.backup.retention.maxAgeDays | quote }}
+                - name: BACKUP_MAX_COUNT
+                  value: {{ .Values.backup.retention.maxCount | quote }}
+              # Read-only root (restricted helper) requires explicit writable
+              # volumes: /tmp for pg_dump/pg_restore scratch space (Pitfall
+              # 3, mirrors migration-job.yaml's migration-tmp), and the
+              # dedicated postgres-backups PVC for the dump output itself.
+              # The backup pod never mounts the Postgres data PVC.
+              volumeMounts:
+                - name: backup-tmp
+                  mountPath: /tmp
+                - name: backups
+                  mountPath: /backups
+                - name: backup-script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: backup-tmp
+              emptyDir: {}
+            - name: backups
+              persistentVolumeClaim:
+                claimName: postgres-backups
+            - name: backup-script
+              configMap:
+                name: indramesh-backup-script
+                defaultMode: 0555
+{{- end }}

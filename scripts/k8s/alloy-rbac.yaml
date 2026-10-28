@@ -1,0 +1,37 @@
+# alloy-rbac.yaml — the exact D-10 namespaced log-reader RBAC for the Phase 301
+# Alloy release (LOGINFRA-03; T-301-11). Applied by scripts/k8s/lib/alloy.sh
+# BEFORE the Helm install (fail-closed), so the Alloy pod is already authorized
+# when it starts.
+#
+# D-10 verbatim: a Role in the `indramesh` namespace with exactly two rules —
+# pods: get/list/watch and pods/log: get — bound to the Alloy ServiceAccount
+# `alloy`, which lives in the `monitoring` namespace (the release namespace).
+# No cluster-scoped resources and no cluster-wide pods/pods-log: Alloy only
+# tails the logs of the indramesh namespace through the Kubernetes API, never
+# the node filesystem. Reviewing any widening of these verbs is mandatory.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: indramesh-alloy-log-reader
+  namespace: indramesh
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: indramesh-alloy-log-reader
+  namespace: indramesh
+subjects:
+  - kind: ServiceAccount
+    name: alloy
+    namespace: monitoring
+roleRef:
+  kind: Role
+  name: indramesh-alloy-log-reader
+  apiGroup: rbac.authorization.k8s.io

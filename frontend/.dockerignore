@@ -1,0 +1,22 @@
+test-results
+playwright-report
+node_modules
+
+# Playwright authentication state — a live session token, never part of an
+# image. The path is not tracked (`frontend/.gitignore` ignores it) and needs no
+# placeholder: Playwright creates the directory itself when it writes the state
+# file.
+playwright/.auth/*
+
+# `frontend/` is ONE build context. In the development checkout it is shared by
+# the dev image (`Dockerfile`) and the development-only E2E image
+# (`Dockerfile.e2e`), which copies `e2e/`, `playwright.config.js`, `pages/` and
+# `helpers/` from it. In that checkout, never add an `e2e` entry (or a
+# playwright-config entry) here — excluding the spec directory breaks the entire
+# E2E suite (PUB-07, Pitfall 12). The published tree ships only the dev image.
+
+# Build output and local tooling state.
+dist
+.claude
+.env
+.env.*

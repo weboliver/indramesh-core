@@ -1,0 +1,81 @@
+?start: query
+
+query: expression order_by?
+
+expression: or_expr
+
+// Keywords are case-insensitive throughout this grammar (the "i" suffix on a
+// Lark string literal — /docs: literals may be "string"i or /regex/i — makes
+// that single literal match any case at the lexer level; no separate named
+// terminal needed). Quoted STRING values (attribute names, objectType names,
+// comparison values) are of course NOT affected — only bare keyword tokens.
+?or_expr: and_expr ("OR"i and_expr)*
+
+?and_expr: not_expr ("AND"i not_expr)*
+
+?not_expr: NOT_OP not_expr -> negate
+         | atom
+
+?atom: "(" expression ")"
+     | condition
+
+condition: objecttype_condition | attr_condition | having_condition
+
+// AQL-09: `objectType IN ("A", "B")` multi-type filter. Kept as a second
+// alternative on the same rule (not a `->`-aliased separate rule) so
+// parser.py's `_count_conditions`/`_check_depth` node-name checks keep
+// working unchanged — the transformer disambiguates by inspecting whether
+// children[1] is a CMP_OP token or the first STRING of an IN(...) list.
+// `objectTypeAndChildren("X")` — X plus all descendant ObjectTypes (hierarchy
+// expansion). OBJECTTYPE_AND_CHILDREN_KW is a separate named terminal (not a
+// third OBJECTTYPE_KW alternative) — Lark's default terminal-priority rule
+// (longer literal wins) already makes it match before the shorter
+// "objectType" literal on this input, so no explicit priority needed; the
+// transformer disambiguates on children[0].type instead of children[1].
+objecttype_condition: OBJECTTYPE_KW CMP_OP STRING
+                     | OBJECTTYPE_KW "IN"i "(" STRING ("," STRING)* ")"
+                     | OBJECTTYPE_AND_CHILDREN_KW "(" STRING ")"
+
+// Reference traversal (D-01/D-02, 190-CONTEXT.md): "object" and "HAVING" are
+// anonymous string literals kept directly INSIDE this rule (never a combined
+// terminal) — same whitespace-in-terminal trap as ORDER BY above (lines 25-32).
+// REF_FN is a named terminal so it stays in the parse tree; the transformer
+// must index past it like it already does for OBJECTTYPE_KW/NOT_OP. The
+// nested argument reuses `expression` so `object HAVING inR(...)` clauses can
+// nest arbitrarily deep (bounded only by the AQL-07 _MAX_DEPTH limit).
+having_condition: "object"i "HAVING"i REF_FN "(" expression ("," "refType"i "IN"i "(" STRING ("," STRING)* ")")? ")"
+
+attr_condition: STRING CMP_OP value
+
+value: STRING | NUMBER | BOOL
+
+// VERIFIED FIX (review, 2026-07-30): "ORDER" "BY" must live directly in this
+// rule, not in a combined terminal — Lark terminals do NOT respect %ignore WS
+// between their own sub-parts, so a terminal like ORDER_BY_KW: "ORDER" "BY"
+// would only match the literal "ORDERBY" with zero characters in between.
+// Real input "ORDER BY" (with a space) would never match, and the lexer would
+// instead greedily match the boolean OR keyword out of "ORDER" and choke on
+// the leftover "DER". Only %ignore-eligible rules (not terminals) may have
+// whitespace between their tokens.
+order_by: "ORDER"i "BY"i NAME ORDER_DIRECTION?
+
+STRING: "\"" (/[^\"]+/)? "\""
+
+NUMBER: /-?\d+(\.\d+)?/
+
+BOOL: "true"i | "false"i
+
+CMP_OP: "=" | "!=" | ">" | "<" | ">=" | "<=" | "~"
+
+NOT_OP: "NOT"i
+OBJECTTYPE_KW: "objectType"i
+OBJECTTYPE_AND_CHILDREN_KW: "objectTypeAndChildren"i
+REF_FN: "inR"i | "outR"i
+
+ORDER_DIRECTION: "ASC"i | "DESC"i
+
+NAME: /[a-zA-Z_][a-zA-Z0-9_]*/
+// NAME is used for the "name" keyword in ORDER BY name
+
+%import common.WS
+%ignore WS

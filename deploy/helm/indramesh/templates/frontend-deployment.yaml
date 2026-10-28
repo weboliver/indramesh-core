@@ -1,0 +1,98 @@
+{{- /*
+frontend-deployment.yaml — the frontend ClusterIP Service and one-replica
+RollingUpdate Deployment for the k3s release (APP-01/APP-02/APP-04, D-01..D-04,
+D-09..D-11; T-257-07..09). Rendered ONLY when apps.enabled is true. Serves the
+compiled SPA from the production Caddy image on unprivileged port 8080 (D-03) —
+never Vite dev or preview mode (D-01); the Compose/Vite development port stays a
+dev-only contract outside this chart. A bounded same-image backend /health init
+check (D-09/D-10) gates app startup on the backend Service; busybox wget from
+the Caddy runtime image provides the check (D-11). The SPA/static/health routing
+contract is proven at the image level (T-257-08). Uses the shared restricted
+helper (T-257-04); the app writes nothing, so no writable volume is required.
+*/ -}}
+{{- if .Values.apps.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: indramesh-frontend
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: indramesh-frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: indramesh-frontend
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: indramesh-frontend
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.apps.frontend.replicas }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: indramesh-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: indramesh-frontend
+    spec:
+      # D-09/D-10: the frontend depends only on the backend Service. The bounded
+      # same-image check (D-11) uses busybox wget already present in the Caddy
+      # runtime image and exits non-zero with a service-labelled diagnostic.
+      initContainers:
+        - name: wait-backend
+          image: "{{ .Values.apps.frontend.image.repository }}:{{ .Values.apps.frontend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.frontend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.frontend.wait.attempts }}); do wget -q -O /dev/null -T 2 http://backend:8000/health && exit 0; sleep {{ .Values.apps.frontend.wait.sleepSeconds }}; done; echo 'backend:8000/health not ready after {{ .Values.apps.frontend.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+      containers:
+        - name: indramesh-frontend
+          image: "{{ .Values.apps.frontend.image.repository }}:{{ .Values.apps.frontend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.frontend.image.pullPolicy }}
+          # D-01/D-03: the compiled SPA via the Caddy runtime on port 8080; the
+          # probe path and SPA/static routing contract are image-level (T-257-08).
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.apps.frontend.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+{{- end }}

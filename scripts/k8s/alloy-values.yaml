@@ -1,0 +1,92 @@
+# alloy-values.yaml — checked-in, non-secret trimmed values for the Phase 301
+# Grafana Alloy release (LOGINFRA-03; D-10, D-11, D-12; T-254-02, T-301-11).
+# Consumed by scripts/k8s/lib/alloy.sh as the FIRST `--values` argument of a
+# local-tgz `helm upgrade --install` (the SHA-256-pinned chart is the verified
+# path — the chart is unsigned, so no OCI `--verify`; D-11).
+#
+# Pinned chart: grafana/alloy 1.13.0 (ALLOY_CHART_VERSION in versions.env).
+# Every key below was re-verified against that chart's own values.yaml
+# (alloy-1.13.0.tgz) before being written — re-read the live values.yaml of a
+# new chart version before moving the pin (D-10).
+#
+# D-10 shape: a 1-replica, non-root Deployment that tails pod logs through the
+# Kubernetes API (`loki.source.kubernetes`), never via hostPath/privileged
+# DaemonSet on /var/log/pods. The namespaced Role/RoleBinding (D-10 verbatim)
+# ships in scripts/k8s/alloy-rbac.yaml and is applied by lib/alloy.sh BEFORE
+# this release is installed, so rbac.create is false here (the chart must not
+# add its broader cluster/namespace Roles).
+
+# D-10: Deployment (chart default is daemonset), exactly one replica.
+controller:
+  type: deployment
+  replicas: 1
+
+alloy:
+  # D-10: run non-root with an explicit unprivileged uid and no privilege
+  # escalation. The chart's configReloader.securityContext is irrelevant here
+  # (the reloader is disabled below), but Alloy's own container context is
+  # empty by default — set it explicitly.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    allowPrivilegeEscalation: false
+
+  # D-10: keep hostPath off. API-based tailing needs no node filesystem access.
+  mounts:
+    varlog: false
+    dockercontainers: false
+
+  # The assembled config always arrives through the installer's PRIVATE values
+  # file (alloy.configMap.content, right-most `--values`), so this checked-in
+  # file keeps the ConfigMap enabled with empty content. A bare
+  # `--values alloy-values.yaml` install would run Alloy with only its UI —
+  # always the right-most contract, never a stray config.
+  configMap:
+    create: true
+    content: ''
+
+  # Base env only; the installer's private values replace this list with
+  # LOG_ENV/LOKI_URL/OTLP_* (D-02 mirror of the Compose env model).
+  extraEnv: []
+
+# PodLogs CRD is unused (no loki.source.podlogs) — do not install the CRD.
+crds:
+  create: false
+
+# Disable the config-reloader sidecar: it would pull the
+# prometheus-operator/prometheus-config-reloader image into the air-gapped
+# import list, which must stay limited to grafana/alloy.
+configReloader:
+  enabled: false
+
+# D-10: the chart-managed RBAC is deliberately off. The exact namespaced Role
+# (pods get/list/watch + pods/log get in `indramesh`) comes from
+# scripts/k8s/alloy-rbac.yaml via the installer — never the chart's broader
+# namespace/cluster Roles.
+rbac:
+  create: false
+
+# The RoleBinding in alloy-rbac.yaml targets this exact ServiceAccount name in
+# the monitoring namespace, so pin it explicitly.
+serviceAccount:
+  create: true
+  name: alloy
+
+# Image-tag override: the chart's appVersion is v1.20.0, but the project pin is
+# the current collector v1.20.1 (RESEARCH 2026-10-06). This is the chart's
+# TOP-LEVEL image.tag key — `alloy.image.tag` is silently ignored by the chart.
+image:
+  tag: v1.20.1
+
+# D-12 paired NetworkPolicy. The chart default is allow-all ingress AND egress;
+# tighten both: egress rules are supplied by the installer's private values
+# (kube-dns, kube-apiserver /32, Loki, and — only when an external sink is
+# selected — the derived OTLP port). `ingress: null` with policyTypes
+# [Ingress, Egress] renders no ingress rules at all, i.e. all ingress denied:
+# Alloy needs none (it only tails via the API and pushes out).
+networkPolicy:
+  enabled: true
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: null

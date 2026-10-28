@@ -1,0 +1,13 @@
+#!/bin/sh
+blocked=0
+git diff --cached --name-status | while IFS="	" read -r status file; do
+  # Deletions of a now-gitignored file are always safe (nothing is being
+  # committed) - only block add/modify of gitignored paths.
+  [ "$status" = "D" ] && continue
+  if git check-ignore -q --no-index -- "$file"; then
+    echo "ERROR: '$file' is gitignored and cannot be committed (even with git add --force)" >&2
+    exit 1
+  fi
+done
+blocked=$?
+exit $blocked

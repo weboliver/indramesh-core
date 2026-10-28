@@ -1,0 +1,15 @@
+# Chart.yaml — canonical local Helm chart contract for the Phase 254 k3s
+# bootstrap (D-21). The canonical chart path is deploy/helm/indramesh; the Helm
+# release identity remains `indramesh` (D-21). Phase 254 ships only the bootstrap
+# chart metadata: it must carry no workload, Secret, PSA, stateful-service,
+# ingress/TLS, image-import, backup, or monitoring resources — those are owned
+# by later v16.0 phases. The endpoint contract that this phase's installer
+# hands to the reachability adapter lives in values.yaml
+# (bootstrap.endpoint.status=deferred, bootstrap.endpoint.url=""); Phase 259
+# flips it to `ready` with the real Ingress/TLS URL (D-23).
+apiVersion: v2
+name: indramesh
+description: IndraMeshDB canonical bootstrap chart (Phase 254)
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

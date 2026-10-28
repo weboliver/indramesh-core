@@ -1,0 +1,41 @@
+name = "example"
+version = "1.0.0"
+author = "IndraMesh"
+license = "AGPL-3.0-or-later"
+api_version = "1.0.0"
+capabilities = ["api_routes", "task_type", "connector"]
+module = "module"
+requires_worker_update = true
+active_by_default = false
+
+[config_schema]
+type = "object"
+
+[config_schema.properties.greeting]
+type = "string"
+default = "hello"
+
+[config_schema.properties.api_token]
+type = "string"
+format = "password"
+
+[frontend]
+bundle = "static/example.js"
+extension_points = ["pages", "navItems", "attributeEditors", "actionButtons", "settingsSections", "taskForms", "connectorConfigEditors", "objectDetailSections", "schemaSettingsSections", "objectTypeSettingsSections", "itemBadges", "schemaWizardEntries", "translationPanelActions", "translationAdminActions", "taskDetailActions"]
+
+[database]
+migrations_dir = "migrations"
+version_table = "alembic_version_example"
+
+# Phase 303 (SEAM-01, Carry-01): reference permission declarations. Each entry
+# becomes a persisted Core permission named `resource:action`, owned by this
+# plugin, with exactly these default-role grants applied on first insert.
+[[permissions]]
+resource = "example-tools"
+action = "read"
+default_roles = ["Administrator", "Editor", "Viewer"]
+
+[[permissions]]
+resource = "example-tools"
+action = "manage"
+default_roles = ["Administrator"]

@@ -1,0 +1,40 @@
+// Phase 301 (LOGINFRA-02/Carry-Labels): sink fragment for the bundled Loki.
+// Selected by ALLOY_SINK=loki (the default). It is `cat`ed after
+// base-docker.alloy, so it defines loki.process "app" (the base forwards into
+// it) and the loki.write target.
+
+loki.process "app" {
+  forward_to = [loki.write.bundled.receiver]
+
+  // App JSON line (LOG_FORMAT=json in Compose-prod and k8s). drop_malformed
+  // stays false so non-JSON lines (postgres, nginx, valkey, elasticsearch)
+  // pass through with only the service/env labels instead of being dropped.
+  stage.json {
+    expressions    = { level = "", category = "", request_id = "", task_id = "", user_id = "", plugin = "" }
+    drop_malformed = false
+  }
+
+  // Dev Compose runs LOG_FORMAT=console (the renderer emits key=value), so the
+  // same frozen fields are parsed a second time by logfmt. One config serves
+  // every LOG_FORMAT (OQ1 dual-stage); logfmt ignores non-key=value tokens.
+  stage.logfmt {
+    mapping = { level = "", category = "", request_id = "", task_id = "", user_id = "", plugin = "" }
+  }
+
+  // Low-cardinality labels only. Level values are lowercase (structlog
+  // add_log_level). request_id/task_id/user_id/plugin must NEVER be labels.
+  stage.labels {
+    values = { level = "", category = "" }
+  }
+
+  // High-cardinality identifiers stay structured metadata.
+  stage.structured_metadata {
+    values = { request_id = "", task_id = "", user_id = "", plugin = "" }
+  }
+}
+
+loki.write "bundled" {
+  endpoint {
+    url = sys.env("LOKI_URL")
+  }
+}

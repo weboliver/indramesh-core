@@ -1,0 +1,54 @@
+// Phase 301 (LOGINFRA-03, D-10): Kubernetes log collection through the
+// Kubernetes API. Alloy runs non-root and tails pod logs via the API server
+// (loki.source.kubernetes) with a namespaced Role — it never mounts
+// /var/log/pods and is not a privileged DaemonSet.
+//
+// This base fragment ends by forwarding into loki.process "app". The sink
+// fragment (selected by ALLOY_SINK and `cat`ed after this file) defines that
+// component, so the runnable config is always base + exactly one sink.
+//
+// The namespace restriction MUST live in the discovery block: the RBAC Role is
+// namespaced to `indramesh` (D-10), so a cluster-wide pod list/watch would be
+// answered with 403 and yield zero targets. A later relabel filter on
+// __meta_kubernetes_namespace would be too late.
+//
+// There is deliberately no Helm template marker here: the chart runs
+// alloy.configMap.content through `tpl`, so this file must stay valid Alloy
+// syntax and get its env via sys.env("LOG_ENV") — the same env model as the
+// Compose base fragment.
+
+discovery.kubernetes "pods" {
+  role = "pod"
+
+  namespaces {
+    names = ["indramesh"]
+  }
+}
+
+discovery.relabel "pods" {
+  targets = discovery.kubernetes.pods.targets
+
+  // service = the container name (backend, worker, ...) within the pod.
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "service"
+  }
+
+  // namespace is a first-class low-cardinality label in k8s (Carry-Labels).
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    target_label  = "namespace"
+  }
+
+  // env = the deployment environment, from the installer-injected LOG_ENV
+  // (mirrors the Compose `com.indramesh.env` label; D-02).
+  rule {
+    replacement = sys.env("LOG_ENV")
+    target_label = "env"
+  }
+}
+
+loki.source.kubernetes "pods" {
+  targets    = discovery.relabel.pods.output
+  forward_to = [loki.process.app.receiver]
+}

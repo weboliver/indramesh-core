@@ -1,0 +1,276 @@
+{{- /*
+migration-job.yaml — the installer-owned Alembic lifecycle Jobs for the k3s
+release (APP-03, D-05..D-08, D-16; T-257-01). Rendered ONLY when apps.enabled
+is true, so the D-16 stateful-only bootstrap pass renders neither Job and the
+full pass renders exactly two Jobs, on either side of the app tier:
+
+  1. indramesh-migration-<rev> — `pre-upgrade` hook, runs `alembic upgrade
+     head` and then the plugin role bootstrap
+     (`python -m app.plugin_system.bootstrap_role`, Phase 287.1 D-03/D-04) in
+     one fatal `&&` chain. Still fatal (T-257-01): a non-zero exit — including
+     a configured-but-failing bootstrap — fails the release through the Job's
+     own failure, before any app resource is touched and before Job (2) can
+     run. This Job does NOT mount plugins-storage (see (2)) — a short-lived,
+     volume-less Job is exactly what Helm's pre-upgrade hooks are for.
+
+  2. indramesh-plugin-migration-<rev> — `post-install,post-upgrade` hook,
+     runs `python -m app.plugin_system.migrate` after Helm's `--wait` has
+     confirmed the ENTIRE ordinary release (including plugins-storage and
+     the backend/worker Deployments) is ready. It is non-fatal for
+     plugin-attributable failures only (D-16): it exits 0 with a prominent
+     warning when a single plugin's migration fails, so one broken plugin
+     never blocks the release, while a genuinely broken runner still
+     surfaces as a non-zero Job (which DOES fail `helm upgrade`, same as any
+     other hook — this is why the module's own exit(main()) contract, not a
+     shell wrapper, decides the container's exit code).
+
+2026-09-22 history — these were previously one combined pre-upgrade Job
+(`alembic upgrade head && python -m app.plugin_system.migrate`), and
+plugins-storage was mounted read-only into it. That combination repeatedly
+deadlocked: a pre-upgrade hook needs its dependencies to exist before ANY
+ordinary resource (including its own PVC) is applied, and once the PVC was
+moved to a hook to fix that, converting an already-tracked ordinary resource
+into a hook triggered Helm's manifest-diff pruning against it (see
+plugins-pvc.yaml's header and the linked todo for the full, hard-won account).
+Splitting the Job removes the plugin runner from the pre-upgrade phase
+entirely, so it never again needs a resource that doesn't exist yet — by
+post-upgrade, `--wait` guarantees plugins-storage is bound and the
+Deployments that also mount it are Ready.
+
+Because a plugin failure yields a *succeeded* Job, `hook-succeeded` deletion
+removes the runner's warning logs together with the Job. The technical cause is
+therefore visible only via log aggregation or the persisted short diagnostic
+(plan 287-03) — operators must not rely on the deleted Job's container logs.
+
+Phase 296 (CLEAN-05, D-10) adds two ordered pre-upgrade maintenance hooks in
+maintenance-job.yaml, both positioned around THIS Job's default 0: a
+clear-queue hook (strictly lower order) runs before `alembic upgrade head`,
+and a purge-cache hook (strictly higher order) runs after it, giving the
+supported order quiesce -> clear queue -> Core migrate -> purge-cache ->
+rollout. Those hooks render only with the opt-in apps.maintenance.cutover
+(default false); this Job itself is not gated by it. This Job's hook annotations, shape and the plugin-migration split are
+unchanged.
+
+Job (2) mounts the shared `plugins-storage` PVC read-only so the runner
+discovers the same plugins the backend/worker Deployments load. That claim is
+ReadWriteOnce (see plugins-pvc.yaml): the Job must be scheduled on the same
+node as those Deployments (single-node k3s is the documented target), otherwise
+the pod waits in ContainerCreating until activeDeadlineSeconds and the release
+fails.
+*/ -}}
+{{- if .Values.apps.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Revision-qualified name: a retained failed Job never collides with a later
+  # retry (T-257-01). pre-upgrade runs before normal resources are updated and
+  # fails the release on Job failure (D-07); hook-succeeded-only deletion keeps
+  # failed-Job evidence for diagnosis and never deletes it ahead of a retry.
+  name: indramesh-migration-{{ .Release.Revision }}
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  # Finite retry/deadline bounds (D-08): the installer fails with an
+  # identifiable migration error rather than waiting indefinitely.
+  backoffLimit: {{ .Values.apps.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.apps.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: indramesh-migration
+    spec:
+      restartPolicy: Never
+      # D-09/D-10: bounded same-image dependency gate. On a fresh install the
+      # stateful Services exist but postgres initializes lazily (its pod may not
+      # be Ready when the pre-upgrade hook fires), so the Job must not begin
+      # `alembic upgrade head` until postgres accepts connections — otherwise the
+      # 300s activeDeadlineSeconds expires while alembic retries a downed DB and
+      # the release fails with DeadlineExceeded before the DB ever becomes Ready.
+      # This init container mirrors the backend Deployment wait-postgres pattern
+      # (bash /dev/tcp raw TCP-connect probe, finite values-driven attempts,
+      # service-labelled failure diagnostic, shared restricted context, same
+      # backend image) but is bounded by apps.migration.wait so the wait window
+      # stays inside the Job's activeDeadlineSeconds (T-257-06, D-08).
+      #
+      # Live finding (2026-09-01): `curl telnet://host:port` is NOT a bare
+      # TCP-connect check — curl's telnet protocol handler connects, then BLOCKS
+      # waiting to read data from the server. Postgres (and Redis) never send an
+      # unsolicited greeting (the client speaks first), so the probe always times
+      # out (curl exit 28) even when the server is fully healthy, and the Job
+      # always fails via activeDeadlineSeconds regardless of Postgres's actual
+      # state. Fixed with bash's `/dev/tcp/<host>/<port>` pseudo-device, which
+      # only performs the TCP handshake and returns immediately — verified live
+      # against a healthy postgres:5432 (exit 0) and an unreachable host (exit
+      # 1, bounded by the outer `timeout`). `bash` is present in the backend
+      # image (`/usr/bin/bash`).
+      initContainers:
+        - name: wait-postgres
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.migration.wait.attempts }}); do timeout 2 bash -c 'exec 3<>/dev/tcp/postgres/5432' >/dev/null 2>&1 && exit 0; sleep {{ .Values.apps.migration.wait.sleepSeconds }}; done; echo 'postgres:5432 not reachable after {{ .Values.apps.migration.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+      containers:
+        - name: migration
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          # D-05 + Phase 287.1 (D-03/D-04): the CORE migration, then the plugin
+          # role bootstrap, in one fatal `&&` chain. `bootstrap_role` is a
+          # non-caught step: a configured-but-failing bootstrap (or a detected
+          # privilege drift) aborts this Job, and because Job (2) is a
+          # post-install/post-upgrade hook it never starts — Helm fails the
+          # release on this pre-upgrade hook. Never softened with a shell
+          # OR-truthy fallback. The plugin runner itself stays in its own
+          # post-upgrade Job below (2026-09-22).
+          command: ["sh", "-ec", "alembic upgrade head && python -m app.plugin_system.bootstrap_role"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          env:
+            # Phase 298 (D-15): this Job sets no ENVIRONMENT, so without the
+            # explicit LOG_FORMAT it would render console instead of JSON.
+            {{- include "indramesh.loggingEnv" . | nindent 12 }}
+            - name: DB_HOST
+              value: postgres
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: DB_PASSWORD
+            - name: DB_NAME
+              value: {{ .Values.postgres.database | quote }}
+            # Phase 287.1 (PLUGDB-07, D-01/D-08; CR-02): the plugin migration
+            # role credentials the bootstrap needs, rendered ONLY when the
+            # operator configured the role name. An unconfigured install renders
+            # neither variable, so the documented "both absent" weakened fallback
+            # (D-09/D-10) is reachable on Kubernetes exactly as in Compose. The
+            # password is referenced from the existing indramesh-database Secret
+            # (never a Helm value) and is `optional: true`, so a Secret that
+            # predates the key degrades to the legible fail-closed configuration
+            # error instead of a CreateContainerConfigError. Both Jobs carry the
+            # same gate so the pre-upgrade bootstrap and the post-upgrade role
+            # child share one identity decision.
+            {{- if .Values.plugins.dbUser }}
+            - name: PLUGIN_DB_USER
+              value: {{ .Values.plugins.dbUser | quote }}
+            - name: PLUGIN_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: PLUGIN_DB_PASSWORD
+                  optional: true
+            {{- end }}
+          # Read-only root (restricted helper) requires an explicit writable
+          # volume for the Python temporary directory (D-15); app file data is
+          # intentionally ephemeral in this phase.
+          volumeMounts:
+            - name: migration-tmp
+              mountPath: /tmp
+      volumes:
+        - name: migration-tmp
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Revision-qualified, same rationale as the core Job above.
+  name: indramesh-plugin-migration-{{ .Release.Revision }}
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+    # post-install too: a fresh install's very first successful apply should
+    # also run plugin migrations, not just subsequent upgrades.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  backoffLimit: {{ .Values.apps.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.apps.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: indramesh-plugin-migration
+    spec:
+      restartPolicy: Never
+      # No wait-postgres init container here: `--wait` already guarantees the
+      # postgres StatefulSet (and everything else in the ordinary manifest,
+      # including plugins-storage and the backend/worker Deployments) is Ready
+      # before ANY post-upgrade hook fires — that readiness gate is the entire
+      # reason this Job runs post-upgrade instead of pre-upgrade.
+      containers:
+        - name: plugin-migration
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          # D-16: the plugin runner's own module entry point decides the
+          # container's exit code directly (sys.exit(main())) — 0 for every
+          # plugin-attributable outcome, non-zero only for an unexpected
+          # core-level exception. No shell wrapper needed: there is nothing
+          # else to chain it with in this Job.
+          command: ["python", "-m", "app.plugin_system.migrate"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          env:
+            # Phase 298 (D-15): the runner renders JSON too; no ENVIRONMENT is
+            # set on this Job, so LOG_FORMAT is declared explicitly.
+            {{- include "indramesh.loggingEnv" . | nindent 12 }}
+            - name: DB_HOST
+              value: postgres
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: DB_PASSWORD
+            - name: DB_NAME
+              value: {{ .Values.postgres.database | quote }}
+            # Phase 287.1 (PLUGDB-07, D-01/D-08; CR-02): the role child executes
+            # each revision with this identity. Same optional gate as Job (1):
+            # when plugins.dbUser is unset neither variable is rendered and the
+            # runner takes the documented weakened fallback (D-09/D-10).
+            {{- if .Values.plugins.dbUser }}
+            - name: PLUGIN_DB_USER
+              value: {{ .Values.plugins.dbUser | quote }}
+            - name: PLUGIN_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: PLUGIN_DB_PASSWORD
+                  optional: true
+            {{- end }}
+            # The plugin runner discovers plugins from the same PVC mount the
+            # backend and worker Deployments use; without it the runner finds
+            # zero plugins in the cluster.
+            - name: INDRAMESH_PLUGINS_DIR
+              value: {{ .Values.plugins.mountPath | quote }}
+          volumeMounts:
+            - name: migration-tmp
+              mountPath: /tmp
+            # Read-only: the Job executes plugin migration code, it never
+            # writes plugin files (RESEARCH A5).
+            - name: plugins
+              mountPath: {{ .Values.plugins.mountPath }}
+              readOnly: true
+      volumes:
+        - name: migration-tmp
+          emptyDir: {}
+        # Reuse the existing single `plugins-storage` claim (plugins-pvc.yaml)
+        # — do not create a second PVC. By post-upgrade this is an ordinary,
+        # already-bound resource; nothing hook-specific about it.
+        - name: plugins
+          persistentVolumeClaim:
+            claimName: plugins-storage
+{{- end }}

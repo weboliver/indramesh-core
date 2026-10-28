@@ -1,0 +1,191 @@
+#!/bin/bash
+# IndraMesh k3s lifecycle wrapper (BOOT-02, D-16..D-20).
+#
+# Stops the k3s systemd service directly: `sudo systemctl stop k3s` when a
+# transition is needed, then polls `systemctl is-active` for the target state
+# within a short bounded timeout (default 30s; override only for tests).
+# Idempotent: an already-stopped service is a successful no-op. Graceful
+# stop only — never scales/deletes workloads, removes PVCs, or resets data
+# (D-19, T-254-04).
+#
+# Also stops the indramesh-local-forward@{80,443} WSL2 reachability bridge
+# (scripts/k8s/lib/local_forward.sh) if it is installed. That bridge is a
+# `systemctl enable`d, `Restart=always` socat relay bound to host 127.0.0.1
+# ports 80/443 — it is NOT tied to k3s.service's own lifecycle (no
+# `After=`/`BindsTo=` relationship), so stopping k3s alone left it running
+# and squatting the same host ports the Docker Compose dev stack's Nginx
+# needs (confirmed live, 2026-09-03: `./stop` did not free port 80, and
+# `docker compose up nginx` failed with "address already in use" against
+# the still-running bridge). With k3s stopped the bridge is useless anyway
+# (its backend, Traefik, is down) — stopping it too both closes that gap
+# and hands the ports back for Compose.
+#
+# `--full`: the plain graceful stop above only signals the k3s systemd unit
+# (`KillMode=process` in k3s.service stops just the k3s server binary), so
+# every `containerd-shim-runc-v2` process and the pods it supervises
+# (Grafana, Prometheus, node_exporter, etc.) are left running on the host by
+# k3s's own upstream design — they survive on purpose so a k3s restart
+# doesn't churn pods. `systemctl status k3s` reports "inactive" while those
+# processes keep consuming CPU/RAM (confirmed live, 2026-09-12). `--full`
+# additionally runs the upstream `k3s-killall.sh` after the graceful stop to
+# reap those orphaned shims/containers/mounts/iptables rules. This is a
+# strictly opt-in extra step on top of D-19's graceful-stop-only default,
+# not a change to the default `./stop` behavior.
+#
+# `--disable`: also clears the boot-time enablement of `k3s.service` and of the
+# local-forward bridge, so a REBOOT leaves the host without a cluster and
+# without the bridge (which would otherwise flap against a systemd start limit
+# while its backend is down). Plain `./stop` only stops them for the current
+# boot. The cluster's data is untouched either way — this never uninstalls k3s
+# or removes PVCs (use the upstream `k3s-uninstall.sh` for that). Runs in the
+# already-stopped path too: "not running" and "must not come back" are
+# different states. Undo with `./start --enable`.
+set -euo pipefail
+
+K3S_UNIT="k3s"
+STATE_TIMEOUT_SECS="${K3S_STOP_TIMEOUT_SECS:-30}"
+POLL_INTERVAL=1
+LOCAL_FORWARD_PORTS="80 443"
+KILLALL_SCRIPT="/usr/local/bin/k3s-killall.sh"
+FULL_STOP=0
+DISABLE_UNITS=0
+
+k3s_state() {
+  systemctl is-active "$K3S_UNIT" 2>/dev/null || true
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+stop_local_forward_bridge() {
+  # Best-effort, non-fatal: the bridge only exists on a host where
+  # ./install_indramesh_k8s.sh has run (scripts/k8s/lib/local_forward.sh
+  # reconcile_local_forward). Absence is not an error.
+  #
+  # `systemctl list-unit-files` matches unit FILE names on disk — the
+  # template `indramesh-local-forward@.service`, never an instantiated name
+  # like `indramesh-local-forward@80.service` (confirmed live, 2026-09-03:
+  # `systemctl list-unit-files indramesh-local-forward@80.service` -> "0 unit
+  # files listed", exit 1, even though the template is installed and
+  # enabled) — checking the instantiated name here silently skipped every
+  # port and made this whole function a no-op. Check the TEMPLATE once.
+  local port unit any_active=0
+  if ! systemctl list-unit-files 'indramesh-local-forward@.service' >/dev/null 2>&1; then
+    return 0
+  fi
+  for port in $LOCAL_FORWARD_PORTS; do
+    unit="indramesh-local-forward@${port}.service"
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      any_active=1
+      echo "Stopping ${unit} (WSL2 reachability bridge, port ${port})..."
+      if ! sudo systemctl stop "$unit"; then
+        echo "WARNING: failed to stop ${unit} — port ${port} may still be held (diagnose with: systemctl status ${unit})" >&2
+      fi
+    fi
+  done
+  if [ "$any_active" -eq 1 ]; then
+    echo "Local-forward bridge stopped — host ports 80/443 are free for other use (e.g. Docker Compose)."
+  fi
+}
+
+run_killall() {
+  # Best-effort reap of orphaned k3s shims/containers/mounts/iptables rules
+  # left behind by the graceful stop above (k3s.service's `KillMode=process`
+  # only kills the k3s server binary, not the containerd-shim-runc-v2
+  # processes it spawned — see header comment). Requires --full.
+  if [ ! -x "$KILLALL_SCRIPT" ]; then
+    die "--full requested but $KILLALL_SCRIPT not found or not executable — install/repair k3s via ./install_indramesh_k8s.sh"
+  fi
+  echo "Running $KILLALL_SCRIPT to reap orphaned k3s shims/containers..."
+  sudo "$KILLALL_SCRIPT"
+  echo "Orphaned k3s workloads cleaned up."
+}
+
+disable_lifecycle_units() {
+  # --disable: clear the boot-time enablement so a reboot brings back neither
+  # the cluster nor the bridge (see header comment). `systemctl disable` never
+  # stops a running unit and never touches data, so this is safe next to the
+  # graceful stop above and, deliberately, in the already-stopped path too.
+  # Best-effort for the bridge: it exists only on a host where
+  # ./install_indramesh_k8s.sh has run. `list-unit-files` matches unit FILE
+  # names on disk — the template, never an instantiated name (see
+  # stop_local_forward_bridge).
+  local port unit
+  echo "Disabling ${K3S_UNIT}.service so it stays stopped across a reboot..."
+  if ! sudo systemctl disable "$K3S_UNIT" >/dev/null 2>&1; then
+    die "failed to disable $K3S_UNIT — diagnose with: systemctl status $K3S_UNIT"
+  fi
+  if systemctl list-unit-files 'indramesh-local-forward@.service' >/dev/null 2>&1; then
+    for port in $LOCAL_FORWARD_PORTS; do
+      unit="indramesh-local-forward@${port}.service"
+      if sudo systemctl disable "$unit" >/dev/null 2>&1; then
+        echo "Disabled ${unit} (port ${port})."
+      else
+        echo "WARNING: failed to disable ${unit} — it may come back after a reboot (diagnose with: systemctl status ${unit})" >&2
+      fi
+    done
+  fi
+  echo "k3s and the reachability bridge will not start after a reboot; cluster data is untouched. Undo with: ./start --enable"
+}
+
+main() {
+  local current elapsed arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --full) FULL_STOP=1 ;;
+      --disable) DISABLE_UNITS=1 ;;
+      *) die "unknown argument: $arg (usage: ./stop [--full] [--disable])" ;;
+    esac
+  done
+
+  if [ "$DISABLE_UNITS" -eq 1 ]; then
+    disable_lifecycle_units
+  fi
+
+  stop_local_forward_bridge
+
+  current="$(k3s_state)"
+
+  if [ "$current" != "active" ]; then
+    echo "k3s is already stopped (no-op)."
+    if [ "$FULL_STOP" -eq 1 ]; then
+      run_killall
+    fi
+    if [ "$DISABLE_UNITS" -eq 1 ]; then
+      echo "Next: ./start --enable to make the cluster persistent again"
+    else
+      echo "Next: ./start to start the k3s service"
+    fi
+    exit 0
+  fi
+
+  echo "Stopping k3s service..."
+  if ! sudo systemctl stop "$K3S_UNIT"; then
+    die "failed to stop k3s — missing service or sudo failure; run ./install_indramesh_k8s.sh (diagnose with: systemctl status k3s)"
+  fi
+
+  elapsed=0
+  while [ "$elapsed" -lt "$STATE_TIMEOUT_SECS" ]; do
+    if [ "$(k3s_state)" != "active" ]; then
+      echo "k3s is stopped."
+      if [ "$FULL_STOP" -eq 1 ]; then
+        run_killall
+      fi
+      if [ "$DISABLE_UNITS" -eq 1 ]; then
+        echo "Next: ./start --enable to make the cluster persistent again"
+      else
+        echo "Next: ./start to start the k3s service"
+      fi
+      exit 0
+    fi
+    sleep "$POLL_INTERVAL"
+    elapsed=$((elapsed + POLL_INTERVAL))
+  done
+
+  die "k3s did not stop within ${STATE_TIMEOUT_SECS}s — diagnose with: systemctl status k3s"
+}
+
+main "$@"

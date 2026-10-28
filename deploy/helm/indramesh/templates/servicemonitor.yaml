@@ -1,0 +1,39 @@
+{{- /*
+servicemonitor.yaml — the MON-02 scrape contract (D-06/D-07, T-261-04..06):
+Prometheus discovers and scrapes backend:8000/metrics (up == 1). Rendered ONLY
+when BOTH monitoring.enabled and apps.enabled are true — the ServiceMonitor
+selects the backend Service, which exists only under apps.enabled (D-16
+two-pass install), and the scrape surface only makes sense when the monitoring
+toggle is on.
+
+Cross-namespace selector contract (research Pitfall 1, Pattern 3): the stack's
+Prometheus is configured Option A via scripts/k8s/monitoring-values.yaml
+(serviceMonitorSelectorNilUsesHelmValues: false + empty selectors), so this
+indramesh-namespace ServiceMonitor is discovered WITHOUT a release:
+kube-prometheus-stack label. Do NOT add one — that is the Option-B coupling the
+plan explicitly prohibits.
+
+The metadata contract mirrors backup-cronjob.yaml:24-28 (managed-by label +
+release annotations) so every chart-owned document carries the same Helm
+identity.
+*/ -}}
+{{- if and .Values.monitoring.enabled .Values.apps.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: indramesh-backend
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: indramesh-backend        # backend-deployment.yaml:27
+  endpoints:
+    - port: http                             # backend-deployment.yaml:29
+      path: /metrics
+      interval: 30s
+{{- end }}

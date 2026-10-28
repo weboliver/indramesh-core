@@ -1,0 +1,15 @@
+# Phase 301 (D-08): file provider for the checked-in starter dashboards. The
+# path is the read-only mount of observability/grafana/dashboards.
+apiVersion: 1
+
+providers:
+  - name: indramesh-logs
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

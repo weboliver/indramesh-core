@@ -1,0 +1,170 @@
+{{- /*
+maintenance-job.yaml — the two ordered, bounded pre-upgrade maintenance hooks
+for the Phase 296 one-way cut-over (CLEAN-05, D-10). Rendered ONLY when
+apps.enabled AND the opt-in apps.maintenance.cutover are both true, alongside
+the Core migration Job in migration-job.yaml. apps.maintenance.cutover defaults
+to false: a routine upgrade (no quiesce) must never clear the ARQ queue or
+purge caches under the still-running pods.
+
+Both Jobs are `pre-upgrade` hooks whose relative ORDER is carried entirely by
+Helm's ascending hook ordering. The Core migration Job keeps its documented
+default order value 0, so the effective sequence is:
+
+    indramesh-maintenance-clear-queue-<rev>   (order -5)  clear-queue (+ fail orphaned Tasks)
+        indramesh-migration-<rev>             (order  0)  Core migrate
+    indramesh-maintenance-purge-cache-<rev>   (order +5)  purge-cache
+
+i.e. quiesce -> clear-queue -> Core migrate -> purge-cache -> rollout. The two
+maintenance subcommands are deliberately SEPARATE Jobs: a single combined
+queue-clear-plus-purge entry point would run the queue clear after the
+migration and break the D-10 order, so no combined entry point is declared
+here. Each Job runs exactly one bounded `python -m app.maintenance` call. The
+plugin runner stays in its own post-upgrade Job (migration-job.yaml); neither
+maintenance hook mounts the plugin PVC.
+
+Operator preconditions (D-10): scale the old backend/worker Deployments to
+zero and WAIT for their pods to terminate before starting the upgrade, then
+prevent the controller from recreating them for the maintenance window. A
+`--set ...replicas=0` inside the SAME `helm upgrade` does NOT satisfy this —
+the pre-upgrade hooks fire before the new replica values take effect, so the
+old pods would still be writing during the drop. After the destructive drop
+there is no rollback to old images; only forward correction. The full runbook
+lives in docs/DEPLOYMENT.md.
+*/ -}}
+{{- if and .Values.apps.enabled .Values.apps.maintenance.cutover }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: indramesh-maintenance-clear-queue-{{ .Release.Revision }}
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded
+    # Strictly BELOW the Core migration Job's default order value (0): the ARQ
+    # queue is cleared BEFORE `alembic upgrade head` runs.
+    "helm.sh/hook-weight": "-5"
+spec:
+  # Same finite retry/deadline bounds as the migration Job (D-08).
+  backoffLimit: {{ .Values.apps.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.apps.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: indramesh-maintenance-clear-queue
+    spec:
+      restartPolicy: Never
+      # Bounded same-image Valkey dependency gate (mirrors the migration Job's
+      # wait-postgres / the backend wait-valkey `/dev/tcp` probe): the queue
+      # clear must not begin until Valkey accepts connections.
+      initContainers:
+        - name: wait-valkey
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.migration.wait.attempts }}); do timeout 2 bash -c 'exec 3<>/dev/tcp/valkey/6379' >/dev/null 2>&1 && exit 0; sleep {{ .Values.apps.migration.wait.sleepSeconds }}; done; echo 'valkey:6379 not reachable after {{ .Values.apps.migration.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+      containers:
+        - name: clear-queue
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "python -m app.maintenance clear-queue"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          env:
+            # Phase 298 (D-15): no ENVIRONMENT on this Job, so LOG_FORMAT is
+            # declared explicitly to render JSON like every other process.
+            {{- include "indramesh.loggingEnv" . | nindent 12 }}
+            - name: DB_HOST
+              value: postgres
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: DB_PASSWORD
+            - name: DB_NAME
+              value: {{ .Values.postgres.database | quote }}
+            # VALKEY_PASSWORD must precede VALKEY_URL: Kubernetes only expands a
+            # $(VAR) reference in an env value when VAR is defined EARLIER in
+            # the same env list. The password lives in the indramesh-valkey
+            # Secret — the same source the backend Deployment reads.
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-valkey
+                  key: VALKEY_PASSWORD
+            - name: VALKEY_URL
+              value: "redis://:$(VALKEY_PASSWORD)@valkey:6379/0"
+          # Read-only root (restricted helper) requires an explicit writable
+          # volume for the Python temporary directory (D-15).
+          volumeMounts:
+            - name: maintenance-tmp
+              mountPath: /tmp
+      volumes:
+        - name: maintenance-tmp
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: indramesh-maintenance-purge-cache-{{ .Release.Revision }}
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded
+    # Strictly ABOVE the Core migration Job's default order value (0): the
+    # scoped cache purge runs AFTER the migration and before ordinary resources.
+    "helm.sh/hook-weight": "+5"
+spec:
+  backoffLimit: {{ .Values.apps.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.apps.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: indramesh-maintenance-purge-cache
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-valkey
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.migration.wait.attempts }}); do timeout 2 bash -c 'exec 3<>/dev/tcp/valkey/6379' >/dev/null 2>&1 && exit 0; sleep {{ .Values.apps.migration.wait.sleepSeconds }}; done; echo 'valkey:6379 not reachable after {{ .Values.apps.migration.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+      containers:
+        - name: purge-cache
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "python -m app.maintenance purge-cache"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          # purge-cache touches Valkey only — no DB_* credentials (least
+          # privilege; only clear-queue needs Postgres to fail orphaned Tasks).
+          env:
+            # Phase 298 (D-15): explicit LOG_FORMAT so the Job renders JSON.
+            {{- include "indramesh.loggingEnv" . | nindent 12 }}
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-valkey
+                  key: VALKEY_PASSWORD
+            - name: VALKEY_URL
+              value: "redis://:$(VALKEY_PASSWORD)@valkey:6379/0"
+          volumeMounts:
+            - name: maintenance-tmp
+              mountPath: /tmp
+      volumes:
+        - name: maintenance-tmp
+          emptyDir: {}
+{{- end }}

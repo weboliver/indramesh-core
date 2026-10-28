@@ -1,0 +1,36 @@
+// CLEAN-01 (Phase 308, D-07): knip is the frontend dead-code authority. The
+// rules are set to "error" so any new finding fails the run instead of
+// scrolling past as a warning (with "warn" knip exits 0 even with findings).
+//
+// Entry points, not ignore lists:
+//  - src/shared/plugin-runtime/host-*.js are loaded by URL from the import map
+//    in frontend/index.html (they are the bare-specifier hosts for plugin
+//    bundles) — no source file imports them, so they must be declared entries.
+//  - src/**/*.test.js are the node --test host suites run by
+//    `npm run test:plugin-runtime`; without them as entries their imports
+//    (loadPluginModule, injectPluginStyles, releaseOwner, ...) look unused.
+//
+// ignoreDependencies — the only two, both per-name and justified:
+//  - react-router: host-router.js re-exports it bare so plugin bundles share
+//    the host module (import map entry `react-router`); it resolves through
+//    react-router-dom v7's own dependency and is deliberately not a direct
+//    dependency of this package.
+//  - tailwindcss: no JS imports it — src/index.css:1 does `@import
+//    "tailwindcss"`, which resolves to this package (Tailwind v4 setup).
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "src/shared/plugin-runtime/host-*.js",
+    "src/**/*.test.js"
+  ],
+  "project": ["src/**/*.{js,jsx}"],
+  "ignoreDependencies": ["react-router", "tailwindcss"],
+  "rules": {
+    "files": "error",
+    "dependencies": "error",
+    "exports": "error",
+    "types": "off",
+    "enumMembers": "off",
+    "duplicates": "error"
+  }
+}

@@ -1,0 +1,118 @@
+{{- /*
+headlamp-deployment.yaml — the Headlamp Web UI ClusterIP Service (port 4466)
+and one-replica RollingUpdate Deployment for the k3s release (UI-K8S-01;
+D-01..D-03, D-09/D-10; T-262-01..04). Rendered ONLY when headlamp.enabled is
+true (D-03). Runs under the shared restricted helper (T-255-04) with
+readOnlyRootFilesystem and the single writable /tmp emptyDir the upstream
+image needs (research Pitfall 3). Read-only is enforced by the RBAC bound to
+the per-user login token (D-07/D-04) — the four write-capable Headlamp flags
+(--enable-helm, --enable-dynamic-clusters, --allow-kubeconfig-changes,
+--unsafe-use-service-account-token) stay at their default false and are never
+added (T-262-04). No credential material here (T-254-02).
+*/ -}}
+{{- if .Values.headlamp.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: headlamp
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: headlamp
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: headlamp
+  ports:
+    - name: http
+      port: 4466
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headlamp
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: headlamp
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: headlamp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: headlamp
+    spec:
+      serviceAccountName: indramesh-headlamp
+      automountServiceAccountToken: true
+      containers:
+        - name: headlamp
+          image: "{{ .Values.headlamp.image.repository }}:{{ .Values.headlamp.image.tag }}"
+          imagePullPolicy: {{ .Values.headlamp.image.pullPolicy }}
+          # D-10: exactly the two sub-path/in-cluster args on the image
+          # ENTRYPOINT. The four write-capable Headlamp flags stay unset
+          # (default false) — read-only is the RBAC on the login token (D-07).
+          args: ["-in-cluster", "-base-url=/headlamp"]
+          ports:
+            - name: http
+              containerPort: 4466
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+            # live-verified (Plan 03, D-02): the upstream image declares its
+            # ENTRYPOINT USER by name ("headlamp"), not a numeric UID — the
+            # kubelet cannot statically verify runAsNonRoot against a
+            # non-numeric image user and refuses to start the container
+            # (CreateContainerConfigError: "image has non-numeric user").
+            # Every other chart image (backend/frontend/nginx) declares a
+            # numeric USER at build time, so this explicit override is
+            # Headlamp-specific — the shared helper's arbitrary-UID
+            # convention (D-09 in _helpers.tpl) still applies to every other
+            # container. UID 100 is the image's own fixed 'headlamp' user
+            # (verified: `docker run ... id` -> uid=100(headlamp)).
+            runAsUser: 100
+          env:
+            # research A4: explicitly disable the bundled static plugins —
+            # plugins are deferred for v16.0, no "Show Prometheus metrics"
+            # button in the UI.
+            - name: HEADLAMP_STATIC_PLUGINS_DIR
+              value: ""
+          resources:
+            {{- toYaml .Values.headlamp.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /headlamp/
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /headlamp/
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /headlamp/
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          # research Pitfall 3: readOnlyRootFilesystem requires the explicit
+          # writable /tmp emptyDir — the upstream image's sole writable path.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

@@ -1,0 +1,50 @@
+// Phase 301 (LOGINFRA-02, Carry-D6): Docker log collection through the
+// read-only docker-socket-proxy. Alloy never mounts the raw docker socket; the
+// only daemon endpoint is tcp://docker-socket-proxy:2375 on the internal
+// logging_internal network.
+//
+// This base fragment ends by forwarding into loki.process "app". The sink
+// fragment (selected by ALLOY_SINK and `cat`ed after this file) defines that
+// component, so the runnable config is always base + exactly one sink.
+
+discovery.docker "containers" {
+  host = "tcp://docker-socket-proxy:2375"
+
+  // Only this Compose project's containers — foreign containers of the host
+  // (other Compose projects, ad-hoc test containers) must not be collected.
+  // The project name is substituted by the compose command from
+  // ALLOY_COMPOSE_PROJECT (default: indramesh), never hard-coded: a stack that
+  // runs under any other COMPOSE_PROJECT_NAME would otherwise match zero
+  // containers and collect NOTHING while Alloy reports healthy (Phase 318,
+  // host-B finding, measured on the indramesh-100-cold release stack).
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=__INDRAMESH_COMPOSE_PROJECT__"]
+  }
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // service = the Compose service name (backend, worker, ...), NOT the
+  // container name: containers are named indramesh-backend-1, so
+  // __meta_docker_container_name would yield wrong and unbounded service
+  // values and {service="backend"} queries would find nothing.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  // env = the Docker label every service carries via the x-log-labels anchor
+  // (com.indramesh.env).
+  rule {
+    source_labels = ["__meta_docker_container_label_com_indramesh_env"]
+    target_label  = "env"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "tcp://docker-socket-proxy:2375"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.process.app.receiver]
+}

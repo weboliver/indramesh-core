@@ -1,0 +1,46 @@
+# Backend build context — the image is built from `backend/` (backend/Dockerfile
+# ends with `COPY . .`), so this list is the only gate that keeps development
+# state out of a built image (PUB-07). The runtime inputs (app/, alembic/,
+# alembic.ini, docker-entrypoint.sh, indramesh/, plugin_alembic/,
+# plugin-requirements.txt, pyproject.toml, pytest.ini, requirements.txt,
+# start.sh) are deliberately absent from it and must stay in the context.
+#
+# Matching note (moby/patternmatcher, verified): a pattern without `**` is
+# anchored at the context root, so `__pycache__/` covers `backend/__pycache__`
+# only. Every artifact below that also occurs further down the tree therefore
+# carries a `**/` companion — without one, `app/__pycache__` or the first-run
+# `app/_setup_user.pwd` would still be copied into the image.
+
+# Test tree — never shipped, and the fixtures under tests/fixtures carry captured
+# provider payloads with real identity data.
+tests/
+
+# Coverage artifacts from `coverage`/`pytest-cov`, plus the pytest cache.
+.coverage
+.coverage.*
+**/.coverage
+**/.coverage.*
+.pytest_cache/
+**/.pytest_cache/
+
+# Bytecode caches.
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+
+# First-run password files and dotenv files — a built image must never bake in a
+# credential.
+*.pwd
+**/*.pwd
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Static-analysis allowlist — an input for `vulture` runs, not for the service.
+vulture_whitelist.py
+
+# One-off probe and audit tooling (probe_jira_*.py, es-golden fixtures) — never
+# executed in the image; backend/scripts is also excluded from the public mirror.
+scripts/

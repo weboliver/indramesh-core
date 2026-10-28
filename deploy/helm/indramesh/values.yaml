@@ -1,0 +1,514 @@
+# values.yaml — non-secret defaults for the Phase 254 canonical bootstrap chart
+# (D-21, D-23, T-254-02). This chart carries ONLY the bootstrap foundation; no
+# workload, Secret, PSA, stateful-service, ingress/TLS, image-import, backup, or
+# monitoring resources are declared here — those are owned by later v16.0
+# phases. Nothing in this file is secret (T-254-02).
+#
+# The Helm-to-adapter endpoint contract (non-secret, helm.sh -> installer ->
+# reachability.sh):
+#   bootstrap.endpoint.status = deferred | ready
+#   bootstrap.endpoint.url    = validated HTTPS URL (required when ready)
+# Phase 254 declared `deferred` with an empty url; Phase 259 supplies the
+# Ingress/TLS surfaces and certifies the endpoint, so the contract is now
+# `ready` with the real HTTPS URL (D-23) — read_endpoint_contract requires
+# the URL when ready (helm.sh) and verify_endpoint probes it from the real
+# consumer origin with NO certificate bypass flag (BOOT-03).
+bootstrap:
+  endpoint:
+    status: ready
+    url: "https://localhost"
+
+# OpenShift Route host (openshift-route.yaml). Empty lets the cluster's router
+# assign one.
+route:
+  host: ""
+
+# Phase 256: non-secret StatefulSet defaults. Storage requests may only grow;
+# existing claims are retained and are never shrunk or recreated by the chart.
+postgres:
+  image:
+    repository: indramesh-stateful-postgres
+    tag: 18.4-age1.8.0-pgv0.8.7
+    pullPolicy: IfNotPresent
+  database: indramesh
+  user: postgres
+  persistence:
+    storageClassName: local-path
+    accessModes: [ReadWriteOnce]
+    storage: 10Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+valkey:
+  image:
+    repository: indramesh-stateful-valkey
+    tag: 9.1.1-r1
+    pullPolicy: IfNotPresent
+  persistence:
+    storageClassName: local-path
+    accessModes: [ReadWriteOnce]
+    storage: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Phase 312.1 (D-01/D-03/D-04/D-08): the search tier is OpenSearch behind the
+# Kubernetes-only wrapper (the same tracked Dockerfile the Compose stack builds),
+# carrying a content-version tag (upstream version + wrapper revision). The
+# security plugin stays ON, the internal HTTP listener is plain (transport TLS
+# as the plugin requires), and no OpenSearch Dashboards workload exists anywhere
+# in this chart (D-04). The app connects as the admin user (D-02; no separate
+# application role in this release).
+opensearch:
+  image:
+    repository: indramesh-stateful-opensearch
+    tag: 3.9.0-r1
+    pullPolicy: IfNotPresent
+  user: admin
+  persistence:
+    storageClassName: local-path
+    accessModes: [ReadWriteOnce]
+    storage: 20Gi
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 3Gi
+
+# Phase 257: non-secret app-tier defaults (R-01, D-13, D-16). The apps.enabled
+# switch gates every Phase-257 app Deployment/Service AND the migration hook, so
+# the D-16 two-pass fresh install renders a stateful-only first release and a
+# full second release without leaking app resources into the bootstrap pass.
+# Nothing here is secret (T-254-02); operators override only the affected
+# non-secret subtree through a private values file passed to the installer.
+apps:
+  enabled: true
+  # Phase 272/K8SFIX-04: in-cluster backend/worker ENVIRONMENT (drives GraphQL
+  # visibility). Default production keeps the current k8s deployment unchanged;
+  # rebuild.sh/install.sh set it from the same root .env used by Compose, so a
+  # `development` ENVIRONMENT also shows GraphQL on the k8s stack.
+  environment: production
+  # Phase 318 (K8S-CONFIG-ROLLOUT-01): the revision (uid/resourceVersion) of
+  # the indramesh-external-api Secret, written by the installer after it
+  # reconciled that Secret. backend/worker carry it as a pod-template
+  # annotation, so creating or rotating the LLM key rolls both on the next
+  # Helm pass instead of needing a manual `kubectl rollout restart`. Empty
+  # until the Secret exists. Metadata only — never a value or a digest of one.
+  externalApiRevision: ""
+  # Phase 298 (D-15): every k8s container that runs IndraMesh code renders JSON
+  # by default (indramesh.loggingEnv). Operators may override with logfmt or
+  # console through a private values file.
+  logFormat: json
+  # Phase 299 (D-17/LVL-01): the env level basis for every container. Empty is
+  # the intended default (Foundation noisy defaults are preserved); operators
+  # may set a global level or a "category=level,category=level" map. Runtime
+  # changes do not require touching these — use the logging-level API.
+  logLevel: ""
+  logLevels: ""
+  # Phase 300 (D-12/TLOG-05): Core task-log cap per run and retention window.
+  # maxLines keeps the first half and the last half of each run's stored log and
+  # marks the discarded middle; retentionDays is enforced hourly in the worker,
+  # never deleting the Task row and never touching PENDING/RUNNING tasks.
+  taskLog:
+    maxLines: 10000
+    retentionDays: 30
+  backend:
+    image:
+      repository: indramesh-backend
+      tag: phase-257
+      # D-11: all three locally imported app images (backend, frontend,
+      # nginx) render imagePullPolicy Never — the phase-257 baselines already
+      # live in containerd and every later tag is imported by the rebuild
+      # loop before any Helm reconciliation, so IfNotPresent's registry-
+      # fallback path is dead weight; Never fails a missing image immediately
+      # instead of attempting a pull (Phase 258).
+      pullPolicy: Never
+    # D-13 / D-14: one-replica RollingUpdate Deployment; the operator overrides
+    # only the affected non-secret subtree in a private values file.
+    replicas: 1
+    # D-09/D-10: bounded same-image init-container wait bounds (attempts x
+    # sleepSeconds). Values-driven so an operator can lengthen the window
+    # without a template change.
+    wait:
+      attempts: 30
+      sleepSeconds: 2
+    # NGINX_TRUSTED_IP is mandatory at FastAPI import time (Pitfall 4). Non-secret
+    # chart config: the k3s default pod-network CIDR the Phase 258 Nginx workload
+    # forwards from; an operator overrides it to their real proxy source CIDR.
+    nginxTrustedIp: 10.42.0.0/16
+    # CORS_ALLOWED_ORIGINS is likewise mandatory at FastAPI import time (live
+    # finding, 2026-09-01: app.main._validate_cors_origins raises RuntimeError
+    # and backend crash-loops without it — no default existed before this
+    # value was introduced). Non-secret chart config: the quickstart endpoint
+    # https://localhost (apps.nginx.hostIp appends https://<ip>); an operator
+    # overrides it to their real trusted frontend origin(s) (comma-separated,
+    # no wildcard).
+    corsAllowedOrigins: https://localhost
+    # LLM_PROVIDER/LLM_BASE_URL/LLM_MODEL/LLM_MODE are non-secret chart config
+    # (Phase 302 D-01..D-04 / T-254-02): the values mirror the root .env exact
+    # values for compose/k8s parity. baseUrl is the versioned OpenAI-compatible
+    # base — the /v1 suffix is REQUIRED (openai.AsyncOpenAI appends
+    # /chat/completions to it; the old host-only mistralai server_url form 404s
+    # here). model is a bare id with NO provider prefix. provider/mode select the
+    # preset default (empty mode = provider default). The API key itself lives
+    # ONLY in the indramesh-external-api Secret — never in values.yaml
+    # (T-271-02).
+    llm:
+      provider: mistral
+      baseUrl: https://api.mistral.ai/v1
+      model: mistral-small-latest
+      mode: ""
+    # Phase 305 (LOGX-01): the Loki query base the log-explorer plugin reads at
+    # call time — a bare http(s) base, distinct from the Alloy push `LOKI_URL`.
+    # Empty by default (Phase 318, host-B clean-host finding): a lean k3s install
+    # (LOGINFRA_ENABLED=false) has no Loki, and the plugin must report
+    # `not_configured` instead of probing a service that does not exist. The
+    # installer writes the bundled URL below when it provisions the log stack,
+    # and an operator running an external Loki sets this value explicitly.
+    lokiQueryUrl: ""
+    # Phase 305 (LOGX-03/LOGX-04, D-13/D-14): externalOnly is the declared
+    # "server logs go only to the external sink" switch — set it together with an
+    # OTLP sink; it is never inferred from unreachability. On the Compose side the
+    # bundled log stack is switched by activating the `logging` profile; this
+    # Kubernetes stack keeps its own LOGINFRA_ENABLED gate and per-release Helm
+    # uninstall. grafanaExploreUrl + grafanaLokiDatasource enable the
+    # browser-reachable Grafana Explore deep link (empty = no link; the k8s stack
+    # reuses kube-prometheus-stack's Grafana).
+    logExplorer:
+      externalOnly: false
+      grafanaExploreUrl: ""
+      grafanaLokiDatasource: ""
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 768Mi
+  worker:
+    replicas: 1
+    wait:
+      attempts: 30
+      sleepSeconds: 2
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+    # LLM_PROVIDER/LLM_BASE_URL/LLM_MODEL/LLM_MODE for the worker process (arq
+    # jobs): same non-secret values as apps.backend.llm (Phase 302 D-01..D-04
+    # parity with root .env; the /v1 base is required by the OpenAI-compatible
+    # client — the worker executes the Tools → Translation bulk jobs, so it
+    # needs the same env contract as the backend pod).
+    llm:
+      provider: mistral
+      baseUrl: https://api.mistral.ai/v1
+      model: mistral-small-latest
+      mode: ""
+  frontend:
+    image:
+      repository: indramesh-frontend-static
+      tag: phase-257
+      # D-11: see apps.backend.image.pullPolicy comment above (Phase 258).
+      pullPolicy: Never
+    replicas: 1
+    # D-09/D-10: bounded same-image backend /health wait (attempts x
+    # sleepSeconds) using busybox wget from the Caddy runtime image (D-11).
+    wait:
+      attempts: 30
+      sleepSeconds: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+  migration:
+    backoffLimit: 3
+    activeDeadlineSeconds: 300
+    # D-09/D-10: bounded same-image wait-postgres init gate on the pre-upgrade
+    # migration hook (T-257-06). On a fresh install postgres initializes lazily
+    # after the stateful Services exist, so the hook must wait for postgres TCP
+    # readiness before running `alembic upgrade head`. attempts x sleepSeconds =
+    # 120 x 2 = ~240s max, comfortably inside activeDeadlineSeconds=300 while
+    # still leaving alembic its own bounded window. Values-driven so an operator
+    # can lengthen the window without a template change.
+    wait:
+      attempts: 120
+      sleepSeconds: 2
+  # Phase 296 (CLEAN-05, D-10): opt-in gate for the one-way cut-over
+  # pre-upgrade hooks in templates/maintenance-job.yaml (clear-queue /
+  # purge-cache). Default off so routine upgrades never clear the ARQ queue
+  # under running pods; set only for the quiesced cut-over pass
+  # (scripts/k8s/rebuild.sh --cutover, docs/DEPLOYMENT.md).
+  maintenance:
+    cutover: false
+  # Phase 278 (SC-01 Kubernetes half): the storage-service StatefulSet defaults
+  # (templates/storage-statefulset.yaml). Deliberately NO image: sub-key — the
+  # storage service reuses apps.backend.image.repository/.tag/.pullPolicy
+  # directly (D-02: shares the backend image, no separate build). Its rendering
+  # is gated on apps.enabled like backend/worker/frontend/migration, because it
+  # depends on the app-tier image that only exists after the D-16 two-pass
+  # install's full pass. valkey-sized resource defaults: the storage service
+  # does filesystem I/O only, no heavy compute (T-254-02 — nothing secret).
+  storage:
+    persistence:
+      storageClassName: local-path
+      accessModes: [ReadWriteOnce]
+      storage: 10Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  # Phase 317 (CR314-23, D-18): ONE claim for import payloads, mounted into both
+  # the backend and the worker Deployment — a per-pod emptyDir made an uploaded
+  # CSV invisible to the worker and gone after a restart. The backend writes
+  # IMPORT_ROOT (/data/imports/folders) and IMPORT_UPLOAD_DIR (/data/imports)
+  # inside this tree; the worker reads the file the scan hands it by absolute
+  # path. A single local-path ReadWriteOnce claim only works on the chart's
+  # single-node target — multi-node needs RWX/shared filesystem support first
+  # (same accepted limitation as plugins.persistence).
+  imports:
+    persistence:
+      storageClassName: local-path
+      accessModes: [ReadWriteOnce]
+      storage: 5Gi
+  # Phase 258: the nginx front door. Gated on apps.nginx.enabled IN ADDITION
+  # to apps.enabled — the nginx image cannot exist in containerd on a fresh
+  # install (install.sh stays image-free), so an always-rendered Deployment
+  # with imagePullPolicy Never would sit in ImagePullBackOff and time out
+  # `helm upgrade --wait` on every fresh install. The rebuild wrapper (Plan
+  # 258-03) sets apps.nginx.enabled: true together with the real tag and
+  # tlsContentHash in its private values file — the documented
+  # `./install_indramesh_k8s.sh && ./rebuild_indramesh_k8s.sh` completion flow.
+  nginx:
+    enabled: false
+    image:
+      repository: indramesh-nginx
+      tag: phase-258
+      pullPolicy: Never
+    replicas: 1
+    # Phase 259 (D-02/D-03): the certs volume sources the cert-manager-owned
+    # leaf Secret indramesh-local-tls (replaces the installer-owned
+    # indramesh-nginx-tls, D-03). Operators override only through a private values
+    # file; the default matches the leaf Certificate reconcile_pki issues.
+    tlsSecretName: indramesh-local-tls
+    # The host's own IPv4 address, written by the installer (detect_host_ip).
+    # When set, the backend also accepts https://<hostIp> as an origin; the
+    # leaf certificate carries it as an IP SAN.
+    hostIp: ""
+    # Phase 259 (D-02): cert-reloader sidecar / nginx reload-loop poll interval
+    # in seconds (decision 3). Renewal reaches the running nginx process
+    # through the shared reload emptyDir marker bridge — no pod rollout.
+    reloadPollSeconds: 10
+    # Host-fed manual/reinstall annotation path (D-02): the installer/rebuild
+    # wrapper computes this from the tracked dev cert/key material
+    # (nginx_tls_content_hash) and passes it as a private values override —
+    # the checksum/secret Pod-template annotation forces a rollout on the
+    # manual path; automatic cert-manager renewal reaches the pod through the
+    # sidecar reload bridge instead.
+    tlsContentHash: ""
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+
+# Phase 259 (D-09/D-10, NET-04): namespace-wide default-deny NetworkPolicy
+# (ingress AND egress) plus the exact D-09 allow matrix as MATCHED
+# ingress+egress pairs, rendered by templates/networkpolicies.yaml. Nothing
+# here is secret (T-254-02).
+networkPolicies:
+  # D-10: the policy layer gates on this toggle (default true). Troubleshooting
+  # disables default-deny via a Helm rerun with this set to false — kubectl
+  # delete of policies is never needed.
+  enabled: true
+  # Decision 2 (research Pitfall 5): the kube-apiserver egress /32, discovered
+  # by the installer from the live default/kubernetes ClusterIP at install time
+  # and supplied before the full Helm pass. The chart omits the apiserver rule
+  # when empty (fail-closed enforcement lives in install.sh — never a
+  # hard-coded ClusterIP).
+  apiServerCidr: ""
+  # Phase 302 (LLM-05, D-12): opt-in egress to the configured LLM endpoint.
+  # A LIST of {cidr, port} entries. An empty list (this default) emits NO LLM
+  # egress rule, so egress stays blocked (fail-closed). Each non-empty entry
+  # adds an ipBlock + TCP port rule for BOTH backend and worker on the existing
+  # allow-backend-worker-egress policy; multiple entries admit a primary and a
+  # fallback endpoint.
+  #
+  # NetworkPolicy can express ONLY an IP range + port — never a hostname — so a
+  # provider hostname must be resolved to its CIDR(s) here (the chart fails the
+  # render on any non-CIDR value). Egress to cluster DNS is already admitted by
+  # allow-dns-egress, so name resolution works without an entry. Provider CIDRs
+  # (e.g. Mistral/OpenAI behind a CDN) can change: the operator owns keeping
+  # them current, or fronts egress through an in-cluster/egress proxy.
+  llmEgress: []
+  # Phase 318 (K8S-LLM-EGRESS-01): backend/worker egress to PUBLIC addresses
+  # on the listed TCP ports. The Jira URL is runtime data (a connection created
+  # in the UI) and LLM providers sit behind CDNs with changing addresses, so no
+  # install-time CIDR can name them; this rule lets the defaults (Jira Cloud,
+  # Mistral/OpenAI on 443) work out of the box. `except` keeps every private,
+  # loopback, link-local and CGNAT range closed — that covers the k3s pod
+  # (10.42/16) and service (10.43/16) CIDRs and the node network, so in-cluster
+  # and LAN targets still need an explicit externalEgress entry. A cluster whose
+  # pod/service CIDRs lie outside these ranges adds them to `except`.
+  publicEgress:
+    enabled: true
+    ports: [443]
+    except:
+      - 0.0.0.0/8
+      - 10.0.0.0/8
+      - 100.64.0.0/10
+      - 127.0.0.0/8
+      - 169.254.0.0/16
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+  # Phase 318 (K8S-LLM-EGRESS-01): explicit {cidr, port} egress entries for
+  # backend/worker — an on-prem Jira Data Center, a LAN Ollama/vLLM, a public
+  # endpoint on a port outside publicEgress.ports. Same CIDR-only contract as
+  # llmEgress (a hostname fails the render). The installer fills it from the
+  # .env (K8S_EGRESS_ALLOW plus a private LLM_BASE_URL host); see
+  # docs/CONFIGURATION.md.
+  externalEgress: []
+
+# Phase 260 (BAK-01, D-01..D-18): non-secret backup CronJob defaults. The
+# backup.enabled switch gates the CronJob/ConfigMap (templates/backup-
+# cronjob.yaml) and the standalone postgres-backups PVC (templates/backup-
+# pvc.yaml). Nothing here is secret (T-254-02) — PGPASSWORD is injected only
+# via secretKeyRef on the existing indramesh-database Secret (D-18), never a
+# Helm value. Deliberately no backup.image.* value: the backup container
+# always reuses postgres.image.* verbatim so pg_dump/pg_restore and the
+# Postgres server are guaranteed the same binary/version by construction
+# (D-15, research Pattern 1).
+backup:
+  enabled: true
+  # D-01: daily at 02:00 UTC, a safe overridable default.
+  schedule: "0 2 * * *"
+  # D-03/Pitfall 2: startingDeadlineSeconds — not concurrencyPolicy alone — is
+  # what actually prevents a catch-up run after a missed 02:00 UTC slot (e.g.
+  # the cluster was down); bounded comfortably under the 24h cadence.
+  startingDeadlineSeconds: 900
+  # D-17: bounded retry / bounded overall Job deadline, mirroring
+  # apps.migration's shape (backoffLimit: 3, activeDeadlineSeconds: 300) with
+  # headroom for a larger dump.
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  # D-09/D-10 (mirrors apps.migration.wait): bounded same-image wait-postgres
+  # init gate before the dump starts.
+  wait:
+    attempts: 120
+    sleepSeconds: 2
+  # D-02: retention deletes once EITHER bound is exceeded; the single most
+  # recent complete dump is never deleted regardless of these values (D-05's
+  # last-good-dump floor, enforced in backup.sh).
+  retention:
+    maxAgeDays: 30
+    maxCount: 14
+  # D-08/D-09: dedicated backup PVC, separate from the Postgres data PVC.
+  persistence:
+    storageClassName: local-path
+    accessModes: [ReadWriteOnce]
+    storage: 10Gi
+
+# Phase 284 (PLUGDEPLOY-01, D-13): plugins are operator-managed code mounted
+# read-only into both application processes. This single RWO local-path claim
+# is intentionally limited to the chart's single-node k3s target; multi-node
+# deployments require RWX/shared filesystem support before using this default.
+plugins:
+  # Own toggle, deliberately NOT apps.enabled — mirrors backup.enabled, lets an
+  # operator disable plugin storage without disabling the app tier. No longer
+  # load-bearing for hook ordering (2026-09-22): the plugin-migration runner
+  # moved to a post-upgrade Job, so this claim is an ordinary resource with no
+  # dependent hook to race against. Full history in templates/plugins-pvc.yaml.
+  enabled: true
+  # Phase 287.1 (PLUGDB-07, D-01/D-08; CR-02): the non-secret plugin migration
+  # role name. EMPTY BY DEFAULT on purpose: the migration Jobs render the plugin
+  # credential env entries only when this is set, so an unconfigured install
+  # renders neither and the documented "both absent" weakened fallback
+  # (D-09/D-10) is selectable on Kubernetes exactly as in Compose. To activate
+  # the PostgreSQL role boundary, set this (e.g. indramesh_plugin) AND add a
+  # PLUGIN_DB_PASSWORD key to the indramesh-database Secret; a set name without a
+  # password is the documented fatal misconfiguration, and the Job's
+  # `optional: true` secretKeyRef makes that fail as a legible configuration
+  # error rather than a CreateContainerConfigError.
+  dbUser: ""
+  persistence:
+    storageClassName: local-path
+    accessModes: [ReadWriteOnce]
+    storage: 1Gi
+  mountPath: /opt/indramesh/plugins
+
+# Phase 261 (MON-01..03, OPS-01): non-secret monitoring defaults (D-06/D-07,
+# T-261-02..06). The monitoring.enabled switch gates the ServiceMonitor
+# (templates/servicemonitor.yaml — chained with apps.enabled), the dashboard
+# ConfigMap (templates/grafana-dashboard-configmap.yaml) and the Phase 261
+# NetworkPolicy/nginx-front-door extensions. The kube-prometheus-stack itself
+# is installer-provisioned (scripts/k8s/lib/monitoring.sh, Plan 02) and its
+# k3s-trim values live in scripts/k8s/monitoring-values.yaml — nothing here is
+# secret (T-254-02); operators override only the affected non-secret subtree
+# through a private values file passed to the installer.
+monitoring:
+  enabled: true
+  # Namespace the installer provisions the kube-prometheus-stack into
+  # (scripts/k8s/lib/monitoring.sh). Used for the cross-namespace
+  # NetworkPolicy clauses and the nginx upstream FQDN.
+  stackNamespace: monitoring
+  # Grafana sub-path contract (Pitfall 3) — mirrored to
+  # scripts/k8s/monitoring-values.yaml; nginx strips the /grafana/ prefix and
+  # Grafana renders under it via root_url/serve_from_sub_path.
+  grafana:
+    rootUrl: https://localhost/grafana/
+  # Smoke-test job bounds mirror apps.migration (backoffLimit/
+  # activeDeadlineSeconds) — consumed by Plan 04's helm-test smoke Job
+  # (templates/tests/smoke-test.yaml).
+  smokeTest:
+    backoffLimit: 1
+    activeDeadlineSeconds: 120
+
+# Phase 262 (UI-K8S-01, D-01..D-03): non-secret Headlamp Web UI defaults. The
+# headlamp.enabled switch gates the headlamp-rbac.yaml and headlamp-deployment
+# templates plus the NetworkPolicy allow-list clauses (templates/
+# networkpolicies.yaml) — D-03: default ON, consistent with monitoring/backup,
+# so after install.sh the browser inspector is reachable; UI-less environments
+# disable via values-override (optional renderable, never required). Nothing
+# here is secret (T-254-02); the login identity is a per-user TokenRequest
+# token pasted at login (D-04), never chart material.
+#
+# Edit-pair contract: headlamp.image.tag is the Edit-Pair half to
+# HEADLAMP_VERSION in scripts/k8s/versions.env (created in Plan 262-02) — both
+# change ONLY together in a single reviewed commit; drift fails the
+# cross-consistency assertion in tests/bootstrap/test_artifacts.sh (Plan
+# 262-02 Task 1). imagePullPolicy Never follows the Phase 258 convention for
+# locally imported images (research A2: fails fast if the import was skipped).
+headlamp:
+  enabled: true
+  image:
+    repository: ghcr.io/headlamp-k8s/headlamp
+    tag: v0.45.0
+    pullPolicy: Never
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi

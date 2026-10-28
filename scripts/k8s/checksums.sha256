@@ -1,0 +1,43 @@
+# checksums.sha256 — expected SHA-256 digests for the pinned Phase 254 bootstrap
+# artifacts (D-12, T-254-01). Machine-readable by `sha256sum -c`: every
+# non-comment line is "<64-hex>  <staged-filename>". The staged filenames are
+# exactly the names scripts/k8s/lib/artifacts.sh downloads into its private
+# temporary directory before any execution or extraction.
+#
+# Sources (re-fetched and diffed against 254-RESEARCH.md on 2026-08-30; see
+# 254-03-SUMMARY.md verification log for the per-value diff):
+#   k3s-installer.sh            https://raw.githubusercontent.com/k3s-io/k3s/v1.36.4+k3s1/install.sh
+#   k3s-server-amd64            https://github.com/k3s-io/k3s/releases/download/v1.36.4+k3s1/sha256sum-amd64.txt
+#   k3s-server-arm64            https://github.com/k3s-io/k3s/releases/download/v1.36.4+k3s1/sha256sum-arm64.txt
+#   helm-v4.2.4-linux-*.tar.gz  https://get.helm.sh/helm-v4.2.4-linux-<arch>.tar.gz.sha256sum
+#   cert-manager-keyring.gpg    https://cert-manager.io/public-keys/cert-manager-keyring-2021-09-20-1020CF3C033D4F35BAE1C19E1226061C665DF13E.gpg
+#                               (official cert-manager Maintainers signing key, fingerprint
+#                               1020CF3C033D4F35BAE1C19E1226061C665DF13E; re-fetched and pinned
+#                               2026-09-02 per the Phase 259 pin rule — digest must be updated
+#                               in the same reviewed commit as CERT_MANAGER_VERSION)
+#   prometheus-community-pubkey.gpg  https://prometheus-community.github.io/helm-charts/pubkey.gpg
+#                               (official prometheus-community Helm chart signing key, fingerprint
+#                               27252B168248743B; re-fetched and pinned 2026-09-03 per the Phase 261
+#                               pin rule — digest must be updated in the same reviewed commit as
+#                               KUBE_PROMETHEUS_STACK_VERSION)
+#   grafana-community-pubkey.gpg  https://grafana-community.github.io/helm-charts/pubkey.gpg
+#                               (official grafana-community Helm chart signing key, fingerprint
+#                               84275654C470636BB88BDCD1C0EA64E52D7A0D41; re-fetched and pinned
+#                               2026-10-06 per the Phase 301 pin rule — digest must be updated in
+#                               the same reviewed commit as LOKI_CHART_VERSION)
+#   alloy-1.13.0.tgz            https://github.com/grafana/helm-charts/releases/download/alloy-1.13.0/alloy-1.13.0.tgz
+#                               (grafana/alloy Helm chart 1.13.0 — UNSIGNED, no .prov asset. Per D-11
+#                               the SHA-256 digest is the PRIMARY/only verified path for this chart,
+#                               not a fallback; re-fetched and pinned 2026-10-06 — digest must be
+#                               updated in the same reviewed commit as ALLOY_CHART_VERSION)
+#
+# Pins change only through a reviewed repository update (D-10).
+46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad  k3s-installer.sh
+835873f37245fc615f547a2fe2af9402a347875f13fa64a1f136de644955ea3f  k3s-server-amd64
+c920706346d5ad4e5cd3c7bf1bb09ce71ebe07fec829e513e40f1caf98aed8bb  k3s-server-arm64
+c306b46f719b0a4da32d0f78ee21bf90ce8d602f15b22ab753f0674d1670a7f3  helm-v4.2.4-linux-amd64.tar.gz
+564de2191b881e9f71b5606b25345821ea1682f06ab90499d3ab22b530176da1  helm-v4.2.4-linux-arm64.tar.gz
+3c150100c94f127dc92acbc5d71dc6417cd87b726fc542ea5e15e8f98653284c  cert-manager-keyring.gpg
+04e12ef6f9523b341eb66f5acdee8d5b6eea8663397b26f1b9d9a37b62d649c2  prometheus-community-pubkey.gpg
+8f095762cf0a92c904896590868b97fa80a9f70d04e01227dafc842251fc7a49  grafana-community-pubkey.gpg
+bfdda6cb770c3526444897b9cb5a4fb33711c608d364d9e7857ec699a2fff4fb  alloy-1.13.0.tgz

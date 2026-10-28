@@ -1,0 +1,267 @@
+[
+  {
+    "name": "IT Infrastructure",
+    "description": "Track physical and virtual IT infrastructure including servers, racks, and datacenters.",
+    "category": "IT Infrastructure",
+    "template_data": {
+      "schema_name": "IT Infrastructure",
+      "schema_description": "Comprehensive IT infrastructure asset tracking",
+      "object_types": [
+        {
+          "name": "Datacenter",
+          "description": "Physical datacenter location",
+          "icon_key": "building-2",
+          "attributes": [
+            { "name": "Name", "type_string": "text", "required": true, "is_unique": true },
+            { "name": "Address", "type_string": "text" },
+            { "name": "Tier", "type_string": "select", "select_options": ["Tier I", "Tier II", "Tier III", "Tier IV"] },
+            { "name": "Contact Email", "type_string": "email" }
+          ]
+        },
+        {
+          "name": "Rack",
+          "description": "Physical server rack",
+          "icon_key": "server",
+          "attributes": [
+            { "name": "Name", "type_string": "text", "required": true },
+            { "name": "Location", "type_string": "text" },
+            { "name": "Capacity (U)", "type_string": "integer" },
+            { "name": "Datacenter", "type_string": "reference", "referenced_object_type_name": "Datacenter" }
+          ]
+        },
+        {
+          "name": "Server",
+          "description": "Physical or virtual server",
+          "icon_key": "monitor",
+          "attributes": [
+            { "name": "Hostname", "type_string": "text", "required": true, "is_unique": true },
+            { "name": "IP Address", "type_string": "text" },
+            { "name": "Operating System", "type_string": "select", "select_options": ["Linux", "Windows", "macOS", "VMware ESXi"] },
+            { "name": "CPU Cores", "type_string": "integer" },
+            { "name": "RAM (GB)", "type_string": "integer" },
+            { "name": "Rack", "type_string": "reference", "referenced_object_type_name": "Rack" }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "Employee Directory",
+    "description": "Manage employees, departments, and organizational hierarchy.",
+    "category": "HR",
+    "template_data": {
+      "schema_name": "Employee Directory",
+      "schema_description": "Employee and department management",
+      "object_types": [
+        {
+          "name": "Department",
+          "description": "Organizational department",
+          "icon_key": "building",
+          "attributes": [
+            { "name": "Name", "type_string": "text", "required": true, "is_unique": true },
+            { "name": "Budget", "type_string": "double" },
+            { "name": "Cost Center", "type_string": "text" }
+          ]
+        },
+        {
+          "name": "Employee",
+          "description": "Employee record",
+          "icon_key": "user",
+          "attributes": [
+            { "name": "First Name", "type_string": "text", "required": true },
+            { "name": "Last Name", "type_string": "text", "required": true },
+            { "name": "Email", "type_string": "email", "required": true, "is_unique": true },
+            { "name": "Phone", "type_string": "text" },
+            { "name": "Job Title", "type_string": "text" },
+            { "name": "Hire Date", "type_string": "datetime" },
+            { "name": "Department", "type_string": "reference", "referenced_object_type_name": "Department" }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "Finance & Contracts",
+    "description": "Track vendors, contracts, and invoices for financial asset management.",
+    "category": "Finance",
+    "template_data": {
+      "schema_name": "Finance & Contracts",
+      "schema_description": "Vendor, contract, and invoice tracking",
+      "object_types": [
+        {
+          "name": "Vendor",
+          "description": "External supplier or service provider",
+          "icon_key": "briefcase",
+          "attributes": [
+            { "name": "Company Name", "type_string": "text", "required": true, "is_unique": true },
+            { "name": "Contact Name", "type_string": "text" },
+            { "name": "Email", "type_string": "email" },
+            { "name": "Phone", "type_string": "text" }
+          ]
+        },
+        {
+          "name": "Contract",
+          "description": "Legal contract with a vendor",
+          "icon_key": "file-text",
+          "attributes": [
+            { "name": "Contract Number", "type_string": "text", "required": true, "is_unique": true },
+            { "name": "Start Date", "type_string": "datetime" },
+            { "name": "End Date", "type_string": "datetime" },
+            { "name": "Value", "type_string": "double" },
+            { "name": "Vendor", "type_string": "reference", "referenced_object_type_name": "Vendor" }
+          ]
+        },
+        {
+          "name": "Invoice",
+          "description": "Payment invoice from a vendor",
+          "icon_key": "receipt",
+          "attributes": [
+            { "name": "Invoice Number", "type_string": "text", "required": true, "is_unique": true },
+            { "name": "Amount", "type_string": "double", "required": true },
+            { "name": "Due Date", "type_string": "datetime" },
+            { "name": "Status", "type_string": "select", "select_options": ["Pending", "Paid", "Overdue", "Disputed"] },
+            { "name": "Contract", "type_string": "reference", "referenced_object_type_name": "Contract" }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "HR Recruitment",
+    "description": "Manage job positions, candidates, and offers through the hiring pipeline.",
+    "category": "HR",
+    "template_data": {
+      "schema_name": "HR Recruitment",
+      "schema_description": "End-to-end recruitment tracking",
+      "object_types": [
+        {
+          "name": "Position",
+          "description": "Open job position",
+          "icon_key": "briefcase",
+          "attributes": [
+            { "name": "Title", "type_string": "text", "required": true },
+            { "name": "Department", "type_string": "text" },
+            { "name": "Salary Range", "type_string": "text" },
+            { "name": "Is Open", "type_string": "boolean" }
+          ]
+        },
+        {
+          "name": "Candidate",
+          "description": "Job applicant",
+          "icon_key": "user",
+          "attributes": [
+            { "name": "Name", "type_string": "text", "required": true },
+            { "name": "Email", "type_string": "email", "required": true, "is_unique": true },
+            { "name": "Phone", "type_string": "text" },
+            { "name": "Resume URL", "type_string": "url" },
+            { "name": "Status", "type_string": "select", "select_options": ["Applied", "Screening", "Interview", "Offer", "Rejected", "Hired"] }
+          ]
+        },
+        {
+          "name": "Offer",
+          "description": "Employment offer extended to a candidate",
+          "icon_key": "file-check",
+          "attributes": [
+            { "name": "Salary", "type_string": "double", "required": true },
+            { "name": "Start Date", "type_string": "datetime" },
+            { "name": "Acceptance Status", "type_string": "select", "select_options": ["Pending", "Accepted", "Declined"] },
+            { "name": "Position", "type_string": "reference", "referenced_object_type_name": "Position" },
+            { "name": "Candidate", "type_string": "reference", "referenced_object_type_name": "Candidate" }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "Facilities Management",
+    "description": "Track buildings, rooms, and equipment for facility management.",
+    "category": "Facilities",
+    "template_data": {
+      "schema_name": "Facilities Management",
+      "schema_description": "Building, room, and equipment inventory",
+      "object_types": [
+        {
+          "name": "Building",
+          "description": "Physical building or property",
+          "icon_key": "building-2",
+          "attributes": [
+            { "name": "Name", "type_string": "text", "required": true },
+            { "name": "Address", "type_string": "text" },
+            { "name": "Floors", "type_string": "integer" },
+            { "name": "Area (sqft)", "type_string": "double" }
+          ]
+        },
+        {
+          "name": "Room",
+          "description": "Room or space within a building",
+          "icon_key": "layout",
+          "attributes": [
+            { "name": "Number", "type_string": "text", "required": true },
+            { "name": "Floor", "type_string": "integer" },
+            { "name": "Capacity", "type_string": "integer" },
+            { "name": "Type", "type_string": "select", "select_options": ["Office", "Meeting Room", "Lab", "Storage", "Lobby"] },
+            { "name": "Building", "type_string": "reference", "referenced_object_type_name": "Building" }
+          ]
+        },
+        {
+          "name": "Equipment",
+          "description": "Facility equipment and assets",
+          "icon_key": "wrench",
+          "attributes": [
+            { "name": "Name", "type_string": "text", "required": true },
+            { "name": "Serial Number", "type_string": "text", "is_unique": true },
+            { "name": "Category", "type_string": "select", "select_options": ["HVAC", "Electrical", "Plumbing", "Security", "IT", "Furniture"] },
+            { "name": "Purchase Date", "type_string": "datetime" },
+            { "name": "Warranty Expiry", "type_string": "datetime" },
+            { "name": "Room", "type_string": "reference", "referenced_object_type_name": "Room" }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "Software Asset Management",
+    "description": "Track software licenses and their assignments across the organization.",
+    "category": "IT Infrastructure",
+    "template_data": {
+      "schema_name": "Software Asset Management",
+      "schema_description": "Software license tracking and assignment",
+      "object_types": [
+        {
+          "name": "Software",
+          "description": "Software application or tool",
+          "icon_key": "package",
+          "attributes": [
+            { "name": "Name", "type_string": "text", "required": true },
+            { "name": "Vendor", "type_string": "text" },
+            { "name": "Version", "type_string": "text" },
+            { "name": "License Type", "type_string": "select", "select_options": ["Per Seat", "Site License", "Subscription", "Open Source", "Freeware"] }
+          ]
+        },
+        {
+          "name": "License",
+          "description": "License key or entitlement",
+          "icon_key": "key",
+          "attributes": [
+            { "name": "Key", "type_string": "text", "is_unique": true },
+            { "name": "Seat Count", "type_string": "integer" },
+            { "name": "Purchase Date", "type_string": "datetime" },
+            { "name": "Expiry Date", "type_string": "datetime" },
+            { "name": "Cost", "type_string": "double" },
+            { "name": "Software", "type_string": "reference", "referenced_object_type_name": "Software" }
+          ]
+        },
+        {
+          "name": "Assignment",
+          "description": "License assigned to a user or device",
+          "icon_key": "user-check",
+          "attributes": [
+            { "name": "Assigned To", "type_string": "text", "required": true },
+            { "name": "Assigned Date", "type_string": "datetime" },
+            { "name": "License", "type_string": "reference", "referenced_object_type_name": "License" }
+          ]
+        }
+      ]
+    }
+  }
+]

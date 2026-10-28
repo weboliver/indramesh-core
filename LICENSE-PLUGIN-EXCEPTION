@@ -1,0 +1,46 @@
+                     IndraMesh Core Plugin Exception, version 1.0
+
+This is an additional permission under section 7 of the GNU Affero General Public License,
+version 3 (the "AGPL"), granted by the copyright holders of IndraMesh Core. It supplements the
+AGPL text in the file LICENSE and applies to IndraMesh Core as distributed together with this
+file.
+
+1. Definitions
+
+"Core" means IndraMesh Core, the program licensed under the AGPL in this repository, and any
+modified version of it.
+
+"Plugin Interface" means the interfaces Core provides for extensions: the `indramesh.sdk`
+Python package, the plugin manifest (`plugin.toml`) and the capability interfaces it declares,
+the plugin hooks, the frontend extension points together with the shared modules the Core
+frontend exposes to plugin bundles, and the REST and GraphQL APIs.
+
+"Plugin" means a work that is loaded or run by Core through the Plugin Interface, that
+interacts with Core only through the Plugin Interface, and that contains no part of Core's
+source code other than what is needed to use the Plugin Interface (names of packages, modules,
+functions, classes, constants, hooks, extension points and manifest fields).
+
+2. Permission
+
+As a special exception, you may create, run, convey and make available over a network a
+Plugin under terms of your choice, including terms that are not compatible with the AGPL, and
+you may convey or make available a combination of Core with one or more Plugins, provided that
+Core itself, including every modification you make to it, remains licensed under the AGPL and
+that you comply with the AGPL for Core in every other respect, including section 13.
+
+The AGPL does not require you to release the source code of a Plugin, or to license a Plugin
+under the AGPL, merely because the Plugin is loaded by Core, imports the Plugin Interface or
+runs in the same process as Core.
+
+3. Limits
+
+This exception does not cover a work that copies, modifies or embeds parts of Core beyond what
+the definition of Plugin allows; such a work is a modified version of Core and is covered by
+the AGPL. Changes to Core made to accommodate a Plugin are modifications of Core. Third-party
+components distributed with Core keep their own licenses; this exception grants nothing on
+their behalf.
+
+4. Modified versions
+
+If you modify Core, you may extend this exception to your version, but you are not obliged to
+do so. If you do not wish to, delete this exception statement from your version.

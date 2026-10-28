@@ -1,0 +1,36 @@
+{{- /*
+openshift-route.yaml — the capability-gated OpenShift Route (D-05, NET-02).
+Rendered ONLY when apps.enabled AND apps.nginx.enabled are both true AND
+route.openshift.io/v1 is present in the target cluster's API versions
+(absent on k3s by default; present with --api-versions route.openshift.io/v1).
+Identical passthrough behavior to the k3s IngressRouteTCP: termination passthrough,
+the host left to the cluster's router (or route.host when set), to the nginx Service https port — targetPort is the
+Service PORT NAME https, not the number 8443 (nginx-deployment.yaml:34-36).
+Never sets httpHeaders or insecureEdgeTerminationPolicy (OpenShift passthrough
+XValidation; research 375; T-259-03).
+*/ -}}
+{{- if and .Values.apps.enabled .Values.apps.nginx.enabled }}
+{{- if .Capabilities.APIVersions.Has "route.openshift.io/v1" }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: indramesh
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  {{- with .Values.route.host }}
+  host: {{ . | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: nginx
+  port:
+    targetPort: https
+  tls:
+    termination: passthrough
+{{- end }}
+{{- end }}

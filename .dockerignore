@@ -1,0 +1,26 @@
+# Root-context .dockerignore — applies ONLY to the production frontend image
+# build (deploy/k8s-images/frontend/Dockerfile), the only build whose context is
+# the repository root; every other image build uses its own subdirectory context
+# (backend/, frontend/, deploy/k8s-images/stateful/*) with its own .dockerignore.
+# These entries keep local development state out of the build context: the
+# multi-hundred-MB node_modules transfer on every image build, stray .env
+# secrets and Playwright session/trace state (T-257-07 supply-chain hygiene).
+.git
+**/node_modules
+**/.env
+**/dist
+**/__pycache__
+**/.pytest_cache
+**/playwright-report
+**/test-results
+
+# Playwright authentication state — a live session token. The whole nested
+# `playwright` directory is dropped here: this context builds the production
+# frontend image, which never runs a browser test, so it does not need the
+# `.auth` placeholder that the `frontend/` context preserves for the E2E image.
+**/playwright
+
+# Agent tooling state, plus nested first-run password and coverage artifacts.
+**/.claude
+**/*.pwd
+**/.coverage*

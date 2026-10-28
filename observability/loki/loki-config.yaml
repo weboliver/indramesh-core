@@ -1,0 +1,38 @@
+# Phase 301 (LOGINFRA-01, D-04): monolithic single-node Loki on the internal
+# logging_internal network. Started with `-config.expand-env=true`, so
+# ${LOKI_RETENTION_PERIOD} resolves from the container environment at start.
+# Base structure from loki-local-config.yaml; the retention triple is complete
+# (Pitfall 2 — with only one of the keys retention silently does nothing).
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2026-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: ${LOKI_RETENTION_PERIOD:-336h}
+
+compactor:
+  working_directory: /loki/retention
+  retention_enabled: true
+  delete_request_store: filesystem

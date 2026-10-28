@@ -1,0 +1,131 @@
+{{- /*
+headlamp-rbac.yaml — Headlamp Web UI read-only namespace-scoped RBAC for the
+k3s release (UI-K8S-01; D-06..D-08; T-262-01..04). Creates a dedicated
+indramesh-headlamp ServiceAccount and binds it ONLY to a Role in the fixed
+`indramesh` namespace granting the D-07 resource list (get/list/watch; pods/log
+subresource get-only per the Phase-255 discipline) — deliberately NO secrets
+access (the namespace Secrets carry DB/JWT credentials; Headlamp would render
+their payloads), NO cluster role or cluster-scoped document (D-08), and NO
+API-Discovery extra rules (system:discovery covers it). Rendered ONLY when
+headlamp.enabled is true (D-03). The browsing identity is the user's per-token
+TokenRequest token pasted at login (D-04) — this file is credential-free
+(T-254-02).
+
+D-08-Addendum (G-262-2): Headlamp's built-in Home/Cluster-Overview page
+unconditionally polls the cluster-scoped `nodes` list and `nodes.metrics.k8s.io`
+(~every 60s) to populate its CPU/memory/node-readiness gauges, independent of
+the "Allowed namespaces" browser setting, because Node/NodeMetrics carry no
+namespace field to scope. k3s bundles metrics-server as a default addon, so
+this call always 403'd under the original D-08-only namespaced Role
+(root-caused in .planning/debug/headlamp-node-metrics-403.md, UAT gap
+G-262-2). The ClusterRole/ClusterRoleBinding documents below are the ONLY
+cluster-scoped documents this file renders, and are a deliberate,
+user-approved, narrow exception to D-08's "no ClusterRole" wording: they grant
+get/list/watch on EXACTLY `nodes` (core apiGroup) and `nodes` in
+`metrics.k8s.io` — no other cluster-scoped resource, no write verb, no
+wildcard. Rationale: node names and CPU/memory numbers are non-sensitive
+infrastructure telemetry, not the Secrets/workload data D-07/D-08 protect.
+Technical constraint: Kubernetes RBAC `resourceNames` cannot scope
+`list`/`watch` requests (only get/delete/update/patch), so this
+resource-type-narrow grant is the tightest RBAC primitive genuinely available.
+See 262-CONTEXT.md's D-08-Addendum (G-262-2) entry for the full decision
+record.
+*/ -}}
+{{- if .Values.headlamp.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: indramesh-headlamp
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: headlamp
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: indramesh-headlamp
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: headlamp
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "persistentvolumeclaims", "configmaps", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: indramesh-headlamp
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: headlamp
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: indramesh-headlamp
+subjects:
+  - kind: ServiceAccount
+    name: indramesh-headlamp
+    namespace: indramesh
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: indramesh-headlamp-node-metrics
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: headlamp
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: indramesh-headlamp-node-metrics
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: headlamp
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: indramesh-headlamp-node-metrics
+subjects:
+  - kind: ServiceAccount
+    name: indramesh-headlamp
+    namespace: indramesh
+{{- end }}

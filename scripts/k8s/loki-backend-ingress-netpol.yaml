@@ -1,0 +1,36 @@
+# loki-backend-ingress-netpol.yaml — the monitoring-side ingress half of the
+# matched backend→Loki NetworkPolicy pair (Phase 305, LOGX-01, D-12). Applied
+# by scripts/k8s/lib/loki.sh AFTER the pinned Helm install succeeds (the
+# `monitoring` namespace exists then) and BEFORE the readiness wait.
+#
+# NetworkPolicies are additive: the pinned Loki chart's own loki-ingress policy
+# (installed from scripts/k8s/loki-values.yaml) admits Alloy from the
+# monitoring namespace and stays fully intact. This checked-in installer-owned
+# manifest adds exactly one more peer — the indramesh-backend pod in the
+# `indramesh` namespace — on Loki's HTTP port 3100, so the log-explorer plugin
+# can query Loki server-side. Loki itself stays without a published port, and
+# the source-side egress half lives in
+# deploy/helm/indramesh/templates/networkpolicies.yaml
+# (allow-backend-worker-egress). Mirrors the checked-in installer-manifest
+# pattern of scripts/k8s/alloy-rbac.yaml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: loki-backend-ingress
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: loki
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: indramesh
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: indramesh-backend
+      ports:
+        - protocol: TCP
+          port: 3100

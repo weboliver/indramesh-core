@@ -1,0 +1,318 @@
+{{- /*
+backend-deployment.yaml — the backend ClusterIP Service and one-replica
+RollingUpdate Deployment for the k3s release (APP-02/APP-04, D-09..D-15;
+T-257-04..06). Rendered ONLY when apps.enabled is true, so the D-16 stateful-only
+bootstrap pass renders no app resource and the full pass renders the backend
+behind the pre-upgrade migration hook. Kubernetes enforces startup order with
+bounded same-image init checks (D-09/D-10) instead of Compose depends_on, and
+the app process runs the direct non-reload Uvicorn command (D-12/D-14) — never
+the Compose migration-plus-server start.sh path. Consumes only existing split
+Secret references (T-257-05) and the shared restricted helper (T-257-04).
+*/ -}}
+{{- if .Values.apps.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: indramesh-backend
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: indramesh-backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: indramesh-backend
+  namespace: indramesh
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: indramesh-backend
+  annotations:
+    meta.helm.sh/release-name: {{ .Release.Name }}
+    meta.helm.sh/release-namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.apps.backend.replicas }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: indramesh-backend
+  template:
+    metadata:
+      annotations:
+        checksum/external-api: {{ .Values.apps.externalApiRevision | default "" | quote }}
+      labels:
+        app.kubernetes.io/name: indramesh-backend
+    spec:
+      # T-255-11 wiring, Phase 305 / LOGX-05 update: the backend no longer
+      # queries the Kubernetes API — the System Logs provider, its pod-log
+      # Role and the apiserver egress clause were removed, so it must NOT
+      # carry a mounted API token (the ServiceAccount survives because this
+      # Deployment still names it, but the token is pure attack surface now).
+      serviceAccountName: indramesh-backend
+      automountServiceAccountToken: false
+      # D-09/D-10: bounded same-image dependency checks. Each init container
+      # identifies one stateful Service by name, loops a finite number of times
+      # with a bounded per-attempt timeout, and exits non-zero with a
+      # service-labelled diagnostic (T-257-06). Postgres/Valkey use bash's
+      # `/dev/tcp` raw TCP-connect probe (see live finding below); the OpenSearch
+      # check uses curl's HTTP client, already installed in the backend image
+      # (D-11), and authenticates with the same split-Secret credentials the app
+      # runtime consumes.
+      #
+      # Live finding (2026-09-01): `curl telnet://host:port` is NOT a bare
+      # TCP-connect check — curl's telnet protocol handler connects, then BLOCKS
+      # waiting to read data from the server. Postgres and Valkey never send an
+      # unsolicited greeting (the client speaks first), so the probe always
+      # timed out (curl exit 28) even when the server was fully healthy. Fixed
+      # with bash's `/dev/tcp/<host>/<port>` pseudo-device, which only performs
+      # the TCP handshake and returns immediately — verified live against a
+      # healthy postgres:5432 (exit 0) and an unreachable host (exit 1, bounded
+      # by the outer `timeout`). `bash` is present in the backend image
+      # (`/usr/bin/bash`). HTTP-based checks (OpenSearch, below) were never
+      # affected — HTTP always sends a response.
+      initContainers:
+        - name: wait-postgres
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.backend.wait.attempts }}); do timeout 2 bash -c 'exec 3<>/dev/tcp/postgres/5432' >/dev/null 2>&1 && exit 0; sleep {{ .Values.apps.backend.wait.sleepSeconds }}; done; echo 'postgres:5432 not reachable after {{ .Values.apps.backend.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+        - name: wait-valkey
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.backend.wait.attempts }}); do timeout 2 bash -c 'exec 3<>/dev/tcp/valkey/6379' >/dev/null 2>&1 && exit 0; sleep {{ .Values.apps.backend.wait.sleepSeconds }}; done; echo 'valkey:6379 not reachable after {{ .Values.apps.backend.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+        - name: wait-opensearch
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          command: ["sh", "-ec", "for i in $(seq 1 {{ .Values.apps.backend.wait.attempts }}); do curl -fsS --max-time 2 -u \"${OPENSEARCH_USERNAME}:${OPENSEARCH_PASSWORD}\" 'http://opensearch:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null 2>&1 && exit 0; sleep {{ .Values.apps.backend.wait.sleepSeconds }}; done; echo 'opensearch:9200 not ready after {{ .Values.apps.backend.wait.attempts }} attempts'; exit 1"]
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          env:
+            - name: OPENSEARCH_USERNAME
+              value: {{ .Values.opensearch.user | quote }}
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-opensearch
+                  key: OPENSEARCH_PASSWORD
+      containers:
+        - name: indramesh-backend
+          image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
+          # D-12/D-14: direct non-reload Uvicorn — the Compose migration-plus-
+          # server script is never used here (D-14); the migration Job owns the
+          # schema upgrade (D-05).
+          command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+          ports:
+            - name: http
+              containerPort: 8000
+          securityContext:
+            {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
+          env:
+            {{- include "indramesh.kubernetesEnv" . | nindent 12 }}
+            {{- include "indramesh.loggingEnv" . | nindent 12 }}
+            {{- include "indramesh.taskLogEnv" . | nindent 12 }}
+            - name: DB_HOST
+              value: postgres
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: DB_PASSWORD
+            - name: DB_NAME
+              value: {{ .Values.postgres.database | quote }}
+            # Live finding (2026-09-01): Kubernetes only expands a $(VAR) reference
+            # in an env value when VAR is defined EARLIER in this same env list —
+            # VALKEY_PASSWORD must precede VALKEY_URL, or $(VALKEY_PASSWORD) is left
+            # as a literal, unexpanded string and Valkey auth fails.
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-valkey
+                  key: VALKEY_PASSWORD
+            - name: VALKEY_URL
+              value: "redis://:$(VALKEY_PASSWORD)@valkey:6379/0"
+            - name: OPENSEARCH_URL
+              value: http://opensearch:9200
+            - name: OPENSEARCH_USERNAME
+              value: {{ .Values.opensearch.user | quote }}
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-opensearch
+                  key: OPENSEARCH_PASSWORD
+            # Phase 278: the storage service's DNS name + port (same as Plan
+            # 278-01's Compose STORAGE_SERVICE_URL) — plain non-secret value,
+            # no secretKeyRef, no $(VAR) expansion needed. Backend/worker do
+            # not call storage at process startup this phase (Phase 279/281
+            # endpoints will), so no wait-storage init container.
+            - name: STORAGE_SERVICE_URL
+              value: http://storage:8001
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-backend-auth
+                  key: JWT_SECRET_KEY
+            - name: FERNET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-backend-auth
+                  key: FERNET_KEY
+            # SEC313-69 rotation: the previous key, read by MultiFernet so
+            # ciphertext written before the rotation stays readable while new
+            # writes use FERNET_KEY. It exists in the Secret only while a
+            # rotation runs, so `optional: true` keeps an install that never had
+            # it working. Finish the rotation with
+            # `python -m app.maintenance rotate-fernet-key`; remove the
+            # FERNET_KEY_OLD key from the Secret only once it exits 0 with
+            # "FERNET_KEY_OLD can be removed".
+            - name: FERNET_KEY_OLD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-backend-auth
+                  key: FERNET_KEY_OLD
+                  optional: true
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-backend-auth
+                  key: ADMIN_PASSWORD
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-external-api
+                  key: LLM_API_KEY
+                  optional: true
+            - name: LLM_PROVIDER
+              value: {{ .Values.apps.backend.llm.provider | quote }}
+            - name: LLM_MODE
+              value: {{ .Values.apps.backend.llm.mode | quote }}
+            - name: LLM_BASE_URL
+              value: {{ .Values.apps.backend.llm.baseUrl | quote }}
+            - name: LLM_MODEL
+              value: {{ .Values.apps.backend.llm.model | quote }}
+            - name: NGINX_TRUSTED_IP
+              value: {{ .Values.apps.backend.nginxTrustedIp | quote }}
+            - name: CORS_ALLOWED_ORIGINS
+              value: {{ if .Values.apps.nginx.hostIp }}{{ printf "%s,https://%s" .Values.apps.backend.corsAllowedOrigins .Values.apps.nginx.hostIp | quote }}{{ else }}{{ .Values.apps.backend.corsAllowedOrigins | quote }}{{ end }}
+            - name: DB_POOL_SIZE
+              value: "10"
+            - name: DB_MAX_OVERFLOW
+              value: "20"
+            - name: DB_POOL_RECYCLE
+              value: "1800"
+            - name: DB_POOL_PRE_PING
+              value: "true"
+            - name: IMPORT_UPLOAD_DIR
+              value: /data/imports
+            - name: EXPORT_ROOT
+              value: /tmp/exports
+            # Phase 317 (CR314-23): the folder scan and the upload route both
+            # resolve inside the shared imports-storage claim, so the worker can
+            # open a file this pod wrote. One tree; IMPORT_UPLOAD_DIR above
+            # (/data/imports) is its parent.
+            - name: IMPORT_ROOT
+              value: /data/imports/folders
+            - name: INDRAMESH_PLUGINS_DIR
+              value: {{ .Values.plugins.mountPath | quote }}
+            # Phase 305 (LOGX-01/LOGX-03/LOGX-04): the Loki query base the
+            # log-explorer plugin reads at call time (non-secret; distinct from
+            # the Alloy push LOKI_URL), the declared external-only switch and the
+            # optional browser-reachable Grafana deep-link pair (empty = no link).
+            # Phase 318: no hard-coded fallback — a lean install carries no Loki,
+            # so an empty value is what makes GET /status answer `not_configured`
+            # instead of `unreachable` (the installer writes the bundled URL when
+            # it provisions the log stack).
+            - name: LOKI_QUERY_URL
+              value: {{ .Values.apps.backend.lokiQueryUrl | default "" | quote }}
+            - name: LOG_EXPLORER_EXTERNAL_ONLY
+              value: {{ .Values.apps.backend.logExplorer.externalOnly | default false | quote }}
+            - name: GRAFANA_EXPLORE_URL
+              value: {{ .Values.apps.backend.logExplorer.grafanaExploreUrl | default "" | quote }}
+            - name: GRAFANA_LOKI_DATASOURCE
+              value: {{ .Values.apps.backend.logExplorer.grafanaLokiDatasource | default "" | quote }}
+            # Phase 311.1 clean-host finding: the plugin DB boundary. The .env
+            # carries PLUGIN_DB_USER (role name) and PLUGIN_DB_PASSWORD, and on
+            # Compose the backend gets both straight from env_file — the
+            # migration runner therefore runs as the restricted role there. On
+            # k8s the plugin-install path runs the SAME runner through
+            # `kubectl exec deploy/indramesh-backend -- python -m
+            # app.plugin_system.migrate`, so the app Deployment needs them too:
+            # without them the runner keeps the privileged fallback and a plugin
+            # declaring `require_restricted_role = true` (ai-translation) refuses
+            # its own migration and lands in `error`. Same `plugins.dbUser` gate
+            # and same optional secretKeyRef as migration-job.yaml.
+            {{- if .Values.plugins.dbUser }}
+            - name: PLUGIN_DB_USER
+              value: {{ .Values.plugins.dbUser | quote }}
+            - name: PLUGIN_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: PLUGIN_DB_PASSWORD
+                  optional: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.apps.backend.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          # D-15: read-only-root (restricted helper) requires an explicit writable
+          # emptyDir at every declared path in the backend/worker write inventory.
+          volumeMounts:
+            - name: exports
+              mountPath: /tmp/exports
+            # CR314-23: the import root lives inside the shared claim, not on a
+            # per-pod emptyDir — the worker mounts the same claim at the same path.
+            - name: imports-storage
+              mountPath: /data/imports
+            - name: tmp
+              mountPath: /tmp
+            - name: plugins
+              mountPath: {{ .Values.plugins.mountPath }}
+              readOnly: true
+      volumes:
+        - name: exports
+          emptyDir: {}
+        - name: imports-storage
+          persistentVolumeClaim:
+            claimName: imports-storage
+        - name: tmp
+          emptyDir: {}
+        - name: plugins
+          persistentVolumeClaim:
+            claimName: plugins-storage
+{{- end }}
