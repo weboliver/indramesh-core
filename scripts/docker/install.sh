@@ -81,6 +81,33 @@ step "install: starting the stack (docker compose up -d --build)"
 step "install: waiting for readiness"
 wait_for_backend_healthy "$ROOT_DIR" "$HEALTH_TIMEOUT" || exit 1
 
+# Upgrade finding (1.0.0 -> 1.0.1 on host B): with the containerd image store
+# (Docker Engine 29+, Docker Desktop) every `--build` produces a NEW image index
+# — BuildKit's provenance attestation carries the build time — even when the
+# platform manifest is byte-identical. Compose compares the manifest, keeps the
+# running container, and the tag moves on to the new index: the container then
+# runs on an untagged image and every container list shows it as a bare
+# `sha256:…` (seen for opensearch, whose content did not change). Recreating
+# exactly the containers whose image no longer is the one their tag names puts
+# each of them back on its tagged image; a cold install finds none.
+_stale=""
+for _cid in $( cd "$ROOT_DIR" && docker compose ps -q </dev/null 2>/dev/null ); do
+  _svc="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$_cid" 2>/dev/null || true)"
+  _ref="$(docker inspect -f '{{.Config.Image}}' "$_cid" 2>/dev/null || true)"
+  _running="$(docker inspect -f '{{.Image}}' "$_cid" 2>/dev/null || true)"
+  [ -n "$_svc" ] && [ -n "$_ref" ] && [ -n "$_running" ] || continue
+  _current="$(docker image inspect -f '{{.Id}}' "$_ref" 2>/dev/null || true)"
+  [ -n "$_current" ] && [ "$_current" != "$_running" ] || continue
+  _stale="$_stale $_svc"
+done
+if [ -n "$_stale" ]; then
+  step "install: recreating services whose image tag now names a rebuilt image:$_stale"
+  # shellcheck disable=SC2086 # Compose service names, one per word
+  ( cd "$ROOT_DIR" && docker compose up -d --no-deps --force-recreate $_stale </dev/null ) \
+    || die "install" "recreating$_stale failed"
+  wait_for_backend_healthy "$ROOT_DIR" "$HEALTH_TIMEOUT" || exit 1
+fi
+
 # Phase 318 (host-B finding): the worker scans the plugin directory at its own
 # start. On a cold install it starts together with the backend, i.e. while
 # `backend/start.sh` is still running the plugin migration runner, and isolates
@@ -95,6 +122,24 @@ wait_for_backend_healthy "$ROOT_DIR" "$HEALTH_TIMEOUT" || exit 1
 step "install: restarting the worker so its plugin registry scans the migrated state"
 ( cd "$ROOT_DIR" && docker compose restart worker </dev/null ) \
   || die "install" "docker compose restart worker failed"
+
+# Upgrade finding (1.0.0 -> 1.0.1 on host B): nginx and loki read their
+# configuration from a SINGLE-FILE bind mount. The upgrade's `git checkout`
+# replaces that file with a new one, while a running container stays attached to
+# the old file — and `up -d` above does not recreate either service, because
+# neither its image nor its service definition changed. nginx then kept proxying
+# the SPA to the 1.0.0 upstream (`frontend:5173`) and answered every page with
+# 502; `nginx -s reload` re-reads the same stale file. Recreating attaches the
+# checked-out file. A cold install pays one nginx restart; loki is recreated only
+# when the `logging` profile actually runs it.
+step "install: recreating nginx so it reads the checked-out configuration"
+( cd "$ROOT_DIR" && docker compose up -d --no-deps --force-recreate nginx </dev/null ) \
+  || die "install" "recreating nginx failed"
+if ( cd "$ROOT_DIR" && docker compose ps --status running --services </dev/null 2>/dev/null ) | grep -qx loki; then
+  step "install: recreating loki so it reads the checked-out configuration"
+  ( cd "$ROOT_DIR" && docker compose up -d --no-deps --force-recreate loki </dev/null ) \
+    || die "install" "recreating loki failed"
+fi
 
 HTTP_PORT_VALUE="$(docker_resolve_port "$ENV_FILE" "$ENV_EXAMPLE" HTTP_PORT 8180)"
 HTTPS_PORT_VALUE="$(docker_resolve_port "$ENV_FILE" "$ENV_EXAMPLE" HTTPS_PORT 8443)"
