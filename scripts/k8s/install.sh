@@ -30,8 +30,8 @@
 #      absent (A2) + full-pass boot values (nginx-enabled + acquired tags +
 #      networkPolicies.apiServerCidr), then the full apps-enabled pass
 #      (D-02, D-16, D-21; Plan 03 decision 2)
-#   9. retained CA root export + consumer trust-store import (D-08;
-#      trust_store.sh) BEFORE the no-bypass endpoint probe
+#   9. (no trust-store import since release 1.0.1 — the certificate is
+#      self-signed and accepted in the browser, as in the Docker quickstart)
 #  10. endpoint contract handoff + platform reachability adapter (D-08, D-23)
 #  11. helm test smoke hooks (OPS-01, D-09..D-11): the explicit `helm test`
 #      after the full pass — test hooks run ONLY on helm test, never during
@@ -68,7 +68,6 @@ ROOT_DIR="$(cd "$K8S_DIR/.." && pwd)"
 . "$LIB_DIR/loki.sh"
 . "$LIB_DIR/alloy.sh"
 . "$LIB_DIR/images.sh"
-. "$LIB_DIR/trust_store.sh"
 . "$LIB_DIR/stateful_storage.sh"
 # (The installer-owned local TLS flow is removed from the Kubernetes path per
 # D-03 — the cert-manager leaf Secret owns the TLS material; the manual
@@ -479,10 +478,6 @@ step "install: running helm test smoke hooks (OPS-01)"
 # (hook-delete-policy before-hook-creation only).
 sudo env KUBECONFIG="$K3S_KUBECONFIG" "$HELM_BIN" test "$HELM_RELEASE_NAME" -n "$HELM_NAMESPACE" || exit 1
 
-step "install: installing the retained CA root into the trust store (D-08)"
-export_ca_root "$TMP_DIR/indramesh-ca.crt" || exit 1
-install_ca_trust "$TMP_DIR/indramesh-ca.crt" || exit 1
-
 print_install_banner() {  # print_install_banner — closing URL/trust/login/conditional-password summary (311.1 D-05)
   # The UI URL comes from the endpoint contract the installer just resolved and
   # verified above — never a hard-coded literal and never the raw port.
@@ -498,7 +493,6 @@ print_install_banner() {  # print_install_banner — closing URL/trust/login/con
     echo "          Also reachable at https://${HOST_IP} from other machines on the network."
   fi
   echo "          The bundled certificate is self-signed — accept the browser warning."
-  echo "          The installer imported the retained CA root into this host's trust store (D-08)."
   if [ "${PLATFORM_WSL:-0}" -eq 1 ]; then
     echo "          The Windows browser reaches the same URL through WSL's localhost forwarding."
   fi

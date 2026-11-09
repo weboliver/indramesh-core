@@ -111,14 +111,11 @@ Memory is still tight. Stop a Compose stack running on the same Pi before the in
 
 ### Access
 
-On the Pi itself, open `https://localhost`; the installer imports its certificate authority into the
-Pi's trust store.
+On the Pi itself, open `https://localhost` and accept the browser warning for the self-signed
+certificate; the installer touches no trust store.
 
 From another machine on the network, open `https://<pi-ip>`. The installer detects the Pi's primary
-IPv4 address and adds it to the certificate; the closing banner prints that address. To trust the
-certificate there, copy the certificate authority from
-`/usr/local/share/ca-certificates/indramesh-local-ca.crt` on the Pi and import it into that
-machine's trust store, or accept the browser warning.
+IPv4 address and adds it to the certificate; the closing banner prints that address. Accept the browser warning there as well.
 
 If the Pi's address changes (DHCP), run the installer again; it reissues the certificate for the new
 address. Give the Pi a fixed address or a DHCP reservation to avoid that. `INDRAMESH_HOST_IP=<ip>`

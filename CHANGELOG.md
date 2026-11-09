@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Plugins** — `install_plugin_docker.sh` and `install_plugin_k8s.sh` update an installed plugin when the source carries a higher version; the same version does nothing and a lower one is refused.
 - **Search** — releases from 1.0.1 on lay out a schema's search index across every object type; a database created under 1.0.0 can hold indices that cover only part of its object types, and objects of the missing types stay out of the search results. Repair them once after the upgrade as a documented operator step: `python -m app.maintenance repair-search-indexes` reports where an index diverges and rebuilds only that part, so a second run is a no-op.
 - **Jira connector** — a Source or Target created under 1.0.0 whose URL points at an address inside the deployment network is refused after the upgrade until a superuser sets `allow_internal_target` to `true` in that row's `config`. The address check runs on pull, push, export and the connection test, so an unchanged internal URL stops syncing rather than silently leaving the deployment.
+- **Installation (k3s)** — `install_indramesh_k8s.sh` no longer imports its certificate authority into a trust store: on WSL2 a normal Windows session could not register it, and the installer then ended with exit 1 on an otherwise complete installation. The certificate is self-signed for the browser, as with the Compose stack, and the closing check proves only that `https://localhost` answers. A CA entry an earlier installation left stays in place — remove stale `indramesh-local-ca` entries, which make the browser reject a newer one (see "What the Installer Changes on Your Host" in `docs/DEPLOYMENT.md`).
 
 ### Fixed
 
@@ -26,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Data model and hierarchy** — deleting a source also removes the key sequences of its schemas from the database, as deleting a single schema already did.
 - **Data model and hierarchy** — deleting a source, schema, object type, attribute or object also removes the translations of everything deleted with it, and an import that replaces a value removes the old value's translations. On the next start, translations and search indices left behind by earlier deletes are removed.
 - **Languages** — the start-up seed removes UI strings that left the code together with their translations, so the translation coverage counts current keys only, and deleting a language also clears its profile preferences and cached dictionary.
+- **Installation (Docker Compose)** — an upgrade recreates nginx, so it serves the configuration of the new release; after a 1.0.0 upgrade it kept the old one and answered every page with `502`. A container whose image tag moved to a rebuilt, identical image is recreated as well, so no container shows up as a bare `sha256:…` after an upgrade.
 
 ### Security
 

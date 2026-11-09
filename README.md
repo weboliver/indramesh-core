@@ -128,7 +128,7 @@ From the cloned repository:
 
 Open **`https://localhost`** and log in as `admin` with the password the installer printed. Monitoring, Headlamp and the log stack are opt-in. A cold run was measured at **4 min 20 s** ([details](docs/DEPLOYMENT.md#measured-quickstart-times)).
 
-**This installer changes the host it runs on**, for example with the k3s cluster, bootstrap packages, a kernel setting and a trust-store import. [What the Installer Changes on Your Host](docs/DEPLOYMENT.md#what-the-installer-changes-on-your-host) lists every change with the way back.
+**This installer changes the host it runs on**, for example with the k3s cluster, bootstrap packages, a kernel setting and a local port forward. [What the Installer Changes on Your Host](docs/DEPLOYMENT.md#what-the-installer-changes-on-your-host) lists every change with the way back.
 
 Host preparation, opt-in components and TLS are described in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#k3s-and-helm), and targets on private addresses in [Outbound connections on Kubernetes](docs/CONFIGURATION.md#outbound-connections-on-kubernetes).
 

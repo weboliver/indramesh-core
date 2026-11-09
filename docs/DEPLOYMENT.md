@@ -130,8 +130,9 @@ administrator permission is involved. On a native host other machines reach the 
 
 Traefik publishes the app on port 80 and port 443. The Compose stack uses `8180`/`8443`, so both
 stacks can run on the same machine side by side. The bundled certificate comes from the installer's
-own certificate authority, which it imports into this host's trust store; elsewhere, accept the
-browser warning or import that authority. The certificate carries `localhost`, `127.0.0.1` and, on
+own certificate authority and is self-signed for the browser: accept the warning once, exactly as
+with the Compose stack. The installer touches no trust store — neither this host's nor, on WSL2,
+the Windows one. The certificate carries `localhost`, `127.0.0.1` and, on
 a native Linux host, the host's own IPv4 address. The closing banner prints that address, and
 `INDRAMESH_HOST_IP` overrides or (set empty) disables it.
 
@@ -145,8 +146,8 @@ installer or `./start` appears to hang or a browser request returns an unexpecte
 A fresh clone reaches a logged-in UI with one command: `./install_indramesh_k8s.sh` creates `.env`
 from `.env.example` when the file is absent, generates every secret in it, installs or reuses the
 cluster, provisions TLS through cert-manager, builds and imports the local application images into
-the cluster, reconciles the Helm release, imports the retained certificate authority into this
-host's trust store, and closes by printing the login URL and — only on the run that generated it —
+the cluster, reconciles the Helm release, verifies that `https://localhost` answers (from the Windows side on
+WSL2), and closes by printing the login URL and — only on the run that generated it —
 the admin password. The quickstart is lean by default: the monitoring
 stack, Headlamp and the log stack are installed only when their switch in the root `.env` is
 exactly the string `true` — `MONITORING_ENABLED`, `HEADLAMP_ENABLED` and `LOGINFRA_ENABLED`,
@@ -215,7 +216,7 @@ Every change, with the way back:
 | The **WSL configuration**: `[boot]` `systemd=true` in `/etc/wsl.conf`. A change here stops the run with exit code 3, because it needs a WSL restart (`wsl --shutdown`) followed by a rerun. | Remove the entry from `/etc/wsl.conf` and restart WSL. |
 | The **WSL memory floor**: `[wsl2]` `memory=` in the Windows-side `%USERPROFILE%\.wslconfig` (an already larger value is left alone). | Remove that line and restart WSL. |
 | The **local-forward service**: the `indramesh-local-forward@.service` systemd template unit at `/etc/systemd/system/indramesh-local-forward@.service`, with its environment file `/etc/indramesh/local-forward.env`; it relays `127.0.0.1:80` and `127.0.0.1:443` to the cluster's Traefik load balancer, which is what makes `https://localhost` work. | `sudo systemctl disable --now indramesh-local-forward@80.service indramesh-local-forward@443.service`, then delete both files and run `sudo systemctl daemon-reload`. |
-| The **trust-store import**: the retained CA root is copied to `/usr/local/share/ca-certificates/indramesh-local-ca.crt` and registered with `update-ca-certificates`; on a WSL2 host the same certificate also goes into the Windows user's `CurrentUser\Root` store (or `LocalMachine\Root` when the terminal happens to run elevated). | Delete `indramesh-local-ca.crt` and run `sudo update-ca-certificates --fresh`; remove the certificate in the Windows certificate manager. |
+| Only **before 1.0.1**: a trust-store import. The retained CA root was copied to `/usr/local/share/ca-certificates/indramesh-local-ca.crt` and registered with `update-ca-certificates`; on a WSL2 host it also went into the Windows `CurrentUser\Root` store (or `LocalMachine\Root` from an elevated terminal). Since 1.0.1 the installer imports nothing, but an entry left by an earlier install stays — and a stale `indramesh-local-ca` of a removed cluster makes the browser reject the new one (`ERR_CERT_AUTHORITY_INVALID`). | Delete `indramesh-local-ca.crt` and run `sudo update-ca-certificates --fresh`; remove every `indramesh-local-ca` entry in the Windows certificate manager (`certmgr.msc`, Trusted Root Certification Authorities). |
 
 The cluster-side resources (the namespace, the Secrets, the Helm release and its retained PVCs)
 live inside that cluster — remove them through the cluster (`helm uninstall indramesh -n indramesh`)
