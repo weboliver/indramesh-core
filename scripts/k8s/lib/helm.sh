@@ -744,3 +744,35 @@ read_endpoint_contract() {  # read_endpoint_contract <values_file> — validate 
   HELM_ENDPOINT_URL="$url"
   return 0
 }
+
+render_chart_nginx_conf() {  # render_chart_nginx_conf <helm_bin> <chart_dir> <values_file> <out_file>
+  # Release 1.0.1 (host-B finding): the nginx.conf Helm deploys is NOT the raw
+  # chart file — templates/nginx-configmap.yaml neutralises the Grafana and
+  # Headlamp proxy_pass lines to `return 404;` when their component is off (the
+  # lean default) and swaps the CSP in development. Validating the raw file made
+  # `nginx -t` fail on every lean install ("host not found in upstream
+  # kube-prometheus-stack-grafana…"), so the rebuild could never complete. The
+  # validation input is therefore rendered from the same template with the
+  # deployed values, and the `nginx.conf: |` block (indented four spaces by the
+  # template's `indent 4`) is cut out of the rendered ConfigMap. `helm template`
+  # is offline — no cluster contact, no sudo.
+  local helm_bin="$1" chart_dir="$2" values_file="$3" out_file="$4" rendered
+  if ! rendered="$("$helm_bin" template "$HELM_RELEASE_NAME" "$chart_dir" -n "$HELM_NAMESPACE" \
+      --values "$values_file" --show-only templates/nginx-configmap.yaml 2>&1)"; then
+    preflight_error "rebuild: rendering the chart's nginx.conf failed: $rendered"
+    return 1
+  fi
+  printf '%s\n' "$rendered" | awk '
+    found {
+      if (substr($0, 1, 4) == "    ") { print substr($0, 5); next }
+      if ($0 == "") { print ""; next }
+      exit
+    }
+    $0 == "  nginx.conf: |" { found = 1 }
+  ' > "$out_file"
+  if [ ! -s "$out_file" ]; then
+    preflight_error "rebuild: the rendered nginx-configmap carries no nginx.conf block"
+    return 1
+  fi
+  return 0
+}

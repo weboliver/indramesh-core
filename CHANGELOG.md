@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Data model and hierarchy** — deleting a source, schema, object type, attribute or object also removes the translations of everything deleted with it, and an import that replaces a value removes the old value's translations. On the next start, translations and search indices left behind by earlier deletes are removed.
 - **Languages** — the start-up seed removes UI strings that left the code together with their translations, so the translation coverage counts current keys only, and deleting a language also clears its profile preferences and cached dictionary.
 - **Installation (Docker Compose)** — an upgrade recreates nginx, so it serves the configuration of the new release; after a 1.0.0 upgrade it kept the old one and answered every page with `502`. A container whose image tag moved to a rebuilt, identical image is recreated as well, so no container shows up as a bare `sha256:…` after an upgrade.
+- **Installation (k3s)** — `rebuild_indramesh_k8s.sh` validates the nginx configuration Helm actually deploys, rendered with the installation's values. It used to test the raw chart file, whose Grafana and Headlamp upstreams do not exist on a default installation, so `nginx -t` failed and the documented upgrade (installer, then rebuild) could not complete.
 
 ### Security
 
