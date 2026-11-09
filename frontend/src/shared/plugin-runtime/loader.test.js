@@ -2,6 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
 import api from '../hooks/use-api.js'
+import { clearToken, setToken } from '../hooks/session-token.js'
 import * as loader from './loader.js'
 
 const { buildPluginBundleUrl, createBundleLoader } = loader
@@ -15,9 +16,10 @@ describe('credentialed plugin bundle loader', () => {
   it('uses the shared client to request text at the versioned URL with a header, never a token in the URL', async () => {
     assert.equal(typeof createBundleLoader, 'function', 'credentialed loader factory is required')
     const originalAdapter = api.defaults.adapter
-    const originalStorage = globalThis.localStorage
     const token = 'secret-test-token'
-    globalThis.localStorage = { getItem: (key) => key === 'indramesh_token' ? token : null }
+    // The bearer comes from the shared in-memory store — never from web
+    // storage and never from the URL (D-01/T-321-02).
+    setToken(token)
     let seen
     api.defaults.adapter = async (config) => {
       seen = config
@@ -32,18 +34,17 @@ describe('credentialed plugin bundle loader', () => {
       assert.equal(seen.responseType, 'text')
       assert.equal(seen.baseURL, '')
       assert.ok(api.getUri(seen).includes('&ce=2&attempt=2'))
-      assert.ok(!api.getUri(seen).includes(token))
+      assert.ok(!api.getUri(seen).includes(token), 'the token must never travel in a URL')
     } finally {
       api.defaults.adapter = originalAdapter
-      globalThis.localStorage = originalStorage
+      clearToken()
     }
   })
 
   it('requests the bundle with a no-store policy and a cache-epoch URL so no stored response can outlive authorization', async () => {
     const originalAdapter = api.defaults.adapter
-    const originalStorage = globalThis.localStorage
     const token = 'epoch-test-token'
-    globalThis.localStorage = { getItem: (key) => key === 'indramesh_token' ? token : null }
+    setToken(token)
     let seen
     api.defaults.adapter = async (config) => {
       seen = config
@@ -55,7 +56,7 @@ describe('credentialed plugin bundle loader', () => {
       const url = api.getUri(seen)
       assert.equal(url, buildPluginBundleUrl(plugin, 0))
       assert.ok(url.includes('?v=0.3.0&ce=2'))
-      assert.ok(!url.includes(token))
+      assert.ok(!url.includes(token), 'the token must never travel in a URL')
       assert.equal(seen.headers.get('Cache-Control'), 'no-store')
 
       seen = undefined
@@ -66,7 +67,7 @@ describe('credentialed plugin bundle loader', () => {
       assert.equal(seen, undefined)
     } finally {
       api.defaults.adapter = originalAdapter
-      globalThis.localStorage = originalStorage
+      clearToken()
     }
   })
 

@@ -47,7 +47,7 @@ async def list_roles(
     db: AsyncSession, skip: int = 0, limit: int = REFERENCE_DEFAULT_LIMIT, q: str | None = None,
     group_id: uuid.UUID | None = None, assigned: bool | None = None,
 ) -> tuple[list[Role], int]:
-    query = select(Role)
+    query = _eager_role_query()
     count_query = select(func.count()).select_from(Role)
     if q:
         search_filter = Role.name.ilike(f"%{q}%")

@@ -34,14 +34,19 @@ Login and FastAPI's documentation/OpenAPI endpoints are not authenticated data r
 
 ## Authentication & Authorization
 
-IndraMesh Core uses **JWT bearer tokens** (`HS256`, `python-jose`), issued via `POST /api/v1/auth/login`
+IndraMesh Core uses **JWT bearer tokens** (`HS256`, `PyJWT`), issued via `POST /api/v1/auth/login`
 and validated by `app/services/auth_service.py::get_current_user` on every protected route.
+The browser session is the same credential pair seen from the other side: a short-lived access
+token sent as a bearer header, plus a refresh credential held in an `HttpOnly` cookie that the
+browser exchanges for a new access token without a login.
 Authorization is enforced by a role-based access control (RBAC) system layered on top of that
 token — see [Users, Roles & Permissions](#users-roles--permissions) below for the resource model.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `POST` | `/auth/login` | None (rate-limited) | OAuth2 password grant (`OAuth2PasswordRequestForm`: `username` + `password` form fields). Returns `{"access_token": "...", "token_type": "bearer"}`. Rate-limited to `RATE_LIMIT_LOGIN` (default `5/minute`, env-configurable) via a dedicated `login_limiter` that is **always active** regardless of `RATE_LIMIT_ENABLED`. |
+| `POST` | `/auth/login` | None (rate-limited) | OAuth2 password grant (`OAuth2PasswordRequestForm`: `username` + `password` form fields). Returns `{"access_token": "...", "token_type": "bearer"}` and sets the `indramesh_refresh` cookie. Rate-limited to `RATE_LIMIT_LOGIN` (default `5/minute`, env-configurable) via a dedicated `login_limiter` that is **always active** regardless of `RATE_LIMIT_ENABLED`. |
+| `POST` | `/auth/refresh` | Refresh cookie | Mints a fresh access token from the `indramesh_refresh` cookie and rotates that cookie, keeping the same session id and the same absolute deadline. Reads only the cookie — no `Authorization` header and no request body — and returns the same `Token` body as login. `401` when the cookie is absent, malformed, past either lifetime bound, revoked or minted before a password change; `503` when the revocation store is unreachable. |
+| `POST` | `/auth/logout` | Refresh cookie (optional) | Ends the browser session. The cookie is expired on the response first, then the session id is blocklisted (and the presented bearer token's `jti`, when an `Authorization` header is sent), so the same cookie can no longer refresh. Answers `200` with `{"message": "Signed out"}`; if the revocation store is unreachable the cookie is still cleared and the answer is `503` with `Message: Signed out locally; revocation store unavailable`, never a `500` that leaves the session alive. |
 | `GET` | `/auth/me` | Bearer | Returns the current user as `UserResponse`. |
 | `GET` | `/auth/me/permissions` | Bearer | Returns the caller's effective permission names as a JSON string array. |
 | `POST` | `/auth/revoke` | Bearer | Self-service logout. Decodes the caller's own JWT, extracts its `jti` claim, and adds it to a Valkey-backed blocklist for the token's remaining TTL — any authenticated user may revoke their own token, this is not admin-only. |
@@ -56,14 +61,42 @@ curl http://localhost:8000/api/v1/objects/ \
   -H "Authorization: Bearer <access_token>"
 ```
 
-**Token internals** (`app/services/auth_service.py`):
-- Signing key: `JWT_SECRET_KEY` env var (validated present at process startup).
+**Login hardening:**
+- The two failure answers are identical and the credential check costs the same either way: an
+  unknown username is verified against a fixed dummy bcrypt digest, so the median difference at the
+  credential-check level stays within `LOGIN_TIMING_TOLERANCE_SECONDS` (**50 ms**).
+- A per-account throttle **delays** the next attempt instead of locking the account: from the third
+  recorded failure onwards each further attempt is delayed 0.5 s, 1 s, 2 s, 4 s and then capped at
+  **8 s**, and the counter decays after 15 minutes. Nothing is ever locked out — a hard lockout
+  would itself be a denial-of-service vector against a known account. The per-IP `login_limiter`
+  above stays in place beside it, the submitted username is only stored as a SHA-256 digest, and an
+  unreachable Valkey means zero delay (fail-open), never a failed login.
+
+**Token internals** (`app/services/auth_service.py`, `app/services/session_service.py`):
+- Signing key: `JWT_SECRET_KEY` env var, at least **32 characters**. Startup (`app/main.py`) and the
+  lazy loader (`get_secret_key`) share one validation rule and refuse a shorter value with
+  `JWT_SECRET_KEY must be at least 32 characters`; HS256 is symmetric, so a short key is
+  brute-forceable offline from a single known token.
+- **Lifetimes.** An access token lives **15 minutes** (`exp - iat == 900`). The refresh credential
+  behind the `indramesh_refresh` cookie is valid for **30 days sliding** — every rotation restarts
+  the 8-hour idle window — with a hard **30-day ceiling measured from login**, after which a new
+  login is required. Access tokens issued with a longer lifetime are refused (`exp - iat` above
+  15 minutes plus the clock-skew tolerance), which is what makes the 1.0.0 → 1.0.1 upgrade force
+  one re-login per user.
+- Access and refresh credentials share the HS256 key but not the claim (`typ`): a refresh credential
+  presented as a bearer token is refused. The cookie itself is scoped to `Path=/api/v1/auth` and
+  carries `HttpOnly`, `SameSite=Strict`, and `Secure` when the request arrived over HTTPS.
+- `imsh_` API-client bearer tokens — the service-account clients of the public API — are unchanged:
+  they authenticate with `Authorization: Bearer imsh_…` under `/public/api/v1/*`, receive no
+  cookie, and are not subject to the access-token lifetime above.
 - Every token carries a unique `jti` claim, enabling the revoke/blocklist flow above.
 - `CLOCK_SKEW_TOLERANCE_SECONDS` (default `10`) tolerates clock drift on the `nbf` claim.
 - `MAX_TOKEN_AGE_SECONDS` is an optional additional absolute-age ceiling on top of the token's own
   `exp` claim; unset by default (only `exp` is enforced).
-- A revoked token's `jti` is checked against the Valkey blocklist on every request via
-  `_is_token_blocklisted`.
+- A revoked token's `jti` and a logged-out session's `sid` are checked against the Valkey blocklist
+  on every request via `blocklist_state` (one `MGET` for both namespaces). The check is
+  **fail-closed**: when the revocation store is unreachable, a protected route and `/auth/refresh`
+  answer `503` with `Retry-After` instead of treating the credential as valid.
 
 **Authorization dependencies** — three FastAPI dependencies gate every route, defined in
 `app/services/auth_service.py`:
@@ -115,7 +148,7 @@ noted per route (superusers bypass every check).
 |---|---|---|---|
 | `GET` | `/users/me/profile` | any authenticated user | Returns the caller's own `UserProfileResponse`; auto-creates the profile row if none exists. |
 | `PATCH` | `/users/me/profile` | any authenticated user | Updates the caller's own profile fields. |
-| `POST` | `/users/me/change-password` | any authenticated user (rate-limited: `RATE_LIMIT_PASSWORD_CHANGE`, default `5/minute`) | Body: current + new password. Revokes the JWT used to make the request (mirrors `/auth/revoke`) so a stolen long-lived token can't outlive a deliberate password change. |
+| `POST` | `/users/me/change-password` | any authenticated user (rate-limited: `RATE_LIMIT_PASSWORD_CHANGE`, default `5/minute`) | Body: current + new password. Bumps the user's `token_version`, so **every** live access token and refresh cookie of that user — including the calling one — stops working; a suspected compromise is ended by the password change itself. No blocklist entry is needed: the epoch is the mechanism (see `/auth/refresh` above). |
 | `POST` | `/users/` | `users:create` | Create a user. Returns `UserAdminResponse`, `201`. |
 | `GET` | `/users/` | `users:read` | List users. Filters: `skip`, `limit` (default `REFERENCE_DEFAULT_LIMIT`), `q` (username/email substring match). `X-Total-Count` header set. |
 | `GET` | `/users/picker` | `objects:read` | Restricted user-picker projection (`UserPickerResponse`), not the user-administration response. |
@@ -128,6 +161,12 @@ noted per route (superusers bypass every check).
 | `GET` | `/users/{user_id}/groups` | `users:read` | List the user's group memberships. |
 | `POST` | `/users/{user_id}/groups/{group_id}` | `groups:manage` | Add group membership. |
 | `DELETE` | `/users/{user_id}/groups/{group_id}` | `groups:manage` | Remove group membership with self-lockout protection. |
+
+**Profile avatar (deprecated in the interface):** `UserProfileResponse.avatar_url` is still stored
+and returned by `GET`/`PATCH /users/me/profile`, but the administration interface no longer renders
+it — the avatar surfaces show initials instead, so a viewer's browser never contacts a third-party
+host on the profile's behalf. A stored value remains valid and is left untouched; a later
+server-side proxy can start rendering it again without a data migration.
 
 ### Roles — `/roles` (`app/api/roles.py`)
 
@@ -234,18 +273,18 @@ Specialized validation, permissions and side effects still differ by resource:
 |---|---|---|---|---|
 | Source | `/sources` | `app/api/sources.py` | — | Create: `require_permission("sources", "create")`; list: `get_current_user` (unscoped by design — no type-level read grant for non-superusers); get/update/delete: `require_record_permission("sources", ...)` (get skips the type-level check) |
 | Schema | `/schemas` | `app/api/schemas.py` | `source_id` | Create: `require_permission("schemas", "create")`; list: `require_permission("schemas", "read")`; get/update/delete: `require_record_permission("schemas", ...)` |
-| ObjectType | `/object-types` | `app/api/object_types.py` | `schema_id` | Create: `require_permission("object-types", "create")`; list: `require_permission("object-types", "read")`; get/update/delete: `require_record_permission("object-types", ...)` |
-| Object | `/objects` | `app/api/objects.py` | `object_type_id`, `q`, `sort_by`, `sort_order`, `filter_tree`, `attr_filters` (see below) | Create/list: `require_permission("objects", ...)`; get/update/delete: `require_record_permission("objects", ...)` |
-| ObjectTypeAttribute | `/object-type-attributes` | `app/api/object_type_attributes.py` | `object_type_id` | `require_permission("object-type-attributes", <action>)` |
+| ObjectType | `/object-types` | `app/api/object_types.py` | `schema_id` | Create: `require_permission("object-types", "create")`; list: `require_permission("object-types", "read")`; get/update/delete: `require_record_permission("object-types", ...)`. `POST /object-types/` resolves the record write decision on two containers — the owning `Schema` and, when one is supplied, the parent `ObjectType`: an invisible container answers the route's existing missing-container answer (`404`), a readable but non-writable one answers `403`. |
+| Object | `/objects` | `app/api/objects.py` | `object_type_id`, `q`, `sort_by`, `sort_order`, `filter_tree`, `attr_filters` (see below) | Create/list: `require_permission("objects", ...)`; get/update/delete: `require_record_permission("objects", ...)`. `POST /objects/` additionally resolves the record **write** decision on the target `ObjectType` container: an invisible container answers the route's existing missing-container answer (`404`), a readable but non-writable one answers `403` — both before the first write, so no partial row survives a refusal. |
+| ObjectTypeAttribute | `/object-type-attributes` | `app/api/object_type_attributes.py` | `object_type_id` | `require_permission("object-type-attributes", <action>)` plus the record write decision on the `ObjectType` container: an invisible container answers the route's existing missing-container answer (`404`), a readable but non-writable one answers `403`; `DELETE` resolves the separate `delete` action, never the `write` umbrella, so a `write` DENY does not block a delete and a `delete` DENY does. |
 | ObjectValue | `/object-values` | `app/api/object_values.py` | `object_id`, `object_ids` (batch); `GET /object-values/distinct` sub-route | `require_permission("object-values", <action>)` |
-| ObjectRef | `/object-refs` | `app/api/object_refs.py` | `from_object_id`, `to_object_id`, `object_ids` (batch) | `require_permission("object-refs", <action>)`; record-level read `DENY` (quick 261012-cpp): for non-superusers a ref whose from or to object (or that object's type, schema or source) is DENY'd is omitted from lists and `X-Total-Count`, and `GET`/`PATCH`/`DELETE /{id}` answer `404 Object reference not found` as for an unknown id; a DENY'd `from_object_id`/`to_object_id` on create/update answers the same `404` as a nonexistent one; filtered callers bypass the shared list cache |
+| ObjectRef | `/object-refs` | `app/api/object_refs.py` | `from_object_id`, `to_object_id`, `object_ids` (batch) | `require_permission("object-refs", <action>)`; record-level read `DENY` (quick 261012-cpp): for non-superusers a ref whose from or to object (or that object's type, schema or source) is DENY'd is omitted from lists and `X-Total-Count`, and `GET`/`PATCH`/`DELETE /{id}` answer `404 Object reference not found` as for an unknown id; a DENY'd `from_object_id`/`to_object_id` on create/update answers the same `404` as a nonexistent one; filtered callers bypass the shared list cache. Record-level **write** decision (D-02 as revised 2026-11-01): creating, changing or moving a reference requires `write` on its source (`from`) object — a readable source with a `write` DENY answers `403`; the target (`to`) only has to be readable, so a write-protected catalog object (a location, a vendor) stays linkable; an invisible end on either side keeps the existing `404`. |
 | AttributeType | `/attribute-types` | `app/api/attribute_types.py` | — | Create/list: `require_permission("attribute-types", ...)`; get/update/delete: `require_record_permission("attribute-types", ...)` |
 | ReferenceType | `/reference-types` | `app/api/reference_types.py` | `schema_id` | `require_permission("reference-types", <action>)` |
 | Status | `/statuses` | `app/api/statuses.py` | — | `require_permission("statuses", <action>)` |
 | Import | `/imports` | `app/api/imports.py` | — | `require_permission("imports", <action>)`; `POST` also creates a `Task` and enqueues `process_import` |
 | Export | `/exports` | `app/api/exports.py` | — | `require_permission("exports", <action>)`; `POST` also creates a `Task` and enqueues `process_export` |
-| ImportStatus | `/import-statuses` | `app/api/import_statuses.py` | — | `get_current_user` (no resource-specific permission enforced) |
-| ExportStatus | `/export-statuses` | `app/api/export_statuses.py` | — | `get_current_user` (no resource-specific permission enforced) |
+| ImportStatus | `/import-statuses` | `app/api/import_statuses.py` | — | `require_permission("imports", <action>)` |
+| ExportStatus | `/export-statuses` | `app/api/export_statuses.py` | — | `require_permission("exports", <action>)`; the list and by-id routes additionally stay inside the caller's own exports (`visible_export_ids_select`), and a superuser is unrestricted |
 | Task | `/tasks` | `app/api/tasks.py` | `task_type`, `current_status`, `schedule_id_null`, `is_permanent` | `require_permission("tasks", <action>)`; plus `/types`, `/retry` and `/cancel` (below) |
 | Target | `/targets` | `app/api/targets.py` | — | `require_permission("targets", <action>)` |
 | ServiceAccount | `/service-accounts` | `app/api/service_accounts.py` | `source_id` | `require_permission("service-accounts", <action>)` |
@@ -572,6 +611,21 @@ and an active plugin; a disabled mounted plugin responds `503`.
 | `GET` | `/conflicts/object-names` | Resolve conflict object names | `conflicts:read` + `objects:read` |
 | `POST` | `/conflicts/{conflict_id}/resolve` | Resolve a conflict | `conflicts:manage` |
 
+**Trigger a Jira Assets pull:**
+
+First enable the Jira plugin, configure a Jira connection for the Source under **Jira connections**, and select an active service account bound to that Source with a Jira bearer token. The backend and worker must have a compatible active Jira plugin; the caller needs `tasks:create` and `sync:trigger` permissions. Replace the UUID placeholders with your configured Source and service account IDs.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/tasks/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"tasktype":"jira.sync-pull","source_id":"<source-uuid>","service_account_id":"<service-account-uuid>","current_step":null,"plugin_parameters":{}}'
+```
+
+Expected result: HTTP `201` with a Task object, including its `id` and `tasktype: "jira.sync-pull"`; execution runs asynchronously. Read its status at `GET /api/v1/tasks/<task-id>`. To select a single Jira schema, set `plugin_parameters.jira_schema_id` to its Jira schema ID.
+
+Jira synchronization now uses plugin task types `jira.sync-pull`, `jira.sync-push`, and `jira.sync-export` through the Tasks API. The former core `/api/v1/sync/*` endpoints are removed; `JIRA_URL` is not the plugin's connection configuration.
+
 Core `Task` rows created by plugin runs remain visible through `GET /tasks/`
 (see [Tasks — Retry and Cancel](#tasks--retry-and-cancel)) with their plugin task-type identifiers.
 
@@ -619,11 +673,11 @@ Distinct from the `SchemaTemplate` library above, `app/api/schemas.py` and
 
 | Method | Path | Status | Auth | Description |
 |---|---|---|---|---|
-| `GET` | `/schemas/{schema_id}/template` | `200` / `404` | `schemas:read` | Downloads one schema's color palette as a JSON file attachment (`Content-Disposition: attachment`). |
-| `GET` | `/schemas/{schema_id}/template-data` | `200` | `schemas:read` | Read the schema's structural template data (distinct from its color palette). |
-| `POST` | `/schemas/{schema_id}/template` | `200` / `404` | `schemas:create` | Body: `TemplateColorsUpdate` (light/dark color groups). Applies the colors to the schema; returns the updated `SchemaResponse`. |
-| `GET` | `/templates/export` | `200` | `require_permission("schemas", "read")` | Downloads **every** schema's color palette as one JSON file (`{"<schema_id>": {...colors...}}`), attachment filename `schemas-templates-export.json`. |
-| `POST` | `/templates/import` | `200` | `require_permission("schemas", "update")` | Body: `{"<schema_id>": {...colors...}, ...}` — bulk-applies color palettes across multiple schemas in one call. Returns `TemplateBulkImportResponse`: `{"updated": [...], "skipped": [{"id", "reason"}], "errors": [{"id", "reason"}]}` — per-entry failures don't abort the whole batch. |
+| `GET` | `/schemas/{schema_id}/template` | `200` / `403` / `404` | `schemas:read` (record-permission-checked) | Downloads one schema's color palette as a JSON file attachment (`Content-Disposition: attachment`). A record `read` DENY on the schema answers `403` — the same answer the sibling `GET /schemas/{schema_id}` gives; a nonexistent id keeps `404 Schema not found`. |
+| `GET` | `/schemas/{schema_id}/template-data` | `200` / `403` / `404` | `schemas:read` (record-permission-checked) | Read the schema's structural template data (distinct from its color palette). A record `read` DENY on the schema answers `403`, matching the sibling `GET /schemas/{schema_id}`; a nonexistent schema keeps its existing `404 Schema not found`, so the denied and the missing cases stay distinguishable. |
+| `POST` | `/schemas/{schema_id}/template` | `200` / `403` / `404` | `schemas:create` + record `create` decision | Body: `TemplateColorsUpdate` (light/dark color groups). Applies the colors to the schema; returns the updated `SchemaResponse`. A stored record `write` DENY on the schema blocks the call with `403`; a nonexistent id keeps `404 Schema not found`. |
+| `GET` | `/templates/export` | `200` | `require_permission("schemas", "read")` + record `read` decision | Downloads **every** schema's color palette as one JSON file (`{"<schema_id>": {...colors...}}`), attachment filename `schemas-templates-export.json`. A schema the caller is record-DENIED on is omitted from the payload — its id never appears as a key. |
+| `POST` | `/templates/import` | `200` | `require_permission("schemas", "update")` + record `read`/`update` decision | Body: `{"<schema_id>": {...colors...}, ...}` — bulk-applies color palettes across multiple schemas in one call. Returns `TemplateBulkImportResponse`: `{"updated": [...], "skipped": [{"id", "reason"}], "errors": [{"id", "reason"}]}` — per-entry failures don't abort the whole batch. An entry the caller is record-DENIED on is returned under `skipped` with one neutral reason that does not distinguish "cannot read" from "cannot write", and nothing is written for it. |
 
 ## Schedules — Preview and Run Now
 
@@ -684,6 +738,16 @@ the service layer (`audit_log()` in `app/services/audit_service.py`).
 |---|---|---|---|---|
 | `GET` | `/audit-logs` | `200` | `audit-log:read` (singular resource name) | Paginated audit trail, newest first (`created_at DESC`). Filters: `entity_type`, `object_id` (owning `Object` — scopes to that object's `objects`/`object_values`/`object_refs` history, excluding plumbing `CREATE`/`DELETE` rows on `object_values` that are really a type-change delete+recreate, keeping only `UPDATE`), `actor_q` (substring match on actor first/last name or email), `start_date`/`end_date` (ISO datetime, inclusive), `page` (default `1`), `page_size` (default `50`, max `200`). Returns `AuditLogPaginatedResponse` (`items`, `total`, `page`, `page_size`, `total_pages`). Each item carries resolved `actor_display_name`/`actor_initials` (joined from `User`/`UserProfile`) and, for reference-attribute changes, resolved `reference_field_name`/`reference_old_target_name`/`reference_new_target_name`. |
 
+For a non-superuser the page is filtered by the caller's record decision before anything is
+serialized: a row is omitted when the attribute behind the change carries a record DENY, when
+that attribute is `is_hidden`, or when the row's own object carries an object-level `DENY` —
+attribute name, old value and new value all disappear with it, in the `object_id`-scoped history
+and in the global log alike. `total` and `total_pages` shrink with the filter, because the count
+is computed over the filtered statement and never over the unfiltered one. A reference target the
+caller may not read is not named: `reference_old_target_name`/`reference_new_target_name` stay
+`null`. An object-level `DENY` on the `object_id` parameter yields an empty page with `HTTP 200`,
+not an error — lists filter silently and never fail per row. Superusers are not filtered.
+
 ### Audit Log Configuration — `/audit-log-config` (`app/api/audit_log_config.py`)
 
 Per-entity-type on/off toggle for whether changes to that entity are written to the audit log at all.
@@ -725,9 +789,11 @@ Standard CRUD, gated by `languages:<action>`.
 
 | Method | Path | Status | Description |
 |---|---|---|---|
-| `POST` | `/languages/` | `201` | Body: `code` (free-form BCP-47-style code, no format constraint enforced), `name` (English display name), `is_active`. |
-| `GET` | `/languages/` | `200` | `skip`/`limit` (default `REFERENCE_DEFAULT_LIMIT`=200, max `1000`). `X-Total-Count` header. |
-| `GET` / `PATCH` / `DELETE` | `/languages/{id}` | `200`/`204` / `404` | Standard fetch/update/delete. |
+| `POST` | `/languages/` | `201` | Body: `code`, `name` (English display name), `is_active`. `code` is trimmed and lowercased, then validated as a BCP-47-shaped tag (`^[a-z]{2,3}(-[a-z]{4})?(-([a-z]{2}|[0-9]{3}))?(-([a-z0-9]{5,8}|[0-9][a-z0-9]{3}))*$`) — a non-conforming code is `422`. A duplicate after normalization is `409`. |
+| `GET` | `/languages/` | `200` | `skip`/`limit` (default `REFERENCE_DEFAULT_LIMIT`=200, max `1000`). `X-Total-Count` header. Each entry carries the computed `is_bundled` flag (the code ships a committed catalog with the application). |
+| `GET` / `PATCH` / `DELETE` | `/languages/{id}` | `200`/`204` / `404` | Standard fetch/update/delete. `DELETE` answers `409` for a bundled language (derived from the backend's `BUNDLED_LANGUAGE_CODES`, the row stays) and for a language still referenced by a schema. Deleting an operator-added language resets every `user_profiles.ui_language` holding that code to `NULL` and invalidates the cached `/ui-translations/dictionary` data. |
+
+The format rule is enforced on **create only** — `GET` responses stay permissive so pre-existing rows with legacy codes still serialize.
 
 A `Schema`'s own enabled-language set is managed separately, on the `schemas` router:
 `GET /schemas/{schema_id}/languages` (`schemas:read`, record-permission-gated) returns the
@@ -751,6 +817,13 @@ suggestion/translate-job lifecycle was retired in the Phase 307 cut-over and now
 |---|---|---|---|
 | `PUT` | `/translations/` | `200` | Body: `TranslationUpsert` — upserts one `(entity, field, language)` translation. |
 | `GET` | `/translations/` | `200` | Filters: `translation_type`, `entity_id`, `field` (`name`/`description`), `language_code`; `skip`/`limit` (default `100`, max `1000`). `X-Total-Count` header. |
+
+The list is record-filtered: a row is omitted when the entity that owns it carries a record DENY
+for the caller — for every record-owned translation type (`object_type`, `object_type_attribute`,
+`select_option`, `object_value`, `status`, `reference_type`). `X-Total-Count` counts only the rows
+the caller may see, so the header and the page agree; it never counts a denied row. The two
+schema-less types — `systemui` and `classification_label` — are never filtered, because they have
+no record owner.
 
 ### UI Translations — `/ui-translations` (`app/api/ui_translations.py`)
 
@@ -816,13 +889,13 @@ refused `409` before any Task row is inserted.
 |---|---|---|---|---|
 | `GET` | `/data/availability` | `200` | `ai-translation:data` | Scope-free `{"available": <bool>}` from the configured LLM — never a provider probe, model, URL or key. The schema section hides its generation controls fail-closed when `false`. |
 | `GET` | `/data/status` | `200` | `ai-translation:data` | Query: `translation_type`, `entity_id`. `{"available": <bool>, "open_count": <int>}` for one entity (record-permission-checked). |
-| `GET` | `/data/open-count` | `200` | `ai-translation:data` | Query: `schema_id`. `{"open_count": <int>}` — the schema-wide open data-suggestion count. |
+| `GET` | `/data/open-count` | `200` / `403` | `ai-translation:data` (record-permission-checked) | Query: `schema_id`. `{"open_count": <int>}` — the schema-wide open data-suggestion count. A record `read` DENY on the schema answers `403 not_authorized` and returns no count at all — the count query never runs, because a `0` would still disclose that the schema exists. |
 | `GET` | `/data/schema-candidates` | `200` | `ai-translation:data` + `translations:read` + `schemas:read` | Query: `schema_id`. Six rows in canonical kind order, each `{translation_type, missing, waiting}` — missing target pairs and how many already have an open suggestion, counted only over entities the caller may read. |
 | `POST` | `/data/generate` | `200` / `409` / `422` / `502` / `503` / `504` | `ai-translation:data` | Body: `{translation_type, entity_id}`. Synchronously generates and persists proposals for the entity, returning `list[SuggestionView]`. `409` when a conflicting field/schema run holds the admission lock; fixed typed error codes (`timeout`/`unreachable`/`not_configured`/`input_rejected`/`invalid_result`) carry a `{code, message}` detail, never raw provider text. |
 | `GET` | `/data/suggestions` | `200` | `ai-translation:data` | Query: `translation_type`, `entity_id`. Lists that entity's open suggestions (`list[SuggestionView]`) for review. |
 | `POST` | `/data/apply` | `200` / `403` / `422` | `ai-translation:data` | Query: `translation_type`, `entity_id`. Body: `{items: [...]}`. Commits the reviewed drafts through the audited Core `upsert_translation()` path (fresh `update` authority required, never the read right alone); returns `ApplyResult`. |
 | `DELETE` | `/data/suggestions/{suggestion_id}` | `200` / `404` | `ai-translation:data` | Query: `translation_type`, `entity_id`. Discards one owned open suggestion (`update` authority); `404` when it is not found in scope. |
-| `GET` | `/data/runs` | `200` / `404` | `ai-translation:data` + `translations:read` + `schemas:read` | Query: `schema_id`. The latest schema run's safe `RunStatus` (`task_id`, `kind`, `outcome`, `attempted`/`generated`/`skipped`/`failed`, timestamps) — never a log, prompt or provider text; `404` when the schema has no run. `outcome` is Core's terminal truth projected onto the private row. |
+| `GET` | `/data/runs` | `200` / `403` / `404` | `ai-translation:data` + `translations:read` + `schemas:read` (record-permission-checked) | Query: `schema_id`. The latest schema run's safe `RunStatus` (`task_id`, `kind`, `outcome`, `attempted`/`generated`/`skipped`/`failed`, timestamps) — never a log, prompt or provider text; `404` when the schema has no run. A record `read` DENY on the schema answers `403 not_authorized` **before** the run lookup, with or without a run row, so a denied caller never receives the run-specific `404` and the lookup cannot become an existence oracle. `outcome` is Core's terminal truth projected onto the private row. |
 | `GET` | `/ui/status` | `200` | `ai-translation:ui` | `{"available": <bool>, "open_count": <int>}` for the UI-string store. |
 | `GET` | `/ui/candidates` | `200` | `ai-translation:ui` | Query: `target_language` (required), `namespace`, `namespace_is_null`, `q`, `only_missing`. Read-only preview of the missing-key block (`UiCandidatesResult`: `items`, `eligible_total`, `missing_total`, `has_more`) — never enqueues, never writes. |
 | `GET` | `/ui/runs` | `200` / `404` | `ai-translation:ui` + `translations:read` | Query: `target_language`. The latest UI run's safe `RunStatus`; `404` when none. |
@@ -924,9 +997,20 @@ on a cache miss or Valkey error), then against `api_clients.token_hash`, resolvi
 
 A read-only [Strawberry](https://strawberry.rocks/) GraphQL schema (`app/graphql/`) mounted at
 `/api/v1/graphql`, registered as a plain `APIRouter` (not `app.mount()`) so FastAPI resolves its
-`Depends()` context normally. `app/graphql/enabled.py` registers this internal mount only when
-`settings.environment != "production"`; it is absent in production. This registration gate
-does not remove the separately registered public GraphQL mount.
+`Depends()` context normally. The route is always registered; on production the router's
+`graphql_endpoint_gate` serves it only while a plugin declaring `enables_http_graphql` is active.
+This gate does not touch the separately registered public GraphQL mount.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/graphql \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ health { status version } }"}'
+```
+
+Expected result: a GraphQL `data.health` object with `status: "ok"` and the runtime package version (or `"unknown"` if package metadata is unavailable).
+
+On a production instance `/api/v1/graphql` answers only once the GraphQL Studio plugin is installed **and** activated by an administrator — installing it alone leaves a fresh installation inactive. `/public/api/v1/graphql` is the integration surface for public clients and does not depend on the plugin.
 
 - **Auth**: `context_getter=get_context` (`app/graphql/context.py`) resolves
   `Depends(get_current_user)` before any resolver runs — every request reaching the schema is
@@ -1130,6 +1214,15 @@ Object read/write endpoints additionally enforce record-level
 `RecordPermission` overrides, matching the internal REST API's `require_record_permission`
 semantics — a record-level `DENY` returns the same `404` as a nonexistent object, so existence is
 never leaked to an unauthorized caller.
+
+`POST /public/api/v1/object/create` refuses a container that carries a record `DENY` for the
+caller, decided in the handler because the container id arrives in the body: a read `DENY` on the
+target `ObjectType` answers the same `400 Unknown objectTypeId` as a nonexistent type (so it is no
+existence oracle), and a `create` `DENY` on a readable container answers `403` with the public
+write envelope `{"errors": ["Not authorized for this object type."]}`. Both decisions run before
+payload validation, so a refusal never names an attribute the caller must not know about. A
+reference target only has to be **readable**: an unreadable target keeps the existing `400
+Reference target {id} not found`, while a write-protected but readable target stays linkable.
 
 **Saved-query execution** — `POST /public/api/v1/saved-queries/{id}/execute`
 (`app/public_api/saved_queries.py`), gated by `require_public_permission("saved-queries", "execute")`:

@@ -22,11 +22,10 @@ export function UiLanguageProvider({ children }) {
   const { t } = useTranslation()
   const { profile, isAuthenticated } = useAuth()
   // Gate on auth: this provider wraps the whole app including Login (D-04),
-  // and an ungated list call fires unauthenticated on first mount — the
-  // resulting 401 trips use-api.js's global interceptor
-  // (localStorage.removeItem + window.location.href = '/login'), which is a
-  // hard reload that re-mounts the app and re-fires the same unauthenticated
-  // request, looping forever on the login page itself.
+  // and an ungated list call fires unauthenticated on first mount. With 321-07
+  // that 401 no longer hard-reloads the page — the interceptor refreshes once
+  // and retries, and the boot path skips the refresh on `/login` — but the
+  // request would still be a round trip that can only fail, so keep the gate.
   const { data: languagesData } = useLanguages(0, 200, { enabled: isAuthenticated })
   const queryClient = useQueryClient()
   const [runtimeLanguage, setRuntimeLanguage] = useState(i18n.resolvedLanguage || i18n.language || 'en')

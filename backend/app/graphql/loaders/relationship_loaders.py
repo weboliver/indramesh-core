@@ -18,16 +18,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from strawberry.dataloader import DataLoader
 
-from app.models.attribute_type import AttributeType
-from app.models.object import Object
 from app.models.object_ref import ObjectRef
 from app.models.object_type import ObjectType
-from app.models.object_type_attribute import ObjectTypeAttribute
 from app.models.object_value import ObjectValue
 from app.services.classification_service import load_classifications
-from app.services.object_ref_service import hidden_ref_clause
+from app.services.object_ref_service import (
+    denied_ref_attribute_clause,
+    hidden_ref_clause,
+)
 from app.services.value_visibility import (
+    apply_value_visibility,
     resolve_principal_roles,
+    value_visibility_joins,
     visible_value_conditions,
 )
 
@@ -72,7 +74,13 @@ def object_values_by_object_id_loader(
     (is_hidden), ``attribute_types`` (the attribute-type record DENY) and
     ``objects`` (the object-level record DENY, which cascades over the
     object's type/schema/source chain). Each joined table is 1:1 on its key,
-    so the row set is unchanged — no duplicate values.
+    so the row set is unchanged — no duplicate values. They are taken from
+    :func:`value_visibility_joins` (all three pairs), not from
+    :func:`attribute_visibility_joins`: the composed
+    ``visible_value_conditions`` includes the object-level clause, so this
+    selection must join ``objects`` too. The attribute-only helper belongs to
+    the CSV value selection, which scopes objects through an ``IN (subquery)``
+    instead of a join.
 
     ``user_id=None`` means "no principal bound" and **raises** unless the
     caller passes the keyword-only ``trusted=True`` opt-in (WR-06): a missing
@@ -102,30 +110,22 @@ def object_values_by_object_id_loader(
         stmt = select(ObjectValue).where(ObjectValue.object_id.in_(keys))
         async with lock:
             if user_id is not None and not is_superuser:
-                # The predicate clauses reference these tables, so the joins
-                # are added together with them — the unfiltered path keeps the
-                # exact statement shape it had before (no needless joins).
-                stmt = (
-                    stmt.join(
-                        ObjectTypeAttribute,
-                        ObjectTypeAttribute.id == ObjectValue.object_type_attribute_id,
-                    )
-                    .join(
-                        AttributeType,
-                        AttributeType.id == ObjectTypeAttribute.attribute_type_id,
-                    )
-                    .join(Object, Object.id == ObjectValue.object_id)
-                )
                 # Resolve the principal's roles once and hand the list to both
                 # fragments (317-03 P-08): the two composed clauses bind the
                 # same ``:role_ids`` name, so they must receive one value.
                 role_ids = await resolve_principal_roles(
                     session, str(user_id), False
                 )
-                for clause in await visible_value_conditions(
-                    session, str(user_id), False, role_ids=role_ids
-                ):
-                    stmt = stmt.where(clause)
+                # The joins are added together with the clauses — the
+                # unfiltered path keeps the exact statement shape it had
+                # before (no needless joins).
+                stmt = apply_value_visibility(
+                    stmt,
+                    await visible_value_conditions(
+                        session, str(user_id), False, role_ids=role_ids
+                    ),
+                    joins=value_visibility_joins(),
+                )
             result = await session.execute(stmt)
             rows = list(result.scalars().all())
         grouped: dict[uuid.UUID, list[ObjectValue]] = defaultdict(list)
@@ -159,11 +159,29 @@ async def _memoized_hidden_ref_clause(session: AsyncSession, memo: dict):
     return memo["hidden_ref_clause"]
 
 
+async def _memoized_denied_ref_clause(session: AsyncSession, memo: dict, user_id):
+    """Evaluate ``denied_ref_attribute_clause`` once per loader instance.
+
+    Unlike the hidden clause this one *is* principal-scoped, so it is memoized
+    per loader and only ever computed for a non-superuser (the callers apply
+    their own ``is_superuser`` guard). Same contract as
+    :func:`_memoized_hidden_ref_clause`: ``memo`` is bound through
+    ``functools.partial``, the caller already holds the request lock, and a
+    stored ``None`` counts as computed (membership test, not truthiness).
+    """
+    if "denied_ref_clause" not in memo:
+        memo["denied_ref_clause"] = await denied_ref_attribute_clause(
+            session, user_id=str(user_id)
+        )
+    return memo["denied_ref_clause"]
+
+
 def object_refs_by_from_object_id_loader(
     session: AsyncSession,
     lock: asyncio.Lock | None = None,
     *,
     is_superuser: bool = False,
+    user_id: str | None = None,
 ) -> DataLoader:
     """Return a DataLoader that loads all outgoing ``ObjectRef`` rows per ``from_object_id``.
 
@@ -179,6 +197,11 @@ def object_refs_by_from_object_id_loader(
     running again. ``is_superuser=True`` is the unfiltered admin view; the
     clause is memoized per loader instance, so one request pays one bounded
     CTE (T-317.2-08).
+
+    AUTHZ-08 / D-08: the attribute-type record DENY is applied in the same
+    place, from ``object_ref_service.denied_ref_attribute_clause`` bound to
+    the request principal. Both clauses are memoized in this loader's own
+    ``memo`` dict, never in the resolver.
     """
 
     lock = lock or asyncio.Lock()
@@ -190,6 +213,7 @@ def object_refs_by_from_object_id_loader(
         lock: asyncio.Lock,
         is_superuser: bool,
         memo: dict,
+        user_id,
     ) -> list[list[ObjectRef]]:
         stmt = select(ObjectRef).where(ObjectRef.from_object_id.in_(keys))
         async with lock:
@@ -197,6 +221,16 @@ def object_refs_by_from_object_id_loader(
                 clause = await _memoized_hidden_ref_clause(session, memo)
                 if clause is not None:
                     stmt = stmt.where(clause)
+            # The same guard the value loader above uses: ``context.py`` binds
+            # a user_id for every request, so a user_id-only test would run the
+            # principal-scoped clause for an administrator and strip refs the
+            # admin may see (RLR-05).
+            if user_id is not None and not is_superuser:
+                denied_clause = await _memoized_denied_ref_clause(
+                    session, memo, user_id
+                )
+                if denied_clause is not None:
+                    stmt = stmt.where(denied_clause)
             result = await session.execute(stmt)
             rows = list(result.scalars().all())
         grouped: dict[uuid.UUID, list[ObjectRef]] = defaultdict(list)
@@ -211,6 +245,7 @@ def object_refs_by_from_object_id_loader(
             lock=lock,
             is_superuser=is_superuser,
             memo=memo,
+            user_id=user_id,
         )
     )
 
@@ -220,6 +255,7 @@ def object_refs_by_to_object_id_loader(
     lock: asyncio.Lock | None = None,
     *,
     is_superuser: bool = False,
+    user_id: str | None = None,
 ) -> DataLoader:
     """Return a DataLoader that loads all incoming ``ObjectRef`` rows per ``to_object_id``.
 
@@ -229,7 +265,9 @@ def object_refs_by_to_object_id_loader(
     WR-02: same in-``_load_fn`` hidden-attribute filter as the outgoing
     loader — non-superusers never receive a ref stored under an ``is_hidden``
     reference attribute (own or inherited), and the cached list is already
-    filtered (SEC313-11).
+    filtered (SEC313-11). AUTHZ-08 / D-08: the attribute-type record DENY is
+    applied in the same in-``_load_fn`` position, and only for a bound
+    non-superuser principal.
     """
 
     lock = lock or asyncio.Lock()
@@ -241,6 +279,7 @@ def object_refs_by_to_object_id_loader(
         lock: asyncio.Lock,
         is_superuser: bool,
         memo: dict,
+        user_id,
     ) -> list[list[ObjectRef]]:
         stmt = select(ObjectRef).where(ObjectRef.to_object_id.in_(keys))
         async with lock:
@@ -248,6 +287,12 @@ def object_refs_by_to_object_id_loader(
                 clause = await _memoized_hidden_ref_clause(session, memo)
                 if clause is not None:
                     stmt = stmt.where(clause)
+            if user_id is not None and not is_superuser:
+                denied_clause = await _memoized_denied_ref_clause(
+                    session, memo, user_id
+                )
+                if denied_clause is not None:
+                    stmt = stmt.where(denied_clause)
             result = await session.execute(stmt)
             rows = list(result.scalars().all())
         grouped: dict[uuid.UUID, list[ObjectRef]] = defaultdict(list)
@@ -262,6 +307,7 @@ def object_refs_by_to_object_id_loader(
             lock=lock,
             is_superuser=is_superuser,
             memo=memo,
+            user_id=user_id,
         )
     )
 

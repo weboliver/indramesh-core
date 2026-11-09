@@ -181,10 +181,16 @@ async def build_graphql_context(
                 session, user.id, user.is_superuser, lock
             ),
             object_refs_by_from_object=object_refs_by_from_object_id_loader(
-                session, lock, is_superuser=user.is_superuser
+                session,
+                lock,
+                is_superuser=user.is_superuser,
+                user_id=str(user.id),
             ),
             object_refs_by_to_object=object_refs_by_to_object_id_loader(
-                session, lock, is_superuser=user.is_superuser
+                session,
+                lock,
+                is_superuser=user.is_superuser,
+                user_id=str(user.id),
             ),
             object_types_by_schema=object_types_by_schema_id_loader(session, lock),
             object_types_by_parent=object_types_by_parent_id_loader(session, lock),

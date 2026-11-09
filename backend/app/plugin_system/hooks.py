@@ -54,6 +54,7 @@ _HOOK_NAMES: frozenset[str] = frozenset(
         "on_object_ref_deleted",
         "before_index",
         "after_index",
+        "on_language_deleted",
     }
 )
 
@@ -100,8 +101,13 @@ async def dispatch_hook(
     """Invoke ``hook_name`` on an already-resolved ``subscribers`` list.
 
     Each subscriber's own ``PluginContext`` is built with the caller's
-    ``active_session`` (D-06 — the hook shares the caller's transaction). A
-    subscriber that raises or times out is logged and skipped; the next
+    ``active_session`` (D-06 — an in-transaction hook shares the caller's
+    transaction) and with the context kind stated explicitly as ``"hook"``:
+    the kind describes the CALL, never the session it happens to carry, so a
+    post-commit hook that opens its own session (``on_language_deleted``,
+    D-19) is still a hook context — ``ctx.context_kind`` reports ``"hook"``
+    and the Core-data write resolver keeps refusing SDK writes from it.
+    A subscriber that raises or times out is logged and skipped; the next
     subscriber still runs.
     """
     for plugin in subscribers:
@@ -115,7 +121,7 @@ async def dispatch_hook(
             continue
         try:
             ctx = await registry.build_context(
-                plugin_name, active_session=active_session
+                plugin_name, active_session=active_session, context_kind="hook"
             )
             await registry.call_capability(plugin, hook_name, ctx, **kwargs)
         except asyncio.CancelledError:

@@ -23,15 +23,12 @@
 # and recreates `frontend`; no selector does all four. The hot-reload source mounts
 # come from docker-compose.dev.yml, not from the public base file.
 #
-# nginx.conf proxies to `backend`/`frontend` by hostname (upstream backend/frontend,
-# nginx.conf); nginx resolves that hostname to a container IP once and caches it for
-# the life of its worker process — `docker compose up -d` recreates a rebuilt service
-# under a NEW container IP, so an nginx left running from before the rebuild keeps
-# connecting to the old, now-dead IP ("connect() failed (111: Connection refused)",
-# live-diagnosed 2026-09-08 after a backend+frontend rebuild). So whenever backend or
-# frontend is rebuilt, nginx gets a plain `restart` afterward (no build/recreate needed,
-# just a fresh process so it re-resolves) — never needed for a worker-only rebuild,
-# since nginx never proxies to it.
+# nginx.conf proxies to `backend`/`frontend` by hostname and re-resolves those names
+# at runtime from Docker's embedded DNS (`resolver` plus `server … resolve;` in both
+# upstream blocks, Phase 323 D-07). A rebuilt service is recreated under a NEW
+# container IP, and nginx follows it within the resolver's ten-second validity
+# window — so this script never restarts or reloads nginx. Nothing is needed for a
+# worker-only rebuild either, since nginx never proxies to the worker.
 set -euo pipefail
 
 usage() { echo "usage: $(basename "$0") [backend|worker|frontend] [--no-cache]" >&2; exit 2; }
@@ -57,17 +54,6 @@ docker compose build "${NO_CACHE_FLAG[@]}" "${RECREATE_TARGETS[@]}"
 
 echo "rebuild: recreating ${RECREATE_TARGETS[*]}"
 docker compose up -d "${RECREATE_TARGETS[@]}"
-
-NEEDS_NGINX_RESTART=0
-for svc in "${RECREATE_TARGETS[@]}"; do
-  if [ "$svc" = "backend" ] || [ "$svc" = "frontend" ]; then
-    NEEDS_NGINX_RESTART=1
-  fi
-done
-if [ "$NEEDS_NGINX_RESTART" -eq 1 ]; then
-  echo "rebuild: restarting nginx (re-resolves backend/frontend's new container IP)"
-  docker compose restart nginx
-fi
 
 echo "rebuild: done"
 docker compose ps "${RECREATE_TARGETS[@]}"

@@ -23,7 +23,10 @@ The surface is deliberately narrow and explicit (``__all__`` below):
 * the provider-neutral LLM surface (D-09, 302-04): the Core-authored
   ``LLMClient`` facade type plus the typed errors a plugin may catch. A plugin
   obtains the client through ``ctx.llm`` and never the raw vendor client or the
-  API key.
+  API key,
+* ``assert_outbound_url`` — the plugin's ONLY permitted outbound-target gate
+  (SESS-07, 321-05), plus ``OUTBOUND_RESOLVE_TIMEOUT_SECONDS``, the one timeout
+  bound it may use.
 
 Usage rules for the Core-data write surface (CORESEAM-10, D-01..D-14)
 --------------------------------------------------------------------
@@ -45,10 +48,13 @@ Usage rules for the Core-data write surface (CORESEAM-10, D-01..D-14)
    the connector media upserts derive their id from
    ``{source}:{object}:{external_id}`` and short-circuit a replay. The per-call
    commit boundary still applies to every call, keyed or not.
-3. **Hooks must not write.** A hook context borrows the caller's transaction, so
-   the SDK refuses every write from it with the stable ``hook_context`` code.
-   To react to a hook, schedule a task (the supported path) rather than writing
-   Core data inline.
+3. **Hooks must not write.** Every hook context is reported as ``hook``
+   (``ctx.context_kind``), whether it borrows the caller's transaction or — like
+   the post-commit ``on_language_deleted`` — opens its own, so the SDK refuses
+   every Core-data write from it with the stable ``hook_context`` code. A
+   subscriber's own cleanup tables are written through ``ctx.db()``, never
+   through this SDK. To react to a hook, schedule a task (the supported path)
+   rather than writing Core data inline.
 4. **Trust model (D-14).** Plugins run in-process with full host access and are
    trusted; attribution is correct BY CONSTRUCTION for a cooperative plugin, not
    a defense against a hostile one. Isolation is PLUGISO-01 (v2). Do not build
@@ -228,6 +234,14 @@ from app.plugin_system.core_data_schemas import (
 )
 from app.services.auth_service import require_permission
 from app.services.cache_service import invalidate_entity_cache
+from app.services.outbound_url_guard import (
+    RESOLVE_TIMEOUT_SECONDS as OUTBOUND_RESOLVE_TIMEOUT_SECONDS,
+)
+from app.services.outbound_url_guard import (
+    OutboundUrlRefused,
+    check_resolved_target,
+    read_allow_internal_flag,
+)
 from app.services.task_service import TaskCredentials
 from app.plugin_system.translation_access import (
     TranslationRecordOwner,
@@ -419,4 +433,55 @@ __all__ = [
     "UiTranslationCatalogRequest",
     "UiTranslationCatalogItem",
     "UiTranslationCatalogResult",
+    # Outbound-target gate (SESS-07, D-06, 321-05): the plugin's ONLY permitted
+    # way to vet a connector URL before it dials it, plus the one timeout bound
+    # it may use. Reached through this surface so no plugin holds an ``app.*``
+    # import, a second implementation, a private timeout literal or a ``None``
+    # (unbounded) one.
+    "assert_outbound_url",
+    "OUTBOUND_RESOLVE_TIMEOUT_SECONDS",
 ]
+
+
+async def assert_outbound_url(
+    url: str,
+    *,
+    config: dict | None = None,
+    resolver=None,
+    timeout: float = OUTBOUND_RESOLVE_TIMEOUT_SECONDS,
+) -> None:
+    """Refuse an outbound connector target — the plugin's only outbound gate.
+
+    A thin passthrough to Core's :func:`check_resolved_target`, never a second
+    implementation of the rule: the scheme/host/literal checks, the resolved
+    answer set and the per-endpoint ``allow_internal_target`` waiver all stay in
+    one place. ``config`` is the endpoint row's OWN config, read through
+    :func:`read_allow_internal_flag`, so the plugin holds no copy of the
+    ``is True`` rule and an environment variable cannot disable anything.
+
+    ``OUTBOUND_RESOLVE_TIMEOUT_SECONDS`` is the same ``RESOLVE_TIMEOUT_SECONDS``
+    Core uses, exported so a plugin cannot hold a private or unbounded default —
+    ``asyncio.wait_for(..., None)`` would remove the bound entirely.
+
+    Always ``fail_closed=True``: a resolution yielding no answer at all (empty
+    answer set, timeout, resolver error) is a refusal here. Core's save-time
+    caller deliberately leaves that case undecided, and this is the layer that
+    dials the socket, so the connect-time caller is the strict one.
+
+    Resolves on EVERY call, because a save-time answer can be stale — DNS may
+    have changed between the save and the request.
+
+    ``resolver``/``timeout`` are test seams forwarded unchanged; production
+    callers pass neither. A refusal surfaces as the bounded
+    :class:`PluginTaskError` reason text, never the URL.
+    """
+    try:
+        await check_resolved_target(
+            url,
+            allow_internal=read_allow_internal_flag(config),
+            resolver=resolver,
+            timeout=timeout,
+            fail_closed=True,
+        )
+    except OutboundUrlRefused as exc:
+        raise PluginTaskError(str(exc)) from None

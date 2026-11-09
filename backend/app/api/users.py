@@ -1,9 +1,7 @@
 import os
 import uuid
-from datetime import datetime, timezone
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Query, Response
-import jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -14,8 +12,7 @@ from app.schemas.crud import (
 )
 from app.schemas.auth import UserResponse
 from app.services.auth_service import (
-    get_current_user, require_permission, get_secret_key, ALGORITHM,
-    add_token_to_blocklist, bump_token_version,
+    get_current_user, require_permission, bump_token_version,
 )
 from app.services.rate_limit import limiter
 from app.api.pagination import REFERENCE_DEFAULT_LIMIT, MAX_LIMIT
@@ -85,22 +82,11 @@ async def change_my_password(
     await enforce_password_policy(db, password_change.new_password)
     await change_password(db, uuid.UUID(current_user.id), password_change)
 
-    # D-09 — end every other session of this user, not just the presented token
+    # D-09 — the token epoch is the whole mechanism: raising token_version ends
+    # every live token of this user (get_current_user and /auth/refresh both
+    # compare the claim against the row), so no blocklist entry is written here.
+    # That keeps a single-session password change free of orphan revocation keys.
     await bump_token_version(db, current_user.id)
-
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header.removeprefix("Bearer ")
-        try:
-            payload = jwt.decode(token, get_secret_key(), algorithms=[ALGORITHM])
-            jti = payload.get("jti")
-            exp = payload.get("exp")
-            if jti and exp:
-                remaining = int(exp - datetime.now(timezone.utc).timestamp())
-                if remaining > 0:
-                    await add_token_to_blocklist(jti, remaining)
-        except jwt.PyJWTError:
-            pass
 
     return {"message": "Password changed successfully"}
 

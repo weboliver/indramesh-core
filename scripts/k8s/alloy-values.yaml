@@ -73,10 +73,12 @@ serviceAccount:
   name: alloy
 
 # Image-tag override: the chart's appVersion is v1.20.0, but the project pin is
-# the current collector v1.20.1 (RESEARCH 2026-10-06). This is the chart's
-# TOP-LEVEL image.tag key — `alloy.image.tag` is silently ignored by the chart.
+# the collector v1.21.3 (Phase 323, D-20 — smallest 1.21 release that closes the
+# measured findings; the 1.20 → 1.21 bump stays in the same major line). This is
+# the chart's TOP-LEVEL image.tag key — `alloy.image.tag` is silently ignored by
+# the chart.
 image:
-  tag: v1.20.1
+  tag: v1.21.3
 
 # D-12 paired NetworkPolicy. The chart default is allow-all ingress AND egress;
 # tighten both: egress rules are supplied by the installer's private values

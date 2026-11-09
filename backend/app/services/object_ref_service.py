@@ -31,8 +31,15 @@ from app.services.object_service import (
     _touch_system_attribute,
 )
 from app.services.audit_service import audit_log, model_to_dict
-from app.services.record_permission_service import build_record_permission_filter
+from app.services.record_permission_service import (
+    _level_denied_sql,
+    build_record_permission_filter,
+)
 from app.services.value_lock_service import assert_binding_writable, resolve_attribute_by_name
+from app.services.value_visibility import (
+    assert_record_action_allowed,
+    resolve_principal_roles,
+)
 from app.services import hook_origin
 
 ENTITY_TYPE = "object_ref"
@@ -173,6 +180,163 @@ async def ref_hidden_by_attribute(db: AsyncSession, ref_id: uuid.UUID) -> bool:
     return visible is None
 
 
+# AUTHZ-08 / D-08: the same ancestor-name resolution as
+# ``_HIDDEN_REF_ATTRIBUTES_SQL``, one level further. The inner select resolves
+# the nearest same-named reference attribute per (root type, name) exactly as
+# before; the attribute-type record DENY is applied in the **outer** WHERE on
+# the resolved row's ``attribute_type_id``. That order is the point: filtering
+# inside the ``DISTINCT ON`` subquery would run *before* the nearest-ancestor
+# pick, so a root type whose nearest same-named attribute is denied would fall
+# back to an ancestor's permitted attribute and expose exactly the refs the DENY
+# must hide. The deny fragment must reference ``resolved.attribute_type_id`` —
+# the ``at`` alias is out of scope outside the derived table.
+#
+# Values interpolated into this string come from the module-level action table
+# only (``_level_denied_sql``); the request values (``:data_type``,
+# ``:role_ids``) ride as bind parameters.
+_DENIED_REF_ATTRIBUTES_SQL = """
+    WITH RECURSIVE ref_types AS (
+        SELECT DISTINCT object_type_id
+        FROM object_refs
+        WHERE object_type_id IS NOT NULL
+    ),
+    ot_ancestors AS (
+        SELECT rt.object_type_id AS root_id, ot.id, ot.parent_id,
+               ot.inherits_attributes, 0 AS depth
+        FROM ref_types rt
+        INNER JOIN object_types ot ON ot.id = rt.object_type_id
+
+        UNION ALL
+
+        SELECT a.root_id, ot.id, ot.parent_id, ot.inherits_attributes,
+               a.depth + 1
+        FROM ot_ancestors a
+        INNER JOIN object_types ot ON ot.id = a.parent_id
+        WHERE ot.inherits_attributes = true AND a.depth < 100
+    )
+    SELECT resolved.root_id, resolved.name
+    FROM (
+        SELECT DISTINCT ON (a.root_id, ota.name)
+            a.root_id AS root_id,
+            ota.name AS name,
+            ota.attribute_type_id AS attribute_type_id
+        FROM ot_ancestors a
+        INNER JOIN object_type_attributes ota ON ota.object_type_id = a.id
+        INNER JOIN attribute_types at ON at.id = ota.attribute_type_id
+        WHERE at.data_type = :data_type
+        ORDER BY a.root_id, ota.name, a.depth ASC
+    ) resolved
+    WHERE {level_denied}
+"""
+
+
+async def denied_ref_attribute_clause(
+    db: AsyncSession,
+    *,
+    user_id: str | None = None,
+    role_ids: list[uuid.UUID] | None = None,
+    is_superuser: bool = False,
+):
+    """A WHERE clause excluding refs of an attribute type the caller may not read.
+
+    RLR-05 bypass first, before any query: ``resolve_principal_roles`` answers
+    ``None`` for a superuser, so a caller that only forwarded ``role_ids`` would
+    otherwise resolve the administrator's real roles with ``is_superuser=False``
+    and strip refs the administrator may see.
+
+    ``role_ids`` lets a caller that already resolved the principal's roles pass
+    the list once (pitfall P-08: one bound value for every ``:role_ids``
+    fragment in the statement). No roles means the DENY-only model cannot match
+    a ``record_permissions`` row at all, so the CTE is skipped entirely.
+    """
+    if is_superuser:
+        return None
+    if role_ids is None:
+        if user_id is None:
+            return None
+        role_ids = await resolve_principal_roles(db, user_id, False)
+    if not role_ids:
+        return None
+    statement = text(
+        _DENIED_REF_ATTRIBUTES_SQL.format(
+            level_denied=_level_denied_sql(
+                "'attribute_type'", "resolved.attribute_type_id", "read"
+            )
+        )
+    )
+    rows = (
+        await db.execute(
+            statement,
+            {
+                "data_type": AttributeTypeDataType.REFERENCE.value,
+                "role_ids": role_ids,
+            },
+        )
+    ).all()
+    if not rows:
+        return None
+    pairs = [(row.root_id, row.name) for row in rows]
+    return or_(
+        ObjectRef.from_attribute_name.is_(None),
+        tuple_(ObjectRef.object_type_id, ObjectRef.from_attribute_name).notin_(pairs),
+    )
+
+
+async def ref_denied_by_attribute_type(
+    db: AsyncSession,
+    ref_id: uuid.UUID,
+    *,
+    user_id: str | None = None,
+    role_ids: list[uuid.UUID] | None = None,
+    is_superuser: bool = False,
+) -> bool:
+    """Whether ``ref_id`` is stored under an attribute type the caller may not read.
+
+    Id-based on purpose: the by-id route may serve the reference from the entity
+    cache as a plain dict, so the check must never read ``from_attribute_name``
+    off that object (pitfall 4). Mirrors :func:`ref_hidden_by_attribute`.
+    """
+    if is_superuser:
+        return False
+    denied_clause = await denied_ref_attribute_clause(
+        db, user_id=user_id, role_ids=role_ids, is_superuser=is_superuser
+    )
+    if denied_clause is None:
+        return False
+    visible = (
+        await db.execute(
+            select(ObjectRef.id).where(ObjectRef.id == ref_id).where(denied_clause)
+        )
+    ).scalar_one_or_none()
+    return visible is None
+
+
+async def _source_attribute_type_id(
+    db: AsyncSession, object_type_id: uuid.UUID, attribute_name: str | None
+) -> uuid.UUID | None:
+    """The attribute type behind a reference's SOURCE attribute, or ``None``.
+
+    Resolved through :func:`resolve_attribute_by_name` — the single-type
+    resolver :func:`_assert_reference_attribute` already uses for this exact
+    question (own type first, then the nearest inheriting ancestor). The
+    ancestor-name CTEs above deliberately are **not** the base here: they walk
+    every reference-carrying type in ``object_refs`` and answer the different
+    read-side question ("which stored pairs are denied anywhere").
+
+    A nameless reference belongs to no attribute (the plugin-SDK/Jira-pull
+    shape) and stays writable; an unresolvable name has already answered its
+    named 400 in :func:`_assert_reference_attribute` before this runs.
+    """
+    if not attribute_name:
+        return None
+    attribute, ambiguous = await resolve_attribute_by_name(
+        db, object_type_id, attribute_name
+    )
+    if ambiguous or attribute is None:
+        return None
+    return attribute.attribute_type_id
+
+
 async def _object_filter(db: AsyncSession, user_id: str | None, is_superuser: bool):
     if user_id is None:
         return None
@@ -228,10 +392,23 @@ async def create_object_ref(
     commit: bool = True,
     emit_index_outbox: bool = True,
     invalidate_cache: bool = True,
+    attribute_type_checked: bool = False,
 ) -> ObjectRef:
-    """``user_id`` None means a trusted internal caller (SDK, public write
-    path) and stays unfiltered; with ``user_id`` set a DENY'd from/to object
-    behaves like a nonexistent one (quick 261012-cpp).
+    """``user_id`` None means a trusted internal caller with no principal at
+    all (the plugin SDK) and stays unfiltered; with ``user_id`` set a DENY'd
+    from/to object behaves like a nonexistent one (quick 261012-cpp) and a
+    record ``write`` DENY on the SOURCE end answers 403 (AUTHZ-07 / D-02 as
+    revised 2026-11-01). The target only has to be readable.
+
+    AUTHZ-08 / D-09: the SOURCE **attribute type** carries the same ``write``
+    decision as the source object; the target end and the target's attribute
+    type never gate a write (a shared catalog object must stay referenceable).
+    ``attribute_type_checked`` says the caller already enforced that decision
+    for this reference's source attribute type — the composite public create
+    decides every payload attribute type in one batched statement
+    (``validate_object_payload`` step 8b), so the gate here would re-open the
+    REV-03 finding per reference. It skips only that gate, never the read
+    filter or the source-object ``write`` gate.
 
     ``commit``/``invalidate_cache`` are the D-15 composite-writer switches — the
     public create/replace routes own the single transaction and the one cache
@@ -255,6 +432,21 @@ async def create_object_ref(
     to_obj = result.scalar_one_or_none()
     if not to_obj:
         raise ValueError("To object not found")
+
+    # AUTHZ-07 / D-02 (as revised 2026-11-01): a reference changes only its
+    # SOURCE, so the source needs a record `write` decision; the target only has
+    # to be READABLE, which the object filter above already enforced. Requiring
+    # `write` on the target would make a write-protected catalog object (a
+    # location, a vendor) unlinkable. Ordered after the read filter on purpose:
+    # an invisible end keeps its `ValueError` -> 404 above, so the invisible and
+    # the non-writable cases never collapse into one status code (D-01). The
+    # helper is the same 403 path every value write uses.
+    # ``user_id`` None is a trusted internal caller with no principal at all
+    # (the plugin SDK); the public composite create passes one (Task 3).
+    if user_id is not None:
+        await assert_record_action_allowed(
+            user_id, is_superuser, object_id=from_obj.id, action="write"
+        )
 
     # EXT-09-D1 / D-12: the row's type is the FROM object's type. A caller that
     # still passes a stale type id (SDK/plugin) is normalised instead of being
@@ -283,6 +475,25 @@ async def create_object_ref(
     await _assert_reference_attribute(
         db, effective_object_type_id, ref_data.from_attribute_name
     )
+
+    # AUTHZ-08 / D-09: a reference changes only its SOURCE, so the source's
+    # ATTRIBUTE TYPE needs a record `write` decision beside the source object's
+    # (319 D-02). Placed directly after the name validation — an unknown or
+    # ambiguous name keeps its named 400 — and before the lock decision and the
+    # insert, so a denied write adds no row. The target end stays untouched
+    # here: requiring anything on it would make a write-protected catalog
+    # object unlinkable, which D-09 rejects explicitly.
+    if user_id is not None and not attribute_type_checked:
+        source_attribute_type_id = await _source_attribute_type_id(
+            db, effective_object_type_id, ref_data.from_attribute_name
+        )
+        if source_attribute_type_id is not None:
+            await assert_record_action_allowed(
+                user_id,
+                is_superuser,
+                attribute_type_id=source_attribute_type_id,
+                action="write",
+            )
 
     # 290 D-02/D-03/D-04: deny a real binding write while the source is
     # externally managed (own object type OR resolved bound attribute),
@@ -380,10 +591,18 @@ async def list_object_refs(
     if user_id is not None and not is_superuser:
         # SEC313-97: hidden attribute names are metadata, not principal-scoped,
         # but the unfiltered shared cache must never serve a restricted caller
-        # (the same rule the object DENY path follows).
+        # (the same rule the object DENY path follows). AUTHZ-08 / D-08 adds the
+        # attribute-type record DENY beside it — that one *is* principal-scoped,
+        # so its roles are resolved once here and handed to the single fragment.
         hidden_clause = await hidden_ref_clause(db)
         if hidden_clause is not None:
             conditions.append(hidden_clause)
+        role_ids = await resolve_principal_roles(db, user_id, False)
+        denied_clause = await denied_ref_attribute_clause(
+            db, user_id=user_id, role_ids=role_ids, is_superuser=False
+        )
+        if denied_clause is not None:
+            conditions.append(denied_clause)
     if conditions:
         query = query.where(*conditions)
         count_query = count_query.where(*conditions)
@@ -452,11 +671,14 @@ async def update_object_ref(
     emit_index_outbox: bool = True,
     invalidate_cache: bool = True,
 ) -> ObjectRef | None:
-    """``user_id`` None means a trusted internal caller (SDK, public write
-    path) and stays unfiltered; with ``user_id`` set a ref with a DENY'd end
-    and a DENY'd from/to object behave like nonexistent ones
-    (quick 261012-cpp). A ref stored under a hidden reference attribute does
-    the same before the no-op and validation paths (SEC313-97 / WR-02, U-02).
+    """``user_id`` None means a trusted internal caller (SDK) and stays
+    unfiltered; with ``user_id`` set a ref with a DENY'd end and a DENY'd
+    from/to object behave like nonexistent ones (quick 261012-cpp), and a
+    record ``write`` DENY on the ref's source — current or newly proposed —
+    answers 403 (AUTHZ-07 / D-02 as revised 2026-11-01). The same holds for the
+    source's **attribute type** (AUTHZ-08 / D-09). A ref stored under a hidden
+    or attribute-type-DENY'd reference attribute answers the route's 404 before
+    the no-op and validation paths (SEC313-97 / WR-02, U-02; AUTHZ-08 / D-08).
 
     Composite switches as in :func:`create_object_ref`.
     """
@@ -480,6 +702,85 @@ async def update_object_ref(
         and await ref_hidden_by_attribute(db, ref.id)
     ):
         return None
+    # AUTHZ-08 / D-08: the same refusal for a ref stored under an attribute
+    # type the caller may not read. Id-based, so it never reads the name off a
+    # cached dict (pitfall 4) and never echoes it.
+    if (
+        user_id is not None
+        and not is_superuser
+        and await ref_denied_by_attribute_type(
+            db, ref.id, user_id=user_id, is_superuser=is_superuser
+        )
+    ):
+        return None
+
+    # AUTHZ-07 / D-02 (as revised 2026-11-01): the ref's SOURCE must be
+    # writable — the persisted one, and a different one the update moves the
+    # ref onto. A target (persisted or supplied) only has to be readable,
+    # which the object filter below already enforces. Checked before the D-05
+    # no-op return so a no-op patch on a write-DENIED ref cannot answer 200.
+    # A proposed source the caller cannot read is deliberately skipped here:
+    # it keeps answering the route's 404 when it is resolved below (D-01).
+    if user_id is not None:
+        await assert_record_action_allowed(
+            user_id, is_superuser, object_id=ref.from_object_id, action="write"
+        )
+        # AUTHZ-08 / D-09 on the same seam: the source's ATTRIBUTE TYPE carries
+        # its own `write` decision — persisted binding first, then a proposed
+        # one. Both before the no-op return, so a no-op patch on a
+        # write-DENIED attribute type cannot answer 200 either. The target end
+        # and the target's attribute type never gate a write.
+        persisted_attribute_type_id = await _source_attribute_type_id(
+            db, ref.object_type_id, ref.from_attribute_name
+        )
+        if persisted_attribute_type_id is not None:
+            await assert_record_action_allowed(
+                user_id,
+                is_superuser,
+                attribute_type_id=persisted_attribute_type_id,
+                action="write",
+            )
+        proposed_from_id = (
+            ref_update.from_object_id
+            if ref_update.from_object_id is not None
+            else ref.from_object_id
+        )
+        proposed_name = (
+            ref_update.from_attribute_name
+            if ref_update.from_attribute_name is not None
+            else ref.from_attribute_name
+        )
+        proposed_type_id = ref.object_type_id
+        if proposed_from_id != ref.from_object_id:
+            readable_new_source = select(Object.object_type_id).where(
+                Object.id == proposed_from_id
+            )
+            if object_filter is not None:
+                readable_new_source = readable_new_source.where(object_filter)
+            proposed_type_id = (
+                await db.execute(readable_new_source)
+            ).scalar_one_or_none()
+            if proposed_type_id is not None:
+                await assert_record_action_allowed(
+                    user_id,
+                    is_superuser,
+                    object_id=proposed_from_id,
+                    action="write",
+                )
+        if proposed_type_id is not None and (
+            proposed_from_id != ref.from_object_id
+            or proposed_name != ref.from_attribute_name
+        ):
+            proposed_attribute_type_id = await _source_attribute_type_id(
+                db, proposed_type_id, proposed_name
+            )
+            if proposed_attribute_type_id is not None:
+                await assert_record_action_allowed(
+                    user_id,
+                    is_superuser,
+                    attribute_type_id=proposed_attribute_type_id,
+                    action="write",
+                )
 
     # 290 D-05: an unchanged payload is a side-effect-free no-op (locked refs
     # included) — checked before any lock read or mutation.
@@ -629,7 +930,9 @@ async def delete_object_ref(
     """``user_id`` None means a trusted internal caller and stays unfiltered;
     with ``user_id`` set a ref with a DENY'd end behaves like a nonexistent one
     (quick 261012-cpp), checked before the lock guard. The same holds for a ref
-    stored under a hidden reference attribute (SEC313-97 / WR-02, U-02).
+    stored under a hidden reference attribute (SEC313-97 / WR-02, U-02) or one
+    whose attribute type the caller may not read (AUTHZ-08 / D-08), and a
+    record ``delete`` DENY on the ref's source answers 403 (AUTHZ-07).
 
     Composite switches as in :func:`create_object_ref`.
     """
@@ -650,6 +953,27 @@ async def delete_object_ref(
         and await ref_hidden_by_attribute(db, ref.id)
     ):
         return False
+    # AUTHZ-08 / D-08: an attribute-type DENY refuses the delete the same way —
+    # id-based, so the row's names are never echoed and nothing is mutated.
+    if (
+        user_id is not None
+        and not is_superuser
+        and await ref_denied_by_attribute_type(
+            db, ref.id, user_id=user_id, is_superuser=is_superuser
+        )
+    ):
+        return False
+    # AUTHZ-07: deleting a reference removes a row from its SOURCE container,
+    # so the caller needs a record `delete` decision on that end — the same
+    # action every other delete path in the tree resolves. `delete` is a
+    # singleton action (record_permission_service._ACTION_ALIASES), so a stored
+    # `write` DENY alone still does not block the delete. Checked after the
+    # hidden guard (an invisible ref keeps answering 404, D-01) and before the
+    # lock guard (a denied delete must not answer 409).
+    if user_id is not None:
+        await assert_record_action_allowed(
+            user_id, is_superuser, object_id=ref.from_object_id, action="delete"
+        )
     from_object_id = ref.from_object_id
     from_obj_result = await db.execute(select(Object).where(Object.id == from_object_id))
     from_obj = from_obj_result.scalar_one_or_none()

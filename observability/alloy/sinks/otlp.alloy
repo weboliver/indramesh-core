@@ -60,9 +60,12 @@ otelcol.receiver.loki "bridge" {
   }
 }
 
-// Batching is disabled by default. The pinned Alloy v1.20.1 has NO exporter
-// `batch {}` block (verified: `alloy validate` rejects it as an unrecognized
-// block name), so batching is enabled with the documented
+// Batching is disabled by default. The pinned Alloy v1.21.3 has NO top-level
+// exporter `batch {}` block: `batch` exists only beneath `sending_queue`
+// (re-verified against the v1.21.3 component source — `QueueArguments` carries
+// the only `alloy:"batch,block,optional"` tag; a top-level `batch {}` is
+// rejected by `alloy validate` as an unrecognized block name, unchanged from
+// 1.20.x). Batching is therefore enabled with the documented
 // `otelcol.processor.batch` component instead.
 otelcol.processor.batch "bridge" {
   output {

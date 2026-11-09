@@ -24,8 +24,7 @@ from app.services.object_type_attribute_service import (
 )
 from app.services.record_permission_service import build_record_permission_filter
 from app.services.search_service import refresh_index_mapping
-from app.services.select_option_service import option_ids_from_structure
-from app.services.translation_service import resolve_translations, delete_translations_for, check_schema_multilingual
+from app.services.translation_service import resolve_translations, delete_dependent_translations, check_schema_multilingual
 from app.db.redis import get_redis, get_arq_pool
 from app.services.audit_service import audit_log, model_to_dict
 from app.services.value_lock_service import assert_types_deletable
@@ -580,32 +579,11 @@ async def delete_object_type(
             )
         ).all()
     }
-    # MULTI-07 / D-15: purge translations of the type and of every cascade-deleted
-    # attribute child (DB FK cascade removes the attribute rows but NOT their
-    # polymorphic translations — no DB-level backstop exists for entity_id).
-    attr_result = await db.execute(
-        select(ObjectTypeAttribute.id, ObjectTypeAttribute.structure).where(
-            ObjectTypeAttribute.object_type_id.in_(
-                [uuid.UUID(tid) for tid in descendant_type_ids]
-            )
-        )
+    # MULTI-07 / D-15: purge the translations of everything the cascade removes
+    # (no DB-level backstop exists for the polymorphic entity_id).
+    await delete_dependent_translations(
+        db, object_type_ids=[uuid.UUID(tid) for tid in descendant_type_ids]
     )
-    attr_rows = attr_result.all()
-    attr_ids = [row[0] for row in attr_rows]
-    await delete_translations_for(
-        db, "object_type", [uuid.UUID(tid) for tid in descendant_type_ids]
-    )
-    await delete_translations_for(db, "object_type_attribute", attr_ids)
-    # WR-01: purge select_option translation rows owned by every
-    # cascade-deleted attribute's SELECT options — entity_id is not a real
-    # FK, so nothing at the DB level cleans these up on the attribute cascade.
-    option_ids = [
-        opt_id
-        for _, structure in attr_rows
-        for opt_id in option_ids_from_structure(structure)
-    ]
-    if option_ids:
-        await delete_translations_for(db, "select_option", option_ids)
     await audit_log(db, "object_types", object_type_id, "DELETE", actor_id,
                     old_values=old_values, new_values=None)
     # Break the object_types.label_attribute_id <-> object_type_attributes.object_type_id
@@ -642,6 +620,7 @@ async def delete_object_type(
     # be invalidated — otherwise a 300s entity-cache entry keeps serving a
     # deleted object/value/ref after DELETE /object-types/{id}.
     await invalidate_entity_cache("object_type")
+    await invalidate_entity_cache("object_type_attribute")
     await invalidate_entity_cache("object")
     await invalidate_entity_cache("object_value")
     await invalidate_entity_cache("object_ref")

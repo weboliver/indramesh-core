@@ -24,10 +24,15 @@ from app.services.cache_service import (
     CACHE_TTL_ENTITY,
 )
 from app.services.audit_service import audit_log, model_to_dict
+from app.services.outbound_url_guard import (
+    check_resolved_target,
+    read_allow_internal_flag,
+)
 from app.services.service_account_service import (
     ENTITY_TYPE as SERVICE_ACCOUNT_ENTITY_TYPE,
     revoke_endpoint_tokens,
 )
+from app.services.source_service import assert_flag_write_allowed
 
 ENTITY_TYPE = "target"
 
@@ -63,6 +68,16 @@ async def create_target(
 
     # CSV and other non-Jira targets may not have a target_url; DB column is NOT NULL
     target_url = target_data.target_url if target_data.target_url else ""
+
+    # SESS-07 / D-06: same guard as the Source create path, against the literal
+    # host and the resolved answer set, unless this endpoint owns the waiver.
+    if "target" in declaration.requires_public_url:
+        await assert_flag_write_allowed(
+            db, actor_id, persisted_config=None, merged_config=config
+        )
+        await check_resolved_target(
+            target_url, allow_internal=read_allow_internal_flag(config)
+        )
 
     db_target = Target(
         schema_id=target_data.schema_id,
@@ -152,21 +167,61 @@ async def update_target(
         return None
 
     old_values = model_to_dict(target)
+
+    # CORESEAM-01: resolve the (possibly changed) connector identity up front,
+    # before any mutation, so the SESS-07 checks below decide from the merged
+    # post-update state and a refused PATCH leaves the row untouched.
+    persisted_type = target.connector_type
+    persisted_url = target.target_url
+    persisted_config = target.config
+    resolved_type = persisted_type
     if target_update.connector_type is not None:
-        # CORESEAM-01: changing the connector identity is always a validated write.
-        target.connector_type = resolve_connector_type(
+        # Changing the connector identity is always a validated write.
+        resolved_type = resolve_connector_type(
             target_update.connector_type, "target"
         ).declaration.name
 
     # A persisted connector that is unknown (or belongs to a plugin that is not
     # active) stays read-tolerant: unrelated field updates keep working. Any
     # write that touches the connector contract itself fails closed.
-    entry = get_connector_type_registry().resolve(target.connector_type)
+    entry = get_connector_type_registry().resolve(resolved_type)
     declaration = entry.declaration if entry is not None else None
     if declaration is None and target_update.config is not None:
         raise ConnectorTypeValidationError(
-            f"unknown target connector type {target.connector_type!r}"
+            f"unknown target connector type {resolved_type!r}"
         )
+
+    merged_config = persisted_config
+    if target_update.config is not None and declaration is not None:
+        merged_config = declaration.validate_config(target_update.config)
+    url_changed = (
+        target_update.target_url is not None
+        and target_update.target_url != persisted_url
+    )
+    type_changed = (
+        target_update.connector_type is not None
+        and resolved_type != persisted_type
+    )
+
+    # D-08: the internal-target waiver is a superuser grant, and a flagged row
+    # may only be repointed (URL or connector type) by a superuser.
+    await assert_flag_write_allowed(
+        db,
+        actor_id,
+        persisted_config=persisted_config,
+        merged_config=merged_config,
+        repoints=url_changed or type_changed,
+    )
+    # SESS-07: re-run the address check only when this PATCH can change the
+    # decision — an unrelated rename must not resolve anything.
+    if declaration is not None and "target" in declaration.requires_public_url:
+        if url_changed or type_changed or target_update.config is not None:
+            await check_resolved_target(
+                target_update.target_url
+                if target_update.target_url is not None
+                else persisted_url,
+                allow_internal=read_allow_internal_flag(merged_config),
+            )
 
     if target_update.schema_id is not None:
         result = await db.execute(
@@ -177,12 +232,12 @@ async def update_target(
         target.schema_id = target_update.schema_id
     if target_update.name is not None:
         target.name = target_update.name
-    url_changed = False
+    if target_update.connector_type is not None:
+        target.connector_type = resolved_type
     if target_update.target_url is not None:
-        url_changed = target_update.target_url != target.target_url
         target.target_url = target_update.target_url
     if target_update.config is not None:
-        target.config = declaration.validate_config(target_update.config)
+        target.config = merged_config
     if target_update.export_folder is not None:
         target.export_folder = target_update.export_folder
     if target_update.is_active is not None:

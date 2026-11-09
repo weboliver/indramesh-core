@@ -5,13 +5,17 @@ is true, so the D-16 stateful-only bootstrap pass renders neither Job and the
 full pass renders exactly two Jobs, on either side of the app tier:
 
   1. indramesh-migration-<rev> — `pre-upgrade` hook, runs `alembic upgrade
-     head` and then the plugin role bootstrap
-     (`python -m app.plugin_system.bootstrap_role`, Phase 287.1 D-03/D-04) in
+     head`, the plugin role bootstrap (`python -m
+     app.plugin_system.bootstrap_role`, Phase 287.1 D-03/D-04) and the
+     application-role deploy step (`python -m app.db.roles`, Phase 322 D-09) in
      one fatal `&&` chain. Still fatal (T-257-01): a non-zero exit — including
-     a configured-but-failing bootstrap — fails the release through the Job's
-     own failure, before any app resource is touched and before Job (2) can
-     run. This Job does NOT mount plugins-storage (see (2)) — a short-lived,
-     volume-less Job is exactly what Helm's pre-upgrade hooks are for.
+     a configured-but-failing bootstrap or a rejected privilege drift — fails
+     the release through the Job's own failure, before any app resource is
+     touched and before Job (2) can run. The deploy step precedes Job (2)
+     because the plugin child's owner-issued runtime grant needs the
+     application role to exist. This Job does NOT mount plugins-storage (see
+     (2)) — a short-lived, volume-less Job is exactly what Helm's pre-upgrade
+     hooks are for.
 
   2. indramesh-plugin-migration-<rev> — `post-install,post-upgrade` hook,
      runs `python -m app.plugin_system.migrate` after Helm's `--wait` has
@@ -120,15 +124,18 @@ spec:
         - name: migration
           image: "{{ .Values.apps.backend.image.repository }}:{{ .Values.apps.backend.image.tag }}"
           imagePullPolicy: {{ .Values.apps.backend.image.pullPolicy }}
-          # D-05 + Phase 287.1 (D-03/D-04): the CORE migration, then the plugin
-          # role bootstrap, in one fatal `&&` chain. `bootstrap_role` is a
-          # non-caught step: a configured-but-failing bootstrap (or a detected
+          # D-05 + Phase 287.1 (D-03/D-04) + Phase 322 (D-09): the CORE
+          # migration, then the plugin role bootstrap, then the application-role
+          # deploy step, in one fatal `&&` chain. `bootstrap_role` and the deploy
+          # step are non-caught: a configured-but-failing bootstrap (or a detected
           # privilege drift) aborts this Job, and because Job (2) is a
           # post-install/post-upgrade hook it never starts — Helm fails the
-          # release on this pre-upgrade hook. Never softened with a shell
-          # OR-truthy fallback. The plugin runner itself stays in its own
-          # post-upgrade Job below (2026-09-22).
-          command: ["sh", "-ec", "alembic upgrade head && python -m app.plugin_system.bootstrap_role"]
+          # release on this pre-upgrade hook. The deploy step runs before Job (2)
+          # because the plugin child's owner-issued runtime grant needs the
+          # application role to exist. Never softened with a shell OR-truthy
+          # fallback. The plugin runner itself stays in its own post-upgrade Job
+          # below (2026-09-22).
+          command: ["sh", "-ec", "alembic upgrade head && python -m app.plugin_system.bootstrap_role && python -m app.db.roles"]
           securityContext:
             {{- include "indramesh.restrictedSecurityContext" . | nindent 12 }}
           env:
@@ -148,6 +155,18 @@ spec:
                   key: DB_PASSWORD
             - name: DB_NAME
               value: {{ .Values.postgres.database | quote }}
+            # Phase 322 (DEPL-02, D-09/D-15): the deploy step at the end of this
+            # Job's chain creates and reconciles the DML-only application role,
+            # so it needs both the role name (non-secret chart value) and the
+            # password (Secret only).
+            - name: DB_APP_USER
+              value: {{ .Values.postgres.appUser | quote }}
+            - name: DB_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: DB_APP_PASSWORD
+                  optional: true
             # Phase 287.1 (PLUGDB-07, D-01/D-08; CR-02): the plugin migration
             # role credentials the bootstrap needs, rendered ONLY when the
             # operator configured the role name. An unconfigured install renders
@@ -237,6 +256,20 @@ spec:
                   key: DB_PASSWORD
             - name: DB_NAME
               value: {{ .Values.postgres.database | quote }}
+            # Phase 322 (DEPL-02, D-15/Pitfall 1): the plugin parent resolves the
+            # runtime role name from the runtime URL, so without DB_APP_USER the
+            # owner-issued grant would go to DB_USER. It needs the password too:
+            # run_plugin_migrations opens that runtime session itself, unguarded,
+            # before it takes the lock (_diagnostic_row_xmins and the two later
+            # session sites), so a name-only wiring fails password authentication.
+            - name: DB_APP_USER
+              value: {{ .Values.postgres.appUser | quote }}
+            - name: DB_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: DB_APP_PASSWORD
+                  optional: true
             # Phase 287.1 (PLUGDB-07, D-01/D-08; CR-02): the role child executes
             # each revision with this identity. Same optional gate as Job (1):
             # when plugins.dbUser is unset neither variable is rendered and the

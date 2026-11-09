@@ -67,13 +67,15 @@ from app.services.object_service import (
 )
 from app.services.object_type_service import resolve_ancestor_ota_by_name
 from app.services.object_value_service import create_object_value, delete_object_value
-from app.services.record_permission_service import build_record_permission_filter
+from app.services.record_permission_service import (
+    build_record_permission_filter,
+    denied_record_ids,
+)
 from app.services.value_lock_service import (
     ValueLockConflict,
     assert_value_writable,
     resolve_name_attribute,
 )
-from app.services.value_visibility import assert_record_action_allowed
 
 # CORESEAM-11/D-14: the Core-owned origin name for a public composite PUT. The
 # default is derived only from the already-resolved public consumer actor (the
@@ -120,6 +122,26 @@ async def purge_public_object_cache(
     except Exception:
         # D-21: fail-open — 60s TTL bounds worst-case staleness
         pass
+
+
+async def invalidate_composite_write_caches() -> None:
+    """Bust every list namespace a composite object write can change (D-14).
+
+    Both composite routes — ``POST /public/api/v1/object/create`` and
+    ``PUT /public/api/v1/object/{id}`` — call only this helper after their one
+    commit, so neither route can forget a namespace again and the "which half
+    of the payload changed" question is gone. All four are needed because one
+    composite write can change values, references and searchable fields in one
+    transaction, and ``object`` covers the object row itself. Fail-open by
+    construction: the tag invalidation swallows Redis errors, so a cache outage
+    never turns a committed write into an error.
+
+    This is the tag-based list-cache purge only. ``purge_public_object_cache``
+    stays a separate, SCAN-based purge of the ``cache:public:*`` keys, which are
+    written without tags and therefore unreachable from here.
+    """
+    for entity_type in ("object", "object_value", "object_ref", "search"):
+        await invalidate_entity_cache(entity_type)
 
 
 @dataclass
@@ -359,6 +381,7 @@ async def _preflight_implicit_name_mirror(
 
 
 async def _assert_attribute_type_actions_allowed(
+    db: AsyncSession,
     attribute_type_ids,
     *,
     user_id: str,
@@ -372,20 +395,32 @@ async def _assert_attribute_type_actions_allowed(
     stored ``write``/``create``/``delete`` DENY or it becomes a bypass for the
     identical rows. The public 4xx envelope is ``{"errors": [...]}``, matching
     the other write errors.
+
+    REV-03 / D-12: the whole attribute-type set is checked by ONE batched
+    ``record_permissions`` statement on the caller's session
+    (``denied_record_ids``), so a cold payload touching many attribute types
+    costs one role resolution and one statement instead of one resolver session
+    per attribute type.
     """
     if is_superuser:
         return
-    for attribute_type_id in dict.fromkeys(attribute_type_ids):
-        try:
-            await assert_record_action_allowed(
-                user_id, False, attribute_type_id=attribute_type_id, action=action
-            )
-        except HTTPException as exc:
-            if exc.status_code != 403:
-                raise
-            raise HTTPException(
-                status_code=403, detail={"errors": [str(exc.detail)]}
-            ) from exc
+    unique_ids = list(
+        dict.fromkeys(
+            uuid.UUID(str(attribute_type_id))
+            for attribute_type_id in attribute_type_ids
+            if attribute_type_id is not None
+        )
+    )
+    if not unique_ids:
+        return
+    denied = await denied_record_ids(
+        db, user_id, "attribute_type", unique_ids, action
+    )
+    if denied:
+        raise HTTPException(
+            status_code=403,
+            detail={"errors": ["Permission denied for this attribute type"]},
+        )
 
 
 async def assert_object_delete_attribute_types_allowed(
@@ -445,6 +480,7 @@ async def assert_object_delete_attribute_types_allowed(
                     attribute_type_ids.append(row.attribute_type_id)
 
     await _assert_attribute_type_actions_allowed(
+        db,
         attribute_type_ids,
         user_id=user_id,
         is_superuser=is_superuser,
@@ -737,6 +773,7 @@ async def validate_object_payload(
     #     enforce. Runs only over surviving entries (a zero-value entry is a
     #     PUT clear, i.e. an update), before any shared-service write.
     await _assert_attribute_type_actions_allowed(
+        db,
         (uuid.UUID(entry.attr_def["attribute_type_id"]) for entry in entries),
         user_id=user_id,
         is_superuser=is_superuser,
@@ -1330,14 +1367,12 @@ async def replace_object_values(
         raise
 
     # 6. Post-commit: one enqueue for the one outbox row (persist_status=False
-    #    — the row is already ENQUEUED), then one invalidation per namespace
-    #    (the same set update_object's default path invalidates), never one
-    #    per value.
+    #    — the row is already ENQUEUED), then one purge of the four namespaces
+    #    a composite write can change (D-14: the same helper the POST route
+    #    calls), never one per value.
     await _enqueue_index_job(
         db, obj.id, "index_object_job",
         outbox_id=outbox_entry.id, persist_status=False,
     )
-    await invalidate_entity_cache("object")
-    await invalidate_entity_cache("object_value")
-    await invalidate_entity_cache("search")
+    await invalidate_composite_write_caches()
 

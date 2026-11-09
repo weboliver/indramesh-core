@@ -307,8 +307,8 @@ function readCatalog(relativePath) {
 }
 
 describe('task log copy catalogs', () => {
-  it('carries every new key in all five frontend locale mirrors', () => {
-    for (const locale of ['en', 'de', 'es', 'fr', 'pt']) {
+  it('carries every new key in all six frontend locale mirrors', () => {
+    for (const locale of ['en', 'de', 'es', 'fr', 'it', 'pt']) {
       const catalog = readCatalog(`frontend/locales/${locale}/systemui.json`)
       for (const key of Object.keys(TASK_LOG_EN)) {
         assert.ok(catalog[key], `${locale} catalog missing ${key}`)
@@ -323,7 +323,7 @@ describe('task log copy catalogs', () => {
       assert.ok(byKey[key], `backend ui_strings missing ${key}`)
       assert.equal(byKey[key].namespace, 'tasks', `backend ui_strings namespace for ${key}`)
     }
-    for (const locale of ['de', 'es', 'fr', 'pt']) {
+    for (const locale of ['de', 'es', 'fr', 'it', 'pt']) {
       const seed = readCatalog(`backend/app/data/ui_translations_${locale}.json`)
       for (const key of Object.keys(TASK_LOG_EN)) {
         assert.ok(seed[key], `backend seed ${locale} missing ${key}`)

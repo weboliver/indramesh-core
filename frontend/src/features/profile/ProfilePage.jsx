@@ -8,60 +8,19 @@ import { Can } from '../../shared/components/Can'
 import PasswordPolicyHint from '../../shared/components/PasswordPolicyHint'
 import { usePasswordPolicy } from '../../shared/hooks/use-password-policy'
 import { passwordViolations } from '../../shared/lib/password-policy'
+import { getInitials } from '../../shared/lib/initials'
+import { clearToken } from '../../shared/hooks/session-token'
 import ApiClientsSection from './ApiClientsSection'
 import { useTranslation } from 'react-i18next'
 
-function AvatarPreview({ profile, size = 40 }) {
-  if (profile?.avatar_url) {
-    return (
-      <div className="relative" style={{ width: size, height: size }}>
-        <img
-          src={profile.avatar_url}
-          alt=""
-          className="rounded-full object-cover"
-          style={{ width: size, height: size }}
-          onError={(e) => {
-            e.target.style.display = 'none'
-            const fallback = e.target.nextSibling
-            if (fallback) fallback.style.display = 'flex'
-          }}
-        />
-        <div
-          className="rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold"
-          style={{ width: size, height: size, display: 'none' }}
-        >
-          {getInitials(profile)}
-        </div>
-      </div>
-    )
-  }
-
-  return (
-    <div
-      className="rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0"
-      style={{ width: size, height: size }}
-    >
-      {getInitials(profile)}
-    </div>
-  )
-}
-
-function getInitials(profile) {
-  if (profile?.first_name && profile?.last_name) {
-    return (profile.first_name[0] + profile.last_name[0]).toUpperCase()
-  }
-  return '?'
-}
-
 export default function ProfilePage() {
   const { t } = useTranslation()
-  const { profile, setProfile } = useAuth()
+  const { profile, setProfile, user } = useAuth()
   const { activeLanguages, isLanguageActive } = useUiLanguage()
 
   // Profile form state
   const [firstName, setFirstName] = useState(profile?.first_name || '')
   const [lastName, setLastName] = useState(profile?.last_name || '')
-  const [avatarUrl, setAvatarUrl] = useState(profile?.avatar_url || '')
   const [uiLanguage, setUiLanguage] = useState(profile?.ui_language || 'en')
   const [profileSaving, setProfileSaving] = useState(false)
   const [profileError, setProfileError] = useState(null)
@@ -73,7 +32,6 @@ export default function ProfilePage() {
     if (!profile) return
     setFirstName(profile.first_name || '')
     setLastName(profile.last_name || '')
-    setAvatarUrl(profile.avatar_url || '')
     setUiLanguage(profile.ui_language || 'en')
   }, [profile])
 
@@ -95,17 +53,15 @@ export default function ProfilePage() {
         // Send '' (not null) so an intentionally cleared name actually
         // clears — the backend treats an explicit null as "field not sent,
         // leave as-is" (see update_profile's `is not None` checks), so null
-        // silently no-oped on clearing a name. avatar_url is the exception:
-        // its schema requires a valid http(s):// URL when present, so an
-        // empty string would 422 — null is the only way to represent "no
-        // avatar" there.
+        // silently no-oped on clearing a name. A key that is not sent at all
+        // is left untouched server-side, which is what keeps the stored
+        // avatar value alive across repeated profile saves.
         first_name: firstName,
         last_name: lastName,
-        avatar_url: avatarUrl || null,
       }
       // Only send ui_language for a changed, active selection (D-14/T-232-05)
       // — an unchanged unavailable preference must never be resent, or a
-      // name/avatar-only save could overwrite/reject the retained value.
+      // name-only save could overwrite/reject the retained value.
       const uiLanguageChanged = uiLanguage !== (profile?.ui_language || 'en')
       if (uiLanguageChanged && (uiLanguage === 'en' || isLanguageActive(uiLanguage))) {
         data.ui_language = uiLanguage
@@ -148,10 +104,17 @@ export default function ProfilePage() {
         new_password: newPassword,
         confirm_password: confirmPassword,
       })
-      showToast(t('toasts.profile.password_changed', 'Password changed successfully'))
-      setCurrentPassword('')
-      setNewPassword('')
-      setConfirmPassword('')
+      // A password change bumps the token epoch, which ends this very session
+      // (SESS-02). Clear the store and land on the notice that names the real
+      // cause — "your session expired" right after a deliberate action would be
+      // the wrong message (UI-SPEC §2.4). The fields are cleared by the unmount.
+      clearToken()
+      // A hard landing, not a router push: with the token cleared the still
+      // mounted layout's ProtectedRoute would render `<Navigate to="/login">`
+      // and replace this URL, dropping `?session=` (and with it the notice the
+      // user needs). A document load also takes the login page's cold-start
+      // path, which skips the pointless refresh.
+      window.location.assign('/login?session=password-changed')
     } catch (err) {
       const detail = err?.response?.data?.detail
       setPasswordError(typeof detail === 'string' ? detail : t('profile.password_change_failed', 'Failed to change password'))
@@ -163,7 +126,10 @@ export default function ProfilePage() {
   const previewProfile = {
     first_name: firstName || profile?.first_name,
     last_name: lastName || profile?.last_name,
-    avatar_url: avatarUrl || profile?.avatar_url,
+    // The profile payload carries no username, so the chain falls through to
+    // the authenticated user object — otherwise a user with neither name
+    // would see `?` instead of their username's initial.
+    username: profile?.username || user?.username,
   }
 
   // Only flag as unavailable once active-language data has actually
@@ -178,7 +144,16 @@ export default function ProfilePage() {
 
       {/* Profile Fields Section */}
       <div className="rounded-lg border p-6 space-y-4">
-        <h2 className="text-lg font-semibold">{t('profile.details_title', 'Profile Details')}</h2>
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold">{t('profile.details_title', 'Profile Details')}</h2>
+          <div
+            className="rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0"
+            style={{ width: 40, height: 40 }}
+            aria-hidden="true"
+          >
+            {getInitials(previewProfile)}
+          </div>
+        </div>
 
         <form onSubmit={handleProfileSubmit} className="space-y-4">
           <div>
@@ -199,19 +174,6 @@ export default function ProfilePage() {
               placeholder={t('profile.last_name_placeholder', 'Last name')}
               className="rounded-md border border-input bg-background px-3 py-2 text-sm w-full"
             />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium mb-1">{t('profile.avatar_url', 'Avatar URL')}</label>
-            <div className="flex items-center gap-3">
-              <input
-                value={avatarUrl}
-                onChange={(e) => setAvatarUrl(e.target.value)}
-                placeholder={t('profile.avatar_url_placeholder', 'https://example.com/avatar.png')}
-                className="rounded-md border border-input bg-background px-3 py-2 text-sm flex-1"
-              />
-              <AvatarPreview profile={previewProfile} size={40} />
-            </div>
           </div>
 
           <div>

@@ -59,6 +59,11 @@ else
   chmod 600 "$ENV_FILE" 2>/dev/null || true
   echo "  created .env from .env.example"
 fi
+# Phase 322 (D-02, Pitfall 6): a 1.0.0 .env gains ONLY the missing DB_APP_* lines
+# here, before the fill — fill_env_placeholders' closing loop refuses a key the
+# file does not carry, so the upgrade would abort on the first rerun otherwise.
+# Append-only: every existing line (DB_USER/DB_PASSWORD included) is untouched.
+append_missing_app_db_keys "$ENV_FILE" "$ENV_EXAMPLE" || exit 1
 
 step "install: default network"
 docker_preflight_subnet "$ENV_FILE" || exit 1

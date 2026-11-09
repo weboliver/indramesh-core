@@ -26,9 +26,10 @@ can effectively write to a core table (direct, ``PUBLIC`` or membership-derived)
 child can start (T-287.1-01/T-287.1-16).
 
 The testable function takes an existing privileged connection (D-16); the CLI is
-a thin wrapper that connects with the application URL. The optional
-``core_tables`` parameter is a test-only seam — the production CLI never passes
-it and always uses :func:`core_table_names`.
+a thin wrapper that connects with the maintenance (``DB_USER``) URL — never the
+runtime application connection. The optional ``core_tables`` parameter is a
+test-only seam — the production CLI never passes it and always uses
+:func:`core_table_names`.
 """
 
 import asyncio
@@ -43,7 +44,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.db import get_database_url
+from app.db import get_maintenance_database_url
 from app.logging import configure_logging
 from app.plugin_system.database_registry import (
     CORE_VERSION_TABLE,
@@ -418,8 +419,11 @@ async def verify_plugin_role_boundary(
 
 
 async def _bootstrap_with_application_connection(config: PluginRoleConfig) -> int:
+    # D-08/DEPL-03: CREATE ROLE / ALTER ROLE need CREATEROLE, which the runtime
+    # identity does not hold. The CLI therefore connects with the maintenance
+    # (DB_USER) identity; only the function name is kept for compatibility.
     engine = create_async_engine(
-        get_database_url(), poolclass=NullPool, hide_parameters=True
+        get_maintenance_database_url(), poolclass=NullPool, hide_parameters=True
     )
     try:
         async with engine.begin() as conn:

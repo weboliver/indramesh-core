@@ -242,7 +242,7 @@ _chart_headlamp_enabled() {  # _chart_headlamp_enabled <values_file> —
 
 _chart_image_field() {  # _chart_image_field <values_file> <section> <field> —
   # echo `<section>.image.<field>` from the chart values (e.g.
-  # `_chart_image_field "$CHART_DIR/values.yaml" postgres tag` -> 18.4-age1.8.0-pgv0.8.7).
+  # `_chart_image_field "$CHART_DIR/values.yaml" postgres tag` -> 18.4-age1.8.0-pgv0.8.7-r1).
   # Absent section, absent image block or absent field echoes nothing, and every
   # caller fails closed on an empty result: the installer must acquire exactly
   # the ref the stateful pods will reference (pullPolicy IfNotPresent), and
@@ -274,6 +274,18 @@ _chart_image_field() {  # _chart_image_field <values_file> <section> <field> —
 }
 
 FULL_PASS_BOOT_VALUES_FILE=""
+
+read_app_db_user_value() {  # read_app_db_user_value <env_file> — set+export DB_APP_USER_VALUE from that .env
+  # Phase 322 D-04: `write_full_pass_boot_values` consumes only shell variables
+  # and never reads .env itself, so without this read a real install renders
+  # `postgres.appUser: ""` and the backend/worker silently fall back to DB_USER.
+  # The installer and the bootstrap suite therefore drive the identical code
+  # path. Only the non-secret role NAME travels; the password is never read into
+  # a values file (T-322-05).
+  local env_file="${1:?env file required}"
+  DB_APP_USER_VALUE="$(dotenv_value "$env_file" "DB_APP_USER" 2>/dev/null || true)"
+  export DB_APP_USER_VALUE
+}
 
 write_full_pass_boot_values() {  # write_full_pass_boot_values <tmpdir> <api_server_cidr> <repo=tag...> —
   # write the private full-pass boot values file (259-04 decision 2): the
@@ -340,6 +352,15 @@ write_full_pass_boot_values() {  # write_full_pass_boot_values <tmpdir> <api_ser
   # in a values file, never the password (T-257-02).
   if [ "${PLUGIN_DB_PASSWORD_PRESENT:-0}" = "1" ] && [ -n "${PLUGIN_DB_USER_VALUE:-}" ]; then
     printf 'plugins:\n  dbUser: %s\n' "$PLUGIN_DB_USER_VALUE" >> "$out"
+  fi
+  # Phase 322 D-04: the non-secret application role name. Emitted ONLY when the
+  # installer read it out of this installation's .env (read_app_db_user_value),
+  # so an empty value leaves the chart's empty default in place and the
+  # documented DB_USER fallback still applies. Only the role NAME lands in a
+  # values file, never the password (T-322-05); the Deployments read
+  # DB_APP_PASSWORD from the indramesh-database Secret.
+  if [ -n "${DB_APP_USER_VALUE:-}" ]; then
+    printf 'postgres:\n  appUser: %s\n' "$DB_APP_USER_VALUE" >> "$out"
   fi
   FULL_PASS_BOOT_VALUES_FILE="$out"
   return 0

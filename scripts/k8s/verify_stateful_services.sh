@@ -18,10 +18,10 @@ OPENSEARCH_MARKER="${MARKER_PREFIX}_OPENSEARCH"
 OPENSEARCH_INDEX="indramesh-phase-3121-verifier-${MARKER_PREFIX,,}"
 INSTALL_LOG="$(mktemp "${TMPDIR:-/tmp}/indramesh-phase-3121-install.XXXXXX")"
 DEFAULT_EVIDENCE_FILE="$SCRIPT_DIR/stateful-image-digests.env"
-POSTGRES_IMAGE_REF="docker.io/library/indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7"
+POSTGRES_IMAGE_REF="docker.io/library/indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7-r1"
 VALKEY_IMAGE_REF="docker.io/library/indramesh-stateful-valkey:9.1.1-r1"
 OPENSEARCH_IMAGE_REF="docker.io/library/indramesh-stateful-opensearch:3.9.0-r1"
-POSTGRES_LOCAL_IMAGE="indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7"
+POSTGRES_LOCAL_IMAGE="indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7-r1"
 VALKEY_LOCAL_IMAGE="indramesh-stateful-valkey:9.1.1-r1"
 OPENSEARCH_LOCAL_IMAGE="indramesh-stateful-opensearch:3.9.0-r1"
 
@@ -206,7 +206,7 @@ wait_for_singleton_ready() {
 assert_selected_image_contract() {
   local manifest
   manifest="$(bash "$ROOT/tests/bootstrap/helm_bin.sh" template "$RELEASE_NAME" "$ROOT/deploy/helm/indramesh" --namespace "$NAMESPACE")"
-  for image in indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7 indramesh-stateful-valkey:9.1.1-r1 indramesh-stateful-opensearch:3.9.0-r1; do
+  for image in indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7-r1 indramesh-stateful-valkey:9.1.1-r1 indramesh-stateful-opensearch:3.9.0-r1; do
     case "$manifest" in *"$image"*) ;; *) verify_error "helm template stock image missing: $image"; return 1 ;; esac
   done
   # Blocker A: the OpenSearch copy-config initContainer must render from the same
@@ -233,8 +233,8 @@ assert_selected_image_contract() {
 # recorded post-import revision.
 #
 # The chart renders the wrapper by its values repository/tag (bare name
-# `indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7`), which Docker normalizes to the
-# canonical `docker.io/library/indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7` — the SAME
+# `indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7-r1`), which Docker normalizes to the
+# canonical `docker.io/library/indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7-r1` — the SAME
 # image as the recorded canonical ref. Normalize the pod's bare name to its
 # canonical registry-qualified form before the equality check so the chain is
 # proven without requiring the chart to spell out the default registry.

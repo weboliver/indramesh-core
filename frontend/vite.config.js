@@ -25,14 +25,18 @@ export default defineConfig({
     react(),
     tailwindcss(),
     pluginHostRuntime,
-    // Build-size report (dist/stats.html). No Monaco worker wiring is needed any
-    // more — the host GraphiQL/Monaco editor was removed in Phase 304.
-    visualizer({
-      filename: 'dist/stats.html',
-      open: false,
-      gzipSize: true,
-      brotliSize: true,
-    }),
+    // Bundle-size report, opt-in only: `ANALYZE=1 npm run build`. It never belongs to a shipped
+    // artifact — the public stage already forbids a `stats.html` (scripts/publish.sh) and the
+    // release image copies nothing but the built assets, so emitting it by default only put a
+    // module inventory of the source tree into the image.
+    ...(process.env.ANALYZE === '1'
+      ? [visualizer({
+          filename: 'dist/stats.html',
+          open: false,
+          gzipSize: true,
+          brotliSize: true,
+        })]
+      : []),
   ],
   optimizeDeps: {
     // All seven package specifiers the host shims re-export must be optimized in

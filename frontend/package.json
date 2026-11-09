@@ -1,7 +1,7 @@
 {
   "name": "frontend",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "scripts": {
@@ -51,10 +51,13 @@
     "eslint-plugin-react": "7.37.5",
     "eslint-plugin-react-hooks": "7.1.1",
     "globals": "17.9.0",
-    "i18next-cli": "1.69.0",
+    "i18next-cli": "1.82.3",
     "knip": "^6.23.0",
     "rollup-plugin-visualizer": "^7.0.1",
     "tailwindcss": "4.3.3",
     "vite": "8.3.5"
+  },
+  "overrides": {
+    "minimatch": "^11.0.4"
   }
 }

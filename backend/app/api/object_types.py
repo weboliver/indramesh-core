@@ -9,6 +9,7 @@ from app.schemas.crud import (
 )
 from app.schemas.auth import UserResponse
 from app.services.auth_service import get_current_user, require_permission, require_record_permission
+from app.services.value_visibility import assert_container_access
 from app.api.pagination import REFERENCE_DEFAULT_LIMIT, MAX_LIMIT
 from app.services.object_type_service import (
     create_object_type, list_object_types, get_object_type,
@@ -27,6 +28,30 @@ async def create_object_type_route(
     db: AsyncSession = Depends(get_db),
     current_user: UserResponse = Depends(require_permission("object-types", "create"))
 ):
+    # AUTHZ-07 (D-01/D-03): the schema is the container of a new object type.
+    # When the payload names a parent object type, that parent is a second
+    # container — an object-type-level DENY on it is not caught by the schema
+    # anchor (the cascade walks upward from the anchor, never sideways), and a
+    # child with `inherits_attributes` would otherwise expose the denied
+    # parent's attributes. Readability first (404, the route's existing
+    # missing-container answer, so invisible and nonexistent look alike), then
+    # create (403). Both checks precede the service call, so no ObjectType row
+    # can survive a refusal.
+    if not current_user.is_superuser:
+        for entity_type, container_id in (
+            ("schema", object_type.schema_id),
+            ("object_type", object_type.parent_id),
+        ):
+            if container_id is None:
+                continue
+            await assert_container_access(
+                str(current_user.id),
+                current_user.is_superuser,
+                entity_type=entity_type,
+                container_id=container_id,
+                action="create",
+                not_found_detail="Schema or parent object type not found",
+            )
     try:
         db_object_type = await create_object_type(db, object_type, current_user.id)
     except ObjectTypeNameConflict as e:
@@ -92,6 +117,32 @@ async def update_object_type_route(
     db: AsyncSession = Depends(get_db),
     current_user: UserResponse = Depends(require_record_permission("object-types", "update", "object_type", "object_type_id"))
 ):
+    # IN-01 / D-17 (319 D-03): a move into another container gates the TARGET
+    # container, not only the subject type the route dependency checked.
+    # Readability first — an invisible target answers this route's existing
+    # missing-container 404, so it is indistinguishable from one that does not
+    # exist — then the update action (403). Both checks precede
+    # `update_object_type(` because the service commits its own transaction, so
+    # a later gate would refuse after the row was re-parented. `parent_id` is
+    # gated as well: it is the update-side sibling of the create route's parent
+    # gate above (an object-type-level DENY on the parent is not covered by the
+    # schema anchor, and a child with `inherits_attributes` reads the parent's
+    # attributes).
+    if not current_user.is_superuser:
+        for entity_type, container_id in (
+            ("schema", object_type_update.schema_id),
+            ("object_type", object_type_update.parent_id),
+        ):
+            if container_id is None:
+                continue
+            await assert_container_access(
+                str(current_user.id),
+                current_user.is_superuser,
+                entity_type=entity_type,
+                container_id=container_id,
+                action="update",
+                not_found_detail="Object type not found",
+            )
     try:
         object_type = await update_object_type(db, object_type_id, object_type_update, current_user.id)
     except ObjectTypeNameConflict as e:

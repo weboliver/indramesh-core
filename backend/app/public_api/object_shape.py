@@ -521,3 +521,28 @@ def strip_hidden_references(shape: dict, visible_targets: dict[str, str]) -> dic
             "objectAttributeValues": kept,
         })
     return {**shape, "attributes": new_attributes}
+
+
+def strip_denied_attributes(shape: dict, visible_ota_ids: set[str]) -> dict:
+    """Per-caller attribute-type DENY strip on a built object shape (D-11).
+
+    ``visible_ota_ids`` holds the ``objectTypeAttributeId`` of every entry whose
+    attribute type the caller may read. An entry outside it is dropped whole —
+    its name (``objectTypeAttribute``) and its values
+    (``objectAttributeValues``) together — so **a denied attribute type is
+    indistinguishable from an attribute that does not exist**: no ``null``
+    placeholder, no empty value list, no ``hidden``/``denied`` marker. An entry
+    without an ``objectTypeAttributeId`` cannot be vouched for and is dropped.
+
+    Pure: the input — a shared, caller-independent cached shape — is never
+    mutated; the surviving entries keep their original order (the list is
+    rebuilt, never re-sorted).
+    """
+    if "attributes" not in shape:
+        return dict(shape)
+    kept = [
+        entry
+        for entry in (shape["attributes"] or [])
+        if str(entry.get("objectTypeAttributeId")) in visible_ota_ids
+    ]
+    return {**shape, "attributes": kept}

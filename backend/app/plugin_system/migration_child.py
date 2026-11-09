@@ -95,31 +95,54 @@ async def _grant_runtime_dml(
     runtime_role: str | None,
     plugin_role: str,
     metadata,
+    version_table: str | None = None,
 ) -> None:
     """Owner-issued, table-scoped DML grant for the runtime role (JDATA-05).
 
     PostgreSQL only lets the table OWNER (or a superuser) GRANT, and the owner is
     the plugin role — which is why this runs here, in the de-privileged child,
     after the upgrade, and never in the privileged parent. Exactly the plugin's
-    declared ``database_metadata`` tables (never the version table — the runtime
-    reads the head through the parent's privileged gate) receive
-    ``SELECT, INSERT, UPDATE, DELETE``; no GRANT OPTION, nothing on Core, no role
-    membership. Re-running is idempotent and harmless, so the ``up_to_date`` path
-    reconciles grants too. The runtime role equal to the plugin role is skipped
-    (it already owns the tables).
+    declared ``database_metadata`` tables receive ``SELECT, INSERT, UPDATE,
+    DELETE``; no GRANT OPTION, nothing on Core, no role membership. Re-running is
+    idempotent and harmless, so the ``up_to_date`` path reconciles grants too. The
+    runtime role equal to the plugin role is skipped (it already owns the tables).
+
+    The plugin's own version table is the deliberate exception (D-17): the
+    registry reads the head over the runtime connection, so the runtime role gets
+    ``SELECT`` only. The plugin role owns that table and can both grant and
+    revoke, which closes the drift its default privilege would otherwise reopen
+    after every install — the deploy sweep only fixes tables that existed when it
+    ran.
     """
     if not runtime_role or runtime_role == plugin_role:
         return
+
+    runtime = _quote_identifier(runtime_role)
+
     tables = sorted({table.name for table in metadata.tables.values()})
-    if not tables:
-        return
-    table_list = ", ".join(_quote_identifier(name) for name in tables)
-    await connection.execute(
-        text(
-            f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {table_list} "
-            f"TO {_quote_identifier(runtime_role)}"
+    if tables:
+        table_list = ", ".join(_quote_identifier(name) for name in tables)
+        await connection.execute(
+            text(
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {table_list} "
+                f"TO {runtime}"
+            )
         )
-    )
+
+    # Run the version-table statements AFTER the DML grant (so a pathological
+    # plugin that declares its own version table cannot re-widen it) and BEFORE
+    # any early return (so a plugin with no declared tables is covered too).
+    if version_table:
+        quoted_version = _quote_identifier(version_table)
+        await connection.execute(
+            text(f"GRANT SELECT ON TABLE {quoted_version} TO {runtime}")
+        )
+        await connection.execute(
+            text(
+                "REVOKE INSERT, UPDATE, DELETE, TRUNCATE "
+                f"ON TABLE {quoted_version} FROM {runtime}"
+            )
+        )
 
 
 async def _upgrade_from_dir(
@@ -162,6 +185,7 @@ async def _upgrade_from_dir(
                         runtime_role=getattr(args, "runtime_role", None),
                         plugin_role=user,
                         metadata=metadata,
+                        version_table=result.manifest.database.version_table,
                     )
             except Exception:
                 return CHILD_EXIT_RUNTIME_GRANT_FAILED

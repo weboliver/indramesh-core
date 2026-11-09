@@ -39,7 +39,7 @@ from sqlalchemy.exc import DataError, ProgrammingError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.db import async_session_maker, get_database_url
+from app.db import async_session_maker, get_database_url, get_maintenance_database_url
 from app.logging import resolve_log_format
 from app.plugin_system.bootstrap_role import (
     PLUGIN_DB_PASSWORD_ENV,
@@ -174,12 +174,32 @@ DIAGNOSTIC_COLUMNS_PENDING_WARNING = (
     "pending)"
 )
 
-# One NullPool engine for the whole run. NullPool means a returned connection
-# can never carry a dangling session-level advisory lock (RESEARCH Pitfall 4);
-# each plugin gets its own fresh connection from it.
-_runner_engine = create_async_engine(
-    get_database_url(), poolclass=NullPool, hide_parameters=True
-)
+# One NullPool engine for the whole run, built LAZILY (Pitfall 2, D-15).
+# NullPool means a returned connection can never carry a dangling session-level
+# advisory lock (RESEARCH Pitfall 4); each plugin gets its own fresh connection
+# from it. It is NOT built at import time: ``registry.py`` imports this module in
+# both the backend and the worker, and on k3s the worker holds only ``DB_APP_*``
+# — a module-level engine would be constructed for an identity that process does
+# not have. A process that never reaches a maintenance path never builds one.
+_runner_engine = None
+
+
+def _get_runner_engine():
+    """Return the cached maintenance (``DB_USER``) engine, building it on first use.
+
+    The privileged parent writes migration state and adopts plugin objects, which
+    needs ownership rights the runtime identity does not have (D-08). Deliberately
+    NOT the runtime builder: ``_resolve_runtime_role_name()`` and
+    ``_database_locator()`` must keep reading :func:`get_database_url` (Pitfall 1)
+    so the owner-issued plugin grant targets the application role and the child
+    receives the application connection's locator.
+    """
+    global _runner_engine
+    if _runner_engine is None:
+        _runner_engine = create_async_engine(
+            get_maintenance_database_url(), poolclass=NullPool, hide_parameters=True
+        )
+    return _runner_engine
 
 # Phase 287.1 (D-02): the hermetic per-plugin revision child. The parent runs
 # `python -m <module>` with a REPLACED environment carrying only the two plugin
@@ -633,6 +653,8 @@ def _database_locator() -> tuple[str, str, int, str]:
 
     Deliberately parsed from :func:`get_database_url` here, in the privileged
     parent, so the child never receives a full URL (and never its password).
+    Must stay on the RUNTIME builder (Pitfall 1): the locator describes the
+    application connection, not the maintenance one.
     """
     url = make_url(get_database_url())
     return (
@@ -653,6 +675,10 @@ def _resolve_runtime_role_name() -> str | None:
     application database URL's username and validated as a safe PostgreSQL
     identifier; anything unvalidated is returned as ``None`` (no GRANT) rather than
     interpolated into SQL or argv.
+
+    Must stay on the RUNTIME builder (Pitfall 1): resolving this from the
+    maintenance URL would return ``DB_USER`` and silently grant plugin DML to the
+    administrator identity instead of the application role.
     """
     username = make_url(get_database_url()).username
     if not username:
@@ -886,7 +912,7 @@ async def _upgrade_with_dir(
 
     cfg = plugin_alembic_config(name, revisions_dir, spec.version_table, metadata)
 
-    plugin_conn = await _runner_engine.connect()
+    plugin_conn = await _get_runner_engine().connect()
     try:
         async with plugin_conn.begin():
             # Bounded per-plugin work (RESEARCH Pitfall 6 / A-287-03). The
@@ -1191,7 +1217,7 @@ async def run_plugin_migrations(
         database_plugins
     )
 
-    async with _runner_engine.connect() as lock_conn:
+    async with _get_runner_engine().connect() as lock_conn:
         acquired = await _acquire_lock(
             lock_conn, timeout_s=DEFAULT_LOCK_TIMEOUT_SECONDS
         )

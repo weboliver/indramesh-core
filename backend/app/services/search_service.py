@@ -34,6 +34,10 @@ from app.plugin_system import hooks as plugin_hooks
 
 logger = logging.getLogger(__name__)
 
+ORPHANED_INDEX_NAME_PATTERN = re.compile(
+    r"objects_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+
 
 def _hook_registry():
     """Return the process-wide PluginRegistry, or None when uninitialized.
@@ -300,23 +304,58 @@ async def build_index_mappings(db: AsyncSession, object_type_id: uuid.UUID) -> d
     return {"properties": _build_mapping_properties(attrs)}
 
 
+async def build_schema_index_mappings(db: AsyncSession, schema_id: uuid.UUID) -> dict:
+    """Mapping for the **whole** Schema: base properties plus every ObjectType.
+
+    One Schema owns one ``objects_<schema_id>`` index shared by all of its
+    ObjectTypes, so an index created by the first document of one type must
+    already carry the explicit field types of all of them — otherwise the other
+    types fall back to dynamic mapping and range, sort and exact-match queries
+    answer wrongly (REV-01).
+
+    Cost is constant, not per attribute: the ``ObjectTypeAttribute`` select
+    plus its single ``selectinload`` of ``attribute_type`` that
+    :func:`_build_mapping_properties` dereferences — two statements, however
+    many attributes or ObjectTypes the Schema declares.
+
+    The property key carries the ObjectType id (``attr_<object_type_id>_<name>``)
+    because two ObjectTypes of one Schema may declare the same attribute name:
+    the same rule :func:`build_es_document` writes with, so the mapping and the
+    documents cannot disagree by construction.
+    """
+    result = await db.execute(
+        select(ObjectTypeAttribute)
+        .options(selectinload(ObjectTypeAttribute.attribute_type))
+        .join(ObjectType, ObjectType.id == ObjectTypeAttribute.object_type_id)
+        .where(ObjectType.schema_id == schema_id)
+    )
+    attrs = result.scalars().all()
+
+    return {"properties": _build_mapping_properties(attrs)}
+
+
 async def ensure_index(
     db: AsyncSession, schema_id: uuid.UUID, object_type_id: uuid.UUID
 ) -> bool:
     """Create the Schema's object index if it does not exist yet (D-16).
 
-    Mappings are passed **inline on creation only**: a brand-new index still
-    needs them. An already existing index is left alone — the per-document index
-    path never writes a mapping. A mapping change belongs to a schema change and
-    goes through :func:`refresh_index_mapping`, the single ``put_mapping`` call
-    site.
+    Mappings are passed **inline on creation only**, and they cover the whole
+    Schema (:func:`build_schema_index_mappings`) — not just the ObjectType whose
+    document happened to create the index. An already existing index is left
+    alone: the per-document index path never writes a mapping. A mapping change
+    belongs to a schema change and goes through :func:`refresh_index_mapping`,
+    the single ``put_mapping`` call site.
+
+    ``object_type_id`` is kept for call-site clarity (callers name the record's
+    type) and for the bulk-reindex attribution comment; it does not shape the
+    mapping.
     """
     es = await get_opensearch()
     index_name = f"objects_{schema_id}"
     exists = await es.indices.exists(index=index_name)
     if exists:
         return False
-    mappings = await build_index_mappings(db, object_type_id)
+    mappings = await build_schema_index_mappings(db, schema_id)
     try:
         await es.indices.create(
             index=index_name,
@@ -327,8 +366,9 @@ async def ensure_index(
         )
     except RequestError as e:
         # Concurrent index_object_job calls can race here; the other caller
-        # already created it — with its own inline mappings. The loser writes
-        # nothing: D-16 keeps the document path free of mapping writes.
+        # already created it — with the same schema-wide inline mappings. The
+        # loser writes nothing: D-16 keeps the document path free of mapping
+        # writes.
         if e.error != "resource_already_exists_exception":
             raise
         return False
@@ -380,6 +420,29 @@ async def delete_index(schema_id: uuid.UUID) -> bool:
     es = await get_opensearch()
     await es.indices.delete(index=f"objects_{schema_id}", ignore=[404], ignore_unavailable=True)
     return True
+
+
+async def delete_orphaned_schema_indices(session: AsyncSession) -> int:
+    """Delete every ``objects_<uuid>`` index without a schema; returns the count.
+
+    The listing comes before the schema read: an index exists only after its
+    schema, so a schema created meanwhile is either absent from the listing or
+    present in the later read.
+    """
+    es = await get_opensearch()
+    listed = await es.cat.indices(index="objects_*", format="json")
+    candidates = set()
+    for entry in listed:
+        match = ORPHANED_INDEX_NAME_PATTERN.fullmatch(entry.get("index", ""))
+        if match:
+            candidates.add(uuid.UUID(match.group(1)))
+    if not candidates:
+        return 0
+    live_schema_ids = set((await session.execute(select(Schema.id))).scalars().all())
+    orphaned = candidates - live_schema_ids
+    for schema_id in orphaned:
+        await delete_index(schema_id)
+    return len(orphaned)
 
 
 async def remove_object_type_documents(
@@ -1509,9 +1572,18 @@ async def bulk_reindex(db: AsyncSession, object_type_id: uuid.UUID, task_id: uui
     es = await get_opensearch()
     index_name = f"objects_{snapshot.schema_id}"
 
-    # Create or extend the schema index, then replace only this ObjectType's
-    # documents. Other ObjectTypes share this index and must remain intact.
-    await ensure_index(db, snapshot.schema_id, object_type_id)
+    # Create the schema index, or extend an existing one — two distinct halves:
+    #  * the index does not exist yet: `ensure_index` creates it with the
+    #    schema-wide mapping inline (REV-01), so there is nothing left to map;
+    #  * the index already exists: it may predate this ObjectType, so its
+    #    mapping is extended for this type's properties through the single
+    #    `put_mapping` site. Best-effort — `refresh_index_mapping` swallows its
+    #    own errors so a mapping failure never fails the reindex.
+    # Then replace only this ObjectType's documents; other ObjectTypes share
+    # this index and must remain intact.
+    created = await ensure_index(db, snapshot.schema_id, object_type_id)
+    if not created:
+        await refresh_index_mapping(object_type_id)
     await es.delete_by_query(
         index=index_name,
         body={"query": {"term": {"object_type_id": str(object_type_id)}}},

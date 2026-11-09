@@ -110,6 +110,12 @@ else
   echo "  created .env from .env.example"
 fi
 
+# Phase 322 D-02: an existing 1.0.0 .env gains ONLY the two missing DB_APP_*
+# lines before the schema gate below runs, so validate_env_schema sees every
+# template key and fill_env_placeholders can generate DB_APP_PASSWORD. An
+# existing value is never rewritten, reordered or dropped.
+append_missing_app_db_keys "$ENV_FILE" "$ENV_SCHEMA_FILE" || exit 1
+
 # Phase 272/K8SFIX-03/04: single ENVIRONMENT source for BOTH stacks — the same
 # root .env variable the Compose stack uses drives the k8s frontend build
 # (VITE_ENVIRONMENT baked at build time) and the in-cluster backend/worker
@@ -188,6 +194,15 @@ PLUGIN_DB_USER_VALUE="$(dotenv_value "$ENV_FILE" "PLUGIN_DB_USER" 2>/dev/null ||
 PLUGIN_DB_PASSWORD_PRESENT=0
 [ -n "$(dotenv_value "$ENV_FILE" "PLUGIN_DB_PASSWORD" 2>/dev/null || true)" ] && PLUGIN_DB_PASSWORD_PRESENT=1
 export PLUGIN_DB_USER_VALUE PLUGIN_DB_PASSWORD_PRESENT
+
+# Phase 322 D-04: the non-secret application role name, read out of THIS
+# installation's .env after append_missing_app_db_keys and
+# fill_env_placeholders, so an upgrade that just appended the key is picked up
+# in the same run. write_full_pass_boot_values consumes only shell variables and
+# never reads .env, so without this read a real install renders
+# `postgres.appUser: ""` and the backend/worker silently fall back to DB_USER.
+# Only the role name travels; the password stays in the Secret (T-322-05).
+read_app_db_user_value "$ENV_FILE"
 
 # Phase 318 (K8S-LLM-EGRESS-01): the .env LLM endpoint and the operator's extra
 # egress targets. On Compose the backend reads LLM_* straight from the .env; on

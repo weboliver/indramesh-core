@@ -12,6 +12,7 @@ import { PluginNavBadge } from '../plugin-runtime/PluginNavBadge'
 import { mergePluginNavGroups } from './nav-groups'
 import { cn } from '../lib/utils'
 import { fetchAppVersion, formatVersionLabel } from '../lib/app-version'
+import { getInitials } from '../lib/initials'
 
 export default function TopNav({ onToggleDark }) {
   const { t } = useTranslation()
@@ -428,22 +429,11 @@ export default function TopNav({ onToggleDark }) {
                  aria-label={t('common.user_menu', 'User menu')}
                 data-testid="user-menu-trigger"
               >
-                {profile?.avatar_url ? (
-                  <img
-                    src={profile.avatar_url}
-                    alt=""
-                    className="h-7 w-7 rounded-full object-cover"
-                    onError={(e) => {
-                      e.target.style.display = 'none'
-                      e.target.nextSibling.style.display = 'flex'
-                    }}
-                  />
-                ) : null}
                 <div
                   className="h-7 w-7 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0"
-                  style={profile?.avatar_url ? { display: 'none' } : undefined}
+                  aria-hidden="true"
                 >
-                  {getInitials(user, profile)}
+                  {getInitials({ ...(profile || {}), username: user.username })}
                 </div>
                 <span className="hidden sm:inline text-sm font-medium max-w-[120px] truncate">
                   {user.username}
@@ -549,11 +539,4 @@ export default function TopNav({ onToggleDark }) {
       )}
     </header>
   )
-}
-
-function getInitials(user, profile) {
-  if (profile?.first_name && profile?.last_name) {
-    return (profile.first_name[0] + profile.last_name[0]).toUpperCase()
-  }
-  return user.username[0].toUpperCase()
 }

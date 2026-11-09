@@ -13,6 +13,7 @@ from app.schemas.classification import (
     TemplateClassification,
 )
 from app.models.attribute_type import AttributeTypeDataType
+from app.data import BUNDLED_LANGUAGE_CODES
 
 
 class _RetiredCoreInputGuard(BaseModel):
@@ -246,25 +247,77 @@ class AttributeTypeResponse(AttributeTypeBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+def _strip_language_name(value: Any) -> Any:
+    """Trim a language display name and refuse a blank one (create and patch).
+
+    Shared by ``LanguageBase`` and ``LanguageUpdate`` so the write contract is
+    identical on both paths: a pure-whitespace name would render as " (xx)" in
+    every language picker and on the admin page.
+    """
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("name must not be blank")
+    return stripped
+
+
 class LanguageBase(BaseModel):
     code: EscapedStr = Field(max_length=10)
-    name: EscapedStr = Field(max_length=100)
+    # min_length + the strip validator below: a display name is never blank and
+    # never surrounded by whitespace. The base is shared with LanguageResponse,
+    # so the read contract matches the write contract — every language name the
+    # API can hand out is at least two visible characters.
+    name: EscapedStr = Field(min_length=2, max_length=100)
     is_active: Optional[bool] = True
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def strip_name(cls, value: Any) -> Any:
+        return _strip_language_name(value)
+
+
+# BCP-47-shaped tag, deliberately narrower than the full grammar: only ASCII
+# lowercase subtags, so a code is safe in a URL, in a cache key and in the
+# browser's Intl API (which raises RangeError on codes like "sv-12" or
+# "xx-abc"). Validation lives on LanguageCreate only — LanguageResponse must
+# stay permissive so pre-existing non-conforming rows still serialize.
+_LANGUAGE_CODE_PATTERN = _re.compile(
+    r"^[a-z]{2,3}(-[a-z]{4})?(-([a-z]{2}|[0-9]{3}))?(-([a-z0-9]{5,8}|[0-9][a-z0-9]{3}))*$"
+)
 
 
 class LanguageCreate(LanguageBase):
-    pass
+    @field_validator("code", mode="before")
+    @classmethod
+    def normalize_language_code(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().lower()
+        if not _LANGUAGE_CODE_PATTERN.match(normalized):
+            raise ValueError("code must be a BCP-47 style language tag")
+        return normalized
 
 
 class LanguageUpdate(BaseModel):
-    name: Optional[EscapedStr] = Field(default=None, max_length=100)
+    name: Optional[EscapedStr] = Field(default=None, min_length=2, max_length=100)
     is_active: Optional[bool] = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def strip_name(cls, value: Any) -> Any:
+        return _strip_language_name(value)
 
 
 class LanguageResponse(LanguageBase):
     id: uuid.UUID
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def is_bundled(self) -> bool:
+        return self.code in BUNDLED_LANGUAGE_CODES
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -1829,6 +1882,11 @@ class RoleListResponse(BaseModel):
     is_system: bool
     created_at: datetime
     updated_at: datetime
+    # SESS-06 (additive): whether the CALLING actor may grant this role. The
+    # API stays the only control — this field only lets the admin UI stop
+    # offering what the API would refuse. Defaults to True so existing
+    # constructors (and consumers that never compute it) keep working.
+    assignable: bool = True
 
     model_config = ConfigDict(from_attributes=True)
 

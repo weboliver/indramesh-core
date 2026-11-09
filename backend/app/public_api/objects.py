@@ -36,8 +36,10 @@ from app.services.auth_service import require_public_object_read
 from app.public_api.object_read_service import (
     get_public_object,
     list_attribute_names,
+    record_filter_denied_attributes,
     record_filter_object_shape,
 )
+from app.services.value_visibility import resolve_principal_roles
 
 objects_router = APIRouter(prefix="/object", tags=["public-object"])
 
@@ -87,6 +89,21 @@ async def public_get_object(
     shape = await get_public_object(db, object_id, requested, lang)
     if shape is None:
         raise HTTPException(status_code=404, detail="Object not found")
-    return await record_filter_object_shape(
+    # D-10/D-11: the shared cache entry stays caller-independent; the DENY
+    # strip is the SECOND post-cache step (after the reference strip), resolved
+    # once per request through the existing record-permission cache. The
+    # caller's roles are resolved once here and handed to the strip;
+    # record_filter_object_shape keeps its own internal resolution.
+    role_ids = await resolve_principal_roles(
+        db, str(current_user.id), current_user.is_superuser
+    )
+    shape = await record_filter_object_shape(
         db, shape, object_id, str(current_user.id), is_superuser=current_user.is_superuser
+    )
+    return await record_filter_denied_attributes(
+        db,
+        shape,
+        str(current_user.id),
+        is_superuser=current_user.is_superuser,
+        role_ids=role_ids,
     )

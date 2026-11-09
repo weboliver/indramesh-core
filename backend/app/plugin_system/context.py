@@ -63,6 +63,11 @@ ALLOWED_SUCCESS_OUTCOMES = frozenset(
     {TaskStatus.SUCCESS, TaskStatus.PARTIAL_SUCCESS}
 )
 
+# The closed set of Core-set context kinds (CORESEAM-10). Anything else is a
+# Core-side mistake and fails at construction instead of silently reaching the
+# Core-data write resolver.
+CONTEXT_KINDS: frozenset[str] = frozenset({"task", "route", "hook"})
+
 
 class PluginContext:
     """Service bundle handed to a plugin capability call or hook."""
@@ -76,6 +81,7 @@ class PluginContext:
         config_schema: dict | None = None,
         step_sequence: tuple[str, ...] | None = None,
         task: Task | None = None,
+        context_kind: str | None = None,
     ) -> None:
         self._plugin_name = plugin_name
         self._raw_config = raw_config
@@ -84,19 +90,30 @@ class PluginContext:
         # it). Never looked up here — a plugin can only ever see its own row.
         self._task = task
         self._task_id = task.id if task_id is None and task is not None else task_id
-        # CORESEAM-10: the Core-set context kind the Core-data write resolver
-        # dispatches on. Derived from what Core passed here — the worker's
-        # task-bound build (task present) is ``task``, a hook's borrowed-session
-        # build (active_session, no task) is ``hook``, and a route/lifecycle
-        # build (neither) is ``route``. It is NOT a public constructor argument:
-        # it only selects the correct actor rule, it is not an anti-forgery
-        # control (D-14).
-        if task is not None:
-            self._context_kind = "task"
-        elif active_session is not None:
-            self._context_kind = "hook"
-        else:
-            self._context_kind = "route"
+        # CORESEAM-10 / D-19: the Core-set context kind the Core-data write
+        # resolver dispatches on. Core states it explicitly whenever the shape
+        # is not derivable from what it passes: the hook bus always passes
+        # ``"hook"``, because a post-commit hook legitimately runs with
+        # ``active_session=None`` (``on_language_deleted``) and deriving the
+        # kind from session ownership would misclassify it as a route context.
+        # Without an explicit kind it is derived from the call shape: a loaded
+        # task is ``task``, a borrowed session (the in-transaction object hooks)
+        # is ``hook``, and neither (route/lifecycle) is ``route``. Either way it
+        # only selects the correct actor rule; it is NOT an anti-forgery control
+        # (D-14).
+        if context_kind is None:
+            if task is not None:
+                context_kind = "task"
+            elif active_session is not None:
+                context_kind = "hook"
+            else:
+                context_kind = "route"
+        elif context_kind not in CONTEXT_KINDS:
+            raise ValueError(
+                f"Unknown context kind {context_kind!r} — expected one of "
+                f"{sorted(CONTEXT_KINDS)}"
+            )
+        self._context_kind = context_kind
         self._config_schema = config_schema or {}
         self._resolved_config: dict | None = None
         # CORESEAM-04 runtime state, all reset with the context (= one attempt).
@@ -159,9 +176,10 @@ class PluginContext:
     def context_kind(self) -> str:
         """The Core-set context kind: ``"task"``, ``"route"`` or ``"hook"``.
 
-        Read-only and set only by Core at construction (CORESEAM-10). The
-        Core-data write resolver uses it to pick the correct actor rule; it is
-        not a public constructor argument and not a security boundary (D-14).
+        Read-only and set only by Core at construction (CORESEAM-10): the hook
+        bus states ``"hook"`` explicitly, every other build lets the context
+        derive it from the call shape. The Core-data write resolver uses it to
+        pick the correct actor rule; it is not a security boundary (D-14).
         """
         return self._context_kind
 

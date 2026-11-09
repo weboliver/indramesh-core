@@ -6,6 +6,12 @@ the optional **Grafana** UI, and how to forward logs to an external **OTLP**
 receiver. It covers Compose and the k3s installer. Application code is not
 touched — ingesting, parsing and shipping are configuration only.
 
+Each application process writes categorized, correlated lines to stdout (`LOG_FORMAT=json` by default,
+switchable to `logfmt` or `console`; categories `app`, `access`, `security`, `task`, `connector.*`,
+`plugin.*`, `db`; `request_id`/`task_id` correlation). Independently of the pipeline, Core persists a
+per-task log for every task run and shows it in Task detail (`TASK_LOG_MAX_LINES`,
+`TASK_LOG_RETENTION_DAYS`).
+
 ## Architecture
 
 ```
@@ -344,7 +350,10 @@ after the pinned Loki install. Loki stays without a published port.
   small persistent volume if that gap matters.
 - **Image air-gap (A2-like):** with `configReloader.enabled=false` and
   `crds.create=false`, the only image the release needs is `grafana/alloy`
-  (tag override `v1.20.1`).
+  (tag override `v1.21.3`). The Loki release keeps the pinned chart 18.13.8 —
+  whose appVersion is 3.7.8 — and raises the image through the checked-in
+  `loki.image.tag: "3.7.9"` override in `scripts/k8s/loki-values.yaml`, so the
+  patched Loki image is the only one the import list carries.
 - **Hermetic check (in-phase):** `bash tests/bootstrap/helm_bin.sh template indramesh
   deploy/helm/indramesh` renders the chart — including the backend→Loki egress
   clause, the `POD_NAMESPACE` Downward-API env and the backend `LOKI_QUERY_URL`

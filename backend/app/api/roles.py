@@ -9,7 +9,8 @@ from app.schemas.crud import (
     GroupResponse,
 )
 from app.schemas.auth import UserResponse
-from app.services.auth_service import require_permission
+from app.services.auth_service import require_permission, resolve_user_permissions
+from app.services.user_admin_service import granted_permission_names
 from app.api.pagination import REFERENCE_DEFAULT_LIMIT, MAX_LIMIT
 from app.services.role_admin_service import (
     create_role, list_roles, get_role, update_role, delete_role,
@@ -42,7 +43,26 @@ async def list_roles_route(
 ):
     items, total = await list_roles(db, skip=skip, limit=limit, q=q, group_id=group_id, assigned=assigned)
     response.headers["X-Total-Count"] = str(total)
-    return items
+
+    # SESS-06 advisory projection (T-321-07): the SAME rule the enforcement
+    # uses — `granted_permission_names` against the actor's resolved,
+    # deny-aware, group-inclusive set — so the list can never advertise a role
+    # that `assign_role_to_user` would refuse. A superuser bypasses it and sees
+    # everything as assignable; for everyone else the actor's permissions are
+    # resolved ONCE per request, never once per role.
+    if current_user.is_superuser:
+        return [
+            RoleListResponse.model_validate(role).model_copy(update={"assignable": True})
+            for role in items
+        ]
+
+    held = await resolve_user_permissions(current_user.id)
+    return [
+        RoleListResponse.model_validate(role).model_copy(
+            update={"assignable": granted_permission_names([role]) <= held}
+        )
+        for role in items
+    ]
 
 
 @router.get("/{role_id}", response_model=RoleResponse)

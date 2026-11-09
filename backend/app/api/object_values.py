@@ -8,7 +8,6 @@ from sqlalchemy import func, select as sa_select
 from sqlalchemy.orm import selectinload
 from app.db import get_db
 from app.models import (
-    AttributeType,
     Object,
     ObjectValue,
     ObjectTypeAttribute,
@@ -29,6 +28,7 @@ from app.services.object_value_service import (
 )
 from app.services.value_lock_service import ValueLockConflict
 from app.services.value_visibility import (
+    apply_value_visibility,
     assert_record_action_allowed,
     principal_signature,
     resolve_principal_roles,
@@ -47,27 +47,14 @@ def _get_value_column(dtype: Any) -> Any:
     return typed_value_column(dtype)
 
 
-def _visible_value_joins() -> tuple:
-    """The three joins every value query must carry for the visibility clauses."""
-    return (
-        (Object, Object.id == ObjectValue.object_id),
-        (
-            ObjectTypeAttribute,
-            ObjectTypeAttribute.id == ObjectValue.object_type_attribute_id,
-        ),
-        (
-            AttributeType,
-            AttributeType.id == ObjectTypeAttribute.attribute_type_id,
-        ),
-    )
-
-
 def _with_visibility(stmt, conditions: list):
-    """Attach the `object` / `object_type_attributes` / `attribute_types` joins
-    and the visibility clauses to a select over ObjectValue."""
-    for target, onclause in _visible_value_joins():
-        stmt = stmt.join(target, onclause)
-    return stmt.where(*conditions)
+    """Attach the visibility joins and clauses to a select over ObjectValue.
+
+    The joins come from :func:`apply_value_visibility` — this route module keeps
+    no copy of the tuple, so the list, the count and the `distinct` exits cannot
+    drift apart.
+    """
+    return apply_value_visibility(stmt, conditions)
 
 
 async def _attribute_type_id_for_value(

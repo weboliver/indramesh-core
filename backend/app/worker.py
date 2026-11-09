@@ -24,7 +24,7 @@ from app.logging.task_log import (
     set_task_log_writer,
 )
 from app.logging.worker import bind_job_context, with_log_context
-from app.db import async_session_maker
+from app.db import async_session_maker, log_identity_split_warning
 from app.db.opensearch import init_opensearch, close_opensearch
 from app.db.redis import get_arq_pool, init_redis, close_redis
 from app.services.scheduler_manager import scheduler_manager, init_job_registry, _execute_scheduled_job
@@ -164,6 +164,11 @@ def invalidate_after(job_name: str):
 # enough to tell the cancellation cleanup handlers apart from an ARQ timeout.
 CANCEL_MONITOR_INTERVAL_SECONDS = 2.0
 _USER_CANCELLED_TASKS: set[uuid.UUID] = set()
+
+ORPHANED_INDEX_SWEEP_TIMEOUT_SECONDS = 60
+# Fixed diagnostics: no index name, id or exception text reaches the log.
+ORPHANED_INDEX_SWEEP_FAILED = "Orphaned search index sweep failed; continuing the worker start."
+ORPHANED_INDEX_SWEEP_DELETED = "Deleted %d orphaned search index(es)."
 
 
 def is_user_cancel_requested(task_id) -> bool:
@@ -326,6 +331,26 @@ async def _reconcile_plugin_states() -> None:
         await registry.reconcile_all()
 
 
+async def sweep_orphaned_search_indices() -> int:
+    """Delete search indices without a schema; never raises, never fails the start.
+
+    Indices deleted before a timeout stay deleted, and the next start continues.
+    """
+    from app.services.search_service import delete_orphaned_schema_indices
+
+    try:
+        async with async_session_maker() as session:
+            deleted = await asyncio.wait_for(
+                delete_orphaned_schema_indices(session),
+                timeout=ORPHANED_INDEX_SWEEP_TIMEOUT_SECONDS,
+            )
+    except Exception:
+        logger.warning(ORPHANED_INDEX_SWEEP_FAILED)
+        return 0
+    logger.info(ORPHANED_INDEX_SWEEP_DELETED, deleted)
+    return deleted
+
+
 async def startup_recovery(ctx: dict) -> None:
     # Re-apply the shared configuration idempotently: arq's CLI applies its own
     # log dict after importing WorkerSettings, and a deployment that forgets
@@ -333,6 +358,12 @@ async def startup_recovery(ctx: dict) -> None:
     # (research Pitfall 3). Nothing is bound here — APScheduler inherits the
     # context active at scheduler.start() (research Pitfall 7).
     configure_logging("worker")
+
+    # D-08 / Pitfall 10: an explicit DATABASE_URL silently disables the
+    # runtime/maintenance identity split. Make the weakened state visible at
+    # worker startup; never abort — the operator's URL is an allowed config.
+    log_identity_split_warning(logger)
+
     import asyncio
 
     # Phase 300: start the process-wide task-log writer right after the stdout
@@ -393,6 +424,8 @@ async def startup_recovery(ctx: dict) -> None:
             "worker startup: recovered %d stuck task(s) — marked FAILED",
             recovered_count,
         )
+
+    await sweep_orphaned_search_indices()
 
     # Initialize APScheduler and load enabled schedules
     init_job_registry()
@@ -1174,7 +1207,7 @@ async def reindex_all_job(ctx: dict, task_id: str) -> dict:
             if not await task_service.start_task_run(session, t_uuid):
                 return {"success": False, "error": "Task not running"}
 
-            from app.services.search_service import reindex_schema, get_opensearch
+            from app.services.search_service import delete_orphaned_schema_indices, reindex_schema
 
             result = await session.execute(select(Schema))
             schemas = result.scalars().all()
@@ -1191,16 +1224,7 @@ async def reindex_all_job(ctx: dict, task_id: str) -> dict:
             # Rebuild all live Schema indices before sweeping legacy per-Type indices.
             stale_deleted = 0
             if not failed_schema_ids:
-                es = await get_opensearch()
-                existing_indices = await es.cat.indices(index="objects_*", format="json")
-                current_schema_ids = {str(schema.id) for schema in schemas}
-                for idx_info in existing_indices:
-                    idx_name = idx_info.get("index", "")
-                    if idx_name.startswith("objects_"):
-                        schema_id_from_index_name = idx_name[len("objects_"):]
-                        if schema_id_from_index_name not in current_schema_ids:
-                            await es.indices.delete(index=idx_name, ignore=[404])
-                            stale_deleted += 1
+                stale_deleted = await delete_orphaned_schema_indices(session)
 
             if not failed_schema_ids:
                 task_status = TaskStatus.SUCCESS.value

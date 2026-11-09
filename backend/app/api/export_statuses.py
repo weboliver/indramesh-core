@@ -8,7 +8,7 @@ from app.schemas.crud import (
     ExportStatusCreate, ExportStatusUpdate, ExportStatusResponse
 )
 from app.schemas.auth import UserResponse
-from app.services.auth_service import get_current_user
+from app.services.auth_service import require_permission
 from app.services.export_service import visible_export_ids_select
 from app.services.export_status_service import (
     create_export_status, list_export_statuses, get_export_status as get_status_svc,
@@ -22,7 +22,7 @@ router = APIRouter(prefix="/export-statuses", tags=["export-statuses"])
 async def create_export_status_route(
     status_data: ExportStatusCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: UserResponse = Depends(get_current_user)
+    current_user: UserResponse = Depends(require_permission("exports", "create"))
 ):
     try:
         return await create_export_status(
@@ -39,7 +39,7 @@ async def create_export_status_route(
 @router.get("/", response_model=List[ExportStatusResponse])
 async def list_export_statuses_route(
     db: AsyncSession = Depends(get_db),
-    current_user: UserResponse = Depends(get_current_user),
+    current_user: UserResponse = Depends(require_permission("exports", "read")),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum records to return"),
     response: Response = None,
@@ -62,7 +62,7 @@ async def list_export_statuses_route(
 async def get_export_status_route(
     status_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: UserResponse = Depends(get_current_user)
+    current_user: UserResponse = Depends(require_permission("exports", "read"))
 ):
     status_obj = await get_status_svc(
         db,
@@ -81,7 +81,7 @@ async def update_export_status_route(
     status_id: uuid.UUID,
     status_update: ExportStatusUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: UserResponse = Depends(get_current_user)
+    current_user: UserResponse = Depends(require_permission("exports", "update"))
 ):
     status_obj = await update_status_svc(
         db,
@@ -100,7 +100,7 @@ async def update_export_status_route(
 async def delete_export_status_route(
     status_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: UserResponse = Depends(get_current_user)
+    current_user: UserResponse = Depends(require_permission("exports", "delete"))
 ):
     deleted = await delete_status_svc(
         db,

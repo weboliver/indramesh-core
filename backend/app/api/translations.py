@@ -46,6 +46,7 @@ async def list_translations_route(
     items, total = await list_translations(
         db, translation_type=translation_type, entity_id=entity_id,
         field=field, language_code=language_code, skip=skip, limit=limit,
+        user_id=str(current_user.id), is_superuser=current_user.is_superuser,
     )
     response.headers["X-Total-Count"] = str(total)
     return items

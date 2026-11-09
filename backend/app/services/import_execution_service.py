@@ -45,6 +45,7 @@ from app.services import value_lock_service
 from app.services.cache_service import invalidate_entity_cache
 from app.schemas.crud import ImportUpdate
 from app.services.audit_service import audit_log, model_to_dict
+from app.services.translation_service import delete_translations_for
 from app.services.typed_value_mapping import typed_column_for_data_type
 from app.services import task_service
 from app.services.auth_service import resolve_user_permissions
@@ -886,6 +887,7 @@ async def _execute_csv_import_body(
                                         old_values=model_to_dict(ov_to_del), new_values=None, object_id=object_id,
                                         object_type_attribute_id=attr_id)
                         await db.delete(ov_to_del)
+                    await delete_translations_for(db, "object_value", [ov.id for ov in ovs_to_del])
 
             # ── 5e: Write ObjectValues for all attributes in this row ──
             for attr_id_str, entry in row_data.items():

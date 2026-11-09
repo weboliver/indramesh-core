@@ -195,6 +195,17 @@ seeds an empty database at start-up. Scale the application tier to zero, keep it
 whole restore, and rebuild the search index afterwards as described in
 [After a restore](#after-a-restore).
 
+Once the archive is restored and the application tier is up, run the application-role step once on
+the backend Deployment:
+
+```bash
+KUBECONFIG=$HOME/.kube/config kubectl -n indramesh exec deploy/indramesh-backend -- python -m app.db.roles
+```
+
+An archive taken on 1.0.0 carries neither the application role's grants nor the keygen functions,
+and scaling the application tier up runs no Job, so nothing else applies them. Compose needs no
+extra step: `backend/start.sh` runs the same step on every start.
+
 ## Upgrade
 
 An upgrade from one 1.x release to a later one is a **source update followed by a rebuild**: the
@@ -205,6 +216,49 @@ The full step-by-step procedure for both installation models lives in
 [DEPLOYMENT.md § Upgrading to a New Release](./DEPLOYMENT.md#upgrading-to-a-new-release). This
 section is the short version; where the two differ, that section and its installer are the
 authority.
+
+### Upgrading from 1.0.0
+
+1.0.1 hardens the session, the signing key, the connector's outbound target and the runtime
+database identity, so five changes are visible to an operator after the rebuild. Each one is
+deliberate; none needs a manual migration step.
+
+- **Every user signs in once more.** 1.0.0 issued 30-day access tokens; a token whose `exp - iat`
+  exceeds the new 15-minute lifetime is refused, so the first request after the upgrade lands on the
+  login screen. The interface also removes the old `localStorage` token entry once, on the first
+  load.
+- **A script that logs in through `/auth/login` must re-login or refresh within 15 minutes.** The
+  access token now lives 15 minutes; `POST /api/v1/auth/refresh` returns a fresh one without a new
+  password. `imsh_` API-client bearer tokens — the service-account clients of the public API — are
+  unchanged and need no adjustment.
+- **An existing Jira Source or Target at an internal address stops syncing.** Core now refuses a URL
+  that resolves to a non-public address, both when it is saved and at every pull/push. A superuser
+  re-enables such an endpoint by setting `allow_internal_target` to the literal JSON boolean `true`
+  in that Source's or Target's `config`; see
+  [CONFIGURATION.md § Internal connector targets](./CONFIGURATION.md#internal-connector-targets).
+  There is no global switch.
+- **Avatar images are no longer shown.** The interface renders initials instead, so a viewer's
+  browser never contacts the host named in a profile's `avatar_url`. Stored values are untouched.
+- **The runtime database identity is split from the administrator's.** Backend and worker run their
+  normal queries as a read/write application role without DDL or superuser rights. The installer
+  rerun adds `DB_APP_USER` and a generated `DB_APP_PASSWORD` to `.env` (Compose) or to the
+  `indramesh-database` Secret (k3s), and the deploy chain creates the application role with its
+  grants and the two keygen functions. `DB_USER`/`DB_PASSWORD` are untouched: the administrator
+  keeps `docker compose exec postgres psql` and `kubectl exec` access.
+
+**Known limitation of the identity split.** On Compose the backend and worker still read
+`DB_USER`/`DB_PASSWORD`, because `backend/start.sh` runs the migrations. On k3s the backend pod keeps
+them because the plugin install runs `kubectl exec … app.plugin_system.migrate` there. The change
+closes the SQL-injection path out of the application process, not a shell inside those containers,
+and row deletion through the application role remains possible — that is what backups are for. A
+plugin that needs a schema change declares it in a migration; plugin code running in the backend or
+worker can no longer run DDL through `PluginContext.db()`.
+
+**First start after the upgrade.** The deploy step removes translations whose entity no longer
+exists and logs the number removed. The worker removes search indices that belong to no schema when
+it starts. Neither needs any action, and a failure in either is a logged warning that does not stop
+the start. Select option translations are skipped in a run where attribute definitions cannot be
+read completely. These rows are removed without an audit entry.
 
 ### Docker Compose
 
@@ -218,12 +272,15 @@ authority.
    `CHANGE_ME` values; a variable the release **renamed or added** is absent rather than empty, so
    the installer stops and names it. Set that key in `.env` by hand — never delete `.env` to force a
    fresh one, because that regenerates `JWT_SECRET_KEY` and `FERNET_KEY` and makes the values
-   already encrypted in the database unreadable — and run it again. It rebuilds every locally built
+   already encrypted in the database unreadable — and run it again. Rotating `JWT_SECRET_KEY` also
+   signs everyone out: every access token and every stored refresh cookie becomes invalid, so all
+   browser sessions end at once. It rebuilds every locally built
    image (including the database and search images) and recreates the changed services. For a
    narrower change, `./rebuild_indramesh_docker.sh` or `docker compose up -d --build` rebuilds and
    recreates the selected services only.
-   Restart nginx afterwards (`docker compose restart nginx`) so it re-resolves the recreated
-   containers' addresses.
+   Nginx re-resolves `backend` and `frontend` at runtime, so no manual restart or reload is needed
+   after a rebuild: a recreated container is picked up within about ten seconds, and a 502 during
+   that window clears by itself.
 4. **The migrations run themselves.** The backend applies the whole chain when it starts —
    `alembic upgrade head` first, then the plugin migrations. Compose has no separate migration
    step and no migration Job; nothing else has to be run for the schema to be current.
@@ -255,9 +312,10 @@ again.
 6. **Check the rollout** with `KUBECONFIG=$HOME/.kube/config kubectl get pods -n indramesh` and log
    in.
 
-Installed plugins are versioned separately from Core. Update one from its own repository with
-`install_plugin_docker.sh` or `install_plugin_k8s.sh` when its release notes say it needs the new
-Core release.
+Installed plugins are versioned separately from Core. Update one by re-running its install command —
+`install_plugin_docker.sh` or `install_plugin_k8s.sh` — with the new release when its release notes
+say it needs the new Core release; [DEPLOYMENT.md § Updating a Plugin](./DEPLOYMENT.md#updating-a-plugin)
+describes the version checks the installer applies.
 
 ## Production Hardening
 
@@ -298,3 +356,28 @@ reverse proxy or load balancer in front of the backend and forward *all* paths t
 three paths there. There is **no built-in toggle** to disable the documentation surface in this
 release — the control is the network reachability of the backend port and whatever sits in front
 of it, not a configuration value.
+
+## Known Performance Characteristics
+
+Properties an operator should know about before sizing an installation. They are correctness-neutral:
+the visible result set is identical in every case below.
+
+- **The record-level filter costs roughly one pass over a principal's DENY set per statement.** A
+  restricted object list, its total count, an AQL query and its count each decide every **cascade**
+  permission level once, against an uncorrelated set of denied record ids. That is the corrected
+  behaviour (before 1.0.1 the set was re-read once per candidate row), but it means the cost follows the
+  **number of DENY rows the principal's roles add up to**, not the number of rows returned. Measured on
+  1.0.1, 50 000 objects, database time only: 500 object DENYs → 19.55 ms page / 12.21 ms count / 26.34 ms
+  AQL page / 14.80 ms AQL count, i.e. 1.4×–1.9× a superuser's statement. With 350 500 decided ids
+  (50 000 object DENYs plus 300 000 orphan rows) the same statements take 472–585 ms, 30.8×–68.0× a
+  superuser's — still about 4–5 % of what 1.0.0 took.
+- **Orphan DENY rows still count.** `record_permissions.record_id` carries no foreign key, so a DENY
+  row whose target object no longer exists stays in the decided set and inflates every restricted
+  statement. Pruning dangling DENY rows is the cheapest improvement available to an operator; the
+  object-list path additionally serves from the list cache, while AQL does not.
+- **The GraphQL visibility path is the most sensitive surface to a large DENY set.** It measured 4.4× a
+  superuser's statement on the 500-DENY shape (1.32 ms vs 0.30 ms) and **1499.1× (544.18 ms vs 0.36 ms)**
+  at 350 500 decided ids. It is recorded, not bounded, in this release.
+
+The technique for bounding very large DENY sets is an open product decision (BACKLOG `PERF-DENY-01`),
+not a configuration option: there is no cap, no sampling and no cross-request cache of decisions.

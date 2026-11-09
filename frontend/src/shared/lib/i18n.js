@@ -11,6 +11,11 @@ i18next.use(initReactI18next).init({
   fallbackLng: 'en',
   defaultNS: 'systemui',
   keySeparator: false,
+  // Runtime bundles are keyed by the language code exactly as the backend
+  // stores it (trimmed, lowercased, e.g. `pt-br`). Without this option
+  // i18next 26 canonicalises every lookup code (`pt-br` → `pt-BR`), so a
+  // hyphenated language silently falls back to English for the whole UI.
+  lowerCaseLng: true,
   returnEmptyString: false,
   initImmediate: false,
   interpolation: {

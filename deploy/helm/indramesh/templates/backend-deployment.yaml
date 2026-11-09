@@ -139,6 +139,20 @@ spec:
                   key: DB_PASSWORD
             - name: DB_NAME
               value: {{ .Values.postgres.database | quote }}
+            # Phase 322 (DEPL-02, D-08/D-15): the DML-only runtime identity. The
+            # role name is non-secret chart data; the password only ever comes
+            # from the Secret. An empty appUser selects the DB_USER fallback.
+            # DB_USER/DB_PASSWORD above stay: the k8s plugin-install path runs
+            # `kubectl exec ... app.plugin_system.migrate` against this pod and
+            # needs the privileged identity (D-15).
+            - name: DB_APP_USER
+              value: {{ .Values.postgres.appUser | quote }}
+            - name: DB_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: indramesh-database
+                  key: DB_APP_PASSWORD
+                  optional: true
             # Live finding (2026-09-01): Kubernetes only expands a $(VAR) reference
             # in an env value when VAR is defined EARLIER in this same env list —
             # VALKEY_PASSWORD must precede VALKEY_URL, or $(VALKEY_PASSWORD) is left

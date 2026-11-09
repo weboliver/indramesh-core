@@ -3,7 +3,8 @@ import uuid
 from typing import Awaitable, Callable, List
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, func, delete, or_, update
+from sqlalchemy import any_, cast, select, func, and_, delete, or_, update
+from sqlalchemy.dialects.postgresql import ARRAY, UUID as PGUUID
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -11,12 +12,15 @@ from sqlalchemy.orm import selectinload
 from app.models import (
     Translation, TranslationType, ObjectType, ObjectTypeAttribute,
     Language, Schema, SchemaLanguage, Status, ReferenceType,
-    AttributeType, AttributeTypeDataType, ObjectValue, UiString,
+    AttributeType, AttributeTypeDataType, Object, ObjectValue, UiString,
     ClassificationLabel,
 )
 from app.schemas.crud import TranslationUpsert
 from app.services.audit_service import audit_log, model_to_dict
 from app.services.cache_service import invalidate_entity_cache
+from app.services.record_permission_service import build_record_permission_filter
+from app.services.select_option_service import option_ids_from_structure
+from app.services.value_visibility import resolve_principal_roles
 
 # Field whitelist per translation type (D-12) — name/description for 221 types,
 # status name (LOOKUP-01), reference_type reference/description (LOOKUP-02),
@@ -800,6 +804,179 @@ async def read_translation_values(
     return out
 
 
+async def _translation_visibility_predicate(
+    db: AsyncSession,
+    user_id: str | None,
+    is_superuser: bool,
+):
+    """The ONE record-visibility predicate the translations list applies (AUTHZ-06).
+
+    Ownership mirrors ``plugin_system/translation_access._resolve_scope``: each
+    record-owned translation type resolves its owner inside the owner's OWN
+    table (``Translation.entity_id`` carries the Status / ReferenceType id,
+    never a Schema id) and is admitted through the existing record-permission
+    SQL fragments. ``systemui`` and ``classification_label`` have no record
+    owner and stay unfiltered.
+
+    Returns ``None`` when nothing has to be filtered — no principal supplied, a
+    superuser, or a principal whose four fragments are all unrestricted — so an
+    authorized caller receives exactly the rows it received before.
+
+    The fragments are SQL, never a per-row ``resolve_record_permission`` loop:
+    the same predicate object is applied to the page query AND the count query,
+    and a new DENY takes effect on the next request (no 60 s single-row cache).
+    """
+    if not user_id or is_superuser:
+        return None
+
+    role_ids = await resolve_principal_roles(db, user_id, False)
+    fragments = {
+        entity_type: await build_record_permission_filter(
+            db, user_id, entity_type, is_superuser=False, role_ids=role_ids
+        )
+        for entity_type in ("schema", "object_type", "attribute_type", "object")
+    }
+    if all(fragment is None for fragment in fragments.values()):
+        return None
+
+    schema_clause = fragments["schema"]
+    object_type_clause = fragments["object_type"]
+    attribute_type_clause = fragments["attribute_type"]
+    object_clause = fragments["object"]
+
+    type_ids: dict[str, uuid.UUID] = dict(
+        (await db.execute(select(TranslationType.code, TranslationType.id))).all()
+    )
+
+    arms = []
+
+    def _scoped(stmt, *clauses):
+        """Apply only the fragments that actually restrict (``None`` = open)."""
+        restricting = [clause for clause in clauses if clause is not None]
+        if not restricting:
+            return None
+        for clause in restricting:
+            stmt = stmt.where(clause)
+        return stmt
+
+    def _admit(code: str, owner_stmt) -> None:
+        """One type arm: the code, narrowed to a visible-owner subquery if any."""
+        type_id = type_ids.get(code)
+        if type_id is None:
+            return
+        if owner_stmt is None:
+            arms.append(Translation.translation_type_id == type_id)
+        else:
+            arms.append(and_(
+                Translation.translation_type_id == type_id,
+                Translation.entity_id.in_(owner_stmt),
+            ))
+
+    # object_type: the translation's entity IS the ObjectType.
+    _admit("object_type", _scoped(select(ObjectType.id), object_type_clause))
+
+    # object_type_attribute: owning ObjectType AND owning AttributeType.
+    _admit("object_type_attribute", _scoped(
+        select(ObjectTypeAttribute.id)
+        .join(ObjectType, ObjectTypeAttribute.object_type_id == ObjectType.id)
+        .join(AttributeType, ObjectTypeAttribute.attribute_type_id == AttributeType.id),
+        object_type_clause,
+        attribute_type_clause,
+    ))
+
+    # object_value: owning Object AND owning AttributeType.
+    _admit("object_value", _scoped(
+        select(ObjectValue.id)
+        .join(
+            ObjectTypeAttribute,
+            ObjectValue.object_type_attribute_id == ObjectTypeAttribute.id,
+        )
+        .join(AttributeType, ObjectTypeAttribute.attribute_type_id == AttributeType.id)
+        .join(Object, ObjectValue.object_id == Object.id),
+        object_clause,
+        attribute_type_clause,
+    ))
+
+    # status / reference_type: entity_id is the Status / ReferenceType id, so the
+    # owning schema is resolved inside the entity's OWN table — comparing
+    # entity_id against a Schema id would drop every row of these two types.
+    if schema_clause is None:
+        _admit("status", None)
+        _admit("reference_type", None)
+    else:
+        _admit("status", select(Status.id).where(
+            Status.schema_id.in_(select(Schema.id).where(schema_clause))
+        ))
+        # A schema-less ReferenceType has no record owner at all — never hidden.
+        _admit("reference_type", select(ReferenceType.id).where(or_(
+            ReferenceType.schema_id.is_(None),
+            ReferenceType.schema_id.in_(select(Schema.id).where(schema_clause)),
+        )))
+
+    # select_option: the option id lives inside object_type_attributes.structure
+    # (there is no row of its own), so derive the denied owners first: every
+    # scanned SELECT attribute that the visible-owner set does not contain is
+    # denied (deny wins, and no not_() SQL is involved — a NULL in the ancestor
+    # join can therefore never quietly keep a denied owner).
+    denied_option_ids: list[uuid.UUID] = []
+    if "select_option" in type_ids:
+        scanned = (await db.execute(
+            select(ObjectTypeAttribute.id, ObjectTypeAttribute.structure)
+            .join(AttributeType)
+            .where(AttributeType.data_type == AttributeTypeDataType.SELECT)
+        )).all()
+        visible_owner_stmt = _scoped(
+            select(ObjectTypeAttribute.id)
+            .join(ObjectType, ObjectTypeAttribute.object_type_id == ObjectType.id)
+            .join(AttributeType, ObjectTypeAttribute.attribute_type_id == AttributeType.id),
+            object_type_clause,
+            attribute_type_clause,
+        )
+        visible_owner_ids = (
+            {row[0] for row in scanned}
+            if visible_owner_stmt is None
+            else {row[0] for row in (await db.execute(visible_owner_stmt)).all()}
+        )
+        for owner_id, structure in scanned:
+            if owner_id in visible_owner_ids:
+                continue
+            for option in (structure or {}).get("options", []):
+                option_id = option.get("id")
+                if not option_id:
+                    continue
+                try:
+                    denied_option_ids.append(uuid.UUID(str(option_id)))
+                except (TypeError, ValueError):
+                    continue
+
+    # No record owner exists for these — always visible, never filtered (D-05).
+    _admit("select_option", None)
+    _admit("systemui", None)
+    _admit("classification_label", None)
+
+    # A code seeded after this plan keeps its previous (unfiltered) behaviour
+    # instead of disappearing for every restricted caller.
+    known_codes = {
+        "object_type", "object_type_attribute", "object_value", "status",
+        "reference_type", "select_option", "systemui", "classification_label",
+    }
+    for code, type_id in type_ids.items():
+        if code not in known_codes:
+            arms.append(Translation.translation_type_id == type_id)
+
+    if not arms:
+        return None
+
+    predicate = or_(*arms)
+    if denied_option_ids:
+        # AND over the type-arm OR, never one more OR arm: as an arm it would
+        # admit every row whose entity_id is not a denied option id.
+        predicate = and_(
+            predicate, Translation.entity_id.notin_(denied_option_ids)
+        )
+    return predicate
+
+
 async def list_translations(
     db: AsyncSession,
     translation_type: str | None = None,
@@ -808,7 +985,18 @@ async def list_translations(
     language_code: str | None = None,
     skip: int = 0,
     limit: int = 100,
+    *,
+    user_id: str | None = None,
+    is_superuser: bool = False,
 ) -> tuple[List[Translation], int]:
+    """List translations, filtered to the records the caller may read (AUTHZ-06).
+
+    ``user_id`` / ``is_superuser`` are keyword-only and default to the previous
+    behaviour (no record filter), so an existing caller keeps its rows. The
+    route supplies the principal; the composed visibility predicate is attached
+    to BOTH the page query and the count query, so ``X-Total-Count`` can never
+    keep counting denied rows.
+    """
     count_query = select(func.count()).select_from(Translation)
     query = select(Translation).options(
         selectinload(Translation.language), selectinload(Translation.translation_type)
@@ -819,6 +1007,10 @@ async def list_translations(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Translation type '{translation_type}' not found")
         query = query.where(Translation.translation_type_id == tt.id)
         count_query = count_query.where(Translation.translation_type_id == tt.id)
+    visibility = await _translation_visibility_predicate(db, user_id, is_superuser)
+    if visibility is not None:
+        query = query.where(visibility)
+        count_query = count_query.where(visibility)
     if entity_id:
         query = query.where(Translation.entity_id == entity_id)
         count_query = count_query.where(Translation.entity_id == entity_id)
@@ -1116,6 +1308,12 @@ async def delete_systemui_translation(
     return True
 
 
+def _uuid_any(ids):
+    """``= ANY`` with one array parameter: ``IN`` binds every id, and asyncpg
+    refuses a statement with more than 32,767 parameters."""
+    return any_(cast(list(ids), ARRAY(PGUUID(as_uuid=True))))
+
+
 async def delete_translations_for(
     db: AsyncSession,
     translation_type_code: str,
@@ -1134,6 +1332,150 @@ async def delete_translations_for(
     await db.execute(
         delete(Translation).where(
             Translation.translation_type_id == translation_type.id,
-            Translation.entity_id.in_(entity_ids),
+            Translation.entity_id == _uuid_any(entity_ids),
         )
     )
+
+
+async def collect_dependent_translation_ids(
+    db: AsyncSession,
+    *,
+    source_id: uuid.UUID | None = None,
+    schema_ids=(),
+    object_type_ids=(),
+    attribute_ids=(),
+    object_ids=(),
+) -> dict[str, set[uuid.UUID]]:
+    """Translation code to entity ids of everything a delete in this scope removes.
+
+    Pure read, and it must run before the delete: ``translations.entity_id`` has
+    no foreign key, so afterwards the rows that lead to the ids are gone. A
+    schema delete passes no ``source_id``, so source-level reference types stay.
+    """
+    collected: dict[str, set[uuid.UUID]] = {
+        "object_type": set(),
+        "object_type_attribute": set(),
+        "select_option": set(),
+        "object_value": set(),
+        "status": set(),
+        "reference_type": set(),
+    }
+
+    schemas = set(schema_ids)
+    if source_id is not None:
+        schemas.update(
+            (await db.execute(select(Schema.id).where(Schema.source_id == source_id))).scalars()
+        )
+
+    if schemas:
+        collected["status"].update(
+            (await db.execute(select(Status.id).where(Status.schema_id == _uuid_any(schemas)))).scalars()
+        )
+
+    reference_scope = []
+    if source_id is not None:
+        reference_scope.append(ReferenceType.source_id == source_id)
+    if schemas:
+        reference_scope.append(ReferenceType.schema_id == _uuid_any(schemas))
+    if reference_scope:
+        collected["reference_type"].update(
+            (await db.execute(select(ReferenceType.id).where(or_(*reference_scope)))).scalars()
+        )
+
+    types = set(object_type_ids)
+    if schemas:
+        types.update(
+            (
+                await db.execute(
+                    select(ObjectType.id).where(ObjectType.schema_id == _uuid_any(schemas))
+                )
+            ).scalars()
+        )
+    # parent_id is ON DELETE CASCADE and a child may live in another schema.
+    frontier = set(types)
+    while frontier:
+        children = set(
+            (
+                await db.execute(
+                    select(ObjectType.id).where(ObjectType.parent_id == _uuid_any(frontier))
+                )
+            ).scalars()
+        )
+        frontier = children - types
+        types |= frontier
+    collected["object_type"] = types
+
+    attributes = set(attribute_ids)
+    attribute_scope = []
+    if attributes:
+        attribute_scope.append(ObjectTypeAttribute.id == _uuid_any(attributes))
+    if types:
+        attribute_scope.append(ObjectTypeAttribute.object_type_id == _uuid_any(types))
+        # referenced_object_type_id is ON DELETE CASCADE too: a reference attribute
+        # of a surviving type dies with the type it points at.
+        attribute_scope.append(ObjectTypeAttribute.referenced_object_type_id == _uuid_any(types))
+    if attribute_scope:
+        rows = (
+            await db.execute(
+                select(ObjectTypeAttribute.id, ObjectTypeAttribute.structure).where(
+                    or_(*attribute_scope)
+                )
+            )
+        ).all()
+        attributes.update(row.id for row in rows)
+        for row in rows:
+            collected["select_option"].update(option_ids_from_structure(row.structure))
+    collected["object_type_attribute"] = attributes
+
+    value_scope = []
+    if object_ids:
+        value_scope.append(ObjectValue.object_id == _uuid_any(object_ids))
+    if attributes:
+        value_scope.append(ObjectValue.object_type_attribute_id == _uuid_any(attributes))
+    if types:
+        value_scope.append(Object.object_type_id == _uuid_any(types))
+    if schemas:
+        value_scope.append(Object.schema_id == _uuid_any(schemas))
+    if value_scope:
+        # Starting from translations bounds the result by what will be deleted,
+        # not by the size of the tree.
+        collected["object_value"].update(
+            (
+                await db.execute(
+                    select(Translation.entity_id)
+                    .join(TranslationType, Translation.translation_type_id == TranslationType.id)
+                    .join(ObjectValue, ObjectValue.id == Translation.entity_id)
+                    .join(Object, Object.id == ObjectValue.object_id)
+                    .where(TranslationType.code == "object_value", or_(*value_scope))
+                )
+            ).scalars()
+        )
+
+    return collected
+
+
+async def delete_dependent_translations(
+    db: AsyncSession,
+    *,
+    source_id: uuid.UUID | None = None,
+    schema_ids=(),
+    object_type_ids=(),
+    attribute_ids=(),
+    object_ids=(),
+) -> None:
+    """Delete the translations of everything a delete in this scope removes.
+
+    Runs inside the caller's transaction (no commit here) and must be called
+    before the delete. ``systemui`` and ``classification_label`` have no cascade
+    parent here, so they are never handled.
+    """
+    collected = await collect_dependent_translation_ids(
+        db,
+        source_id=source_id,
+        schema_ids=schema_ids,
+        object_type_ids=object_type_ids,
+        attribute_ids=attribute_ids,
+        object_ids=object_ids,
+    )
+    for translation_type_code, entity_ids in collected.items():
+        await delete_translations_for(db, translation_type_code, list(entity_ids))

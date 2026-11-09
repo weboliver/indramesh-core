@@ -32,6 +32,7 @@ from app.aql.parser import parse
 from app.aql.transformer import _extract_order_by
 from app.db import get_db
 from app.public_api.object_read_service import (
+    load_denied_attribute_type_ids,
     load_objects_read,
     load_visible_reference_targets,
 )
@@ -42,6 +43,7 @@ from app.public_api.object_shape import (
 )
 from app.schemas.auth import UserResponse
 from app.services.auth_service import require_public_hierarchy_read
+from app.services.value_visibility import resolve_principal_roles
 
 # This IQL search envelope is never scoped to a single ObjectType — the same
 # reason ``objectTypeId`` below is unconditionally 0 (verified against the
@@ -271,6 +273,45 @@ def validate_attributes_param(
 aql_router = APIRouter(prefix="/aql", tags=["public-aql"])
 
 
+def _filter_denied_attribute_defs(
+    assembly, denied_ids: set[uuid.UUID]
+) -> tuple[dict, dict]:
+    """Split a page assembly into DENY-filtered definition maps (D-11).
+
+    Returns ``(page_defs_by_object_id, filtered_type_defs)``, both **new** dicts
+    of **new** lists holding only the defs whose ``attribute_type_id`` is not
+    denied. A denied attribute type must be indistinguishable from a
+    non-existent one, so it must leave BOTH the per-entry attributes and the
+    top-level ``objectTypeAttributes`` (D-11); D-03's "the allow-list never
+    filters objectTypeAttributes" still holds — this is a per-caller DENY, not
+    the allow-list.
+
+    Never mutate the assembly's own lists: ``assembly.type_defs[tid]`` IS the
+    tier-cached ``schema["attribute_defs"]`` list from ``_get_type_schema``
+    (600 s, shared across callers), and ``page_objects[*].attribute_defs`` may
+    alias that very list object — an in-place edit would poison the shared
+    cache for every caller and every future request.
+    """
+    denied_str = {str(type_id) for type_id in denied_ids}
+    page_defs = {
+        object_id: [
+            definition
+            for definition in (data.attribute_defs or [])
+            if str(definition.get("attribute_type_id")) not in denied_str
+        ]
+        for object_id, data in assembly.page_objects.items()
+    }
+    type_defs = {
+        type_id: [
+            definition
+            for definition in definitions
+            if str(definition.get("attribute_type_id")) not in denied_str
+        ]
+        for type_id, definitions in assembly.type_defs.items()
+    }
+    return page_defs, type_defs
+
+
 @aql_router.get("/objects")
 async def public_aql_objects(
     qlQuery: str | None = Query(None, description="AQL query string"),
@@ -348,6 +389,40 @@ async def public_aql_objects(
                     d for d in data.attribute_defs if d["name"].lower() in keep
                 ]
 
+    # D-11: attribute-type record DENY, per caller. The filter runs HERE —
+    # after the allow-list block (which must keep seeing every known name) and
+    # BEFORE the shape builder, because ``build_object_shape`` reads
+    # ``data.attribute_defs`` and the envelope is built at the very end: a
+    # filter after the reference strip would leave the denied attribute inside
+    # the already-built ``entries``. The page's whole distinct attribute-type
+    # set is resolved ONCE through the same cache-through decision the object
+    # route uses, so a cached decision means the same thing on both surfaces.
+    envelope_type_defs = assembly.type_defs
+    if not current_user.is_superuser:
+        role_ids = await resolve_principal_roles(db, str(current_user.id), False)
+        page_attribute_type_ids: set[uuid.UUID] = set()
+        for data in assembly.page_objects.values():
+            for definition in data.attribute_defs or []:
+                raw_type_id = definition.get("attribute_type_id")
+                if not raw_type_id:
+                    continue
+                try:
+                    page_attribute_type_ids.add(uuid.UUID(str(raw_type_id)))
+                except (TypeError, ValueError):
+                    continue
+        denied_ids = await load_denied_attribute_type_ids(
+            db,
+            page_attribute_type_ids,
+            str(current_user.id),
+            is_superuser=False,
+            role_ids=role_ids,
+        )
+        page_defs, envelope_type_defs = _filter_denied_attribute_defs(
+            assembly, denied_ids
+        )
+        for object_id, definitions in page_defs.items():
+            assembly.page_objects[object_id].attribute_defs = definitions
+
     entries = [
         build_object_shape(assembly.page_objects[item_id])
         for item_id in assembly.page_objects
@@ -373,7 +448,7 @@ async def public_aql_objects(
             }
     return build_aql_envelope(
         entries=entries,
-        type_defs=assembly.type_defs,
+        type_defs=envelope_type_defs,
         ref_object_types=ref_object_types,
         total=total,
         page=page_num,

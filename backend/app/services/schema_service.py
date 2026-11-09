@@ -13,6 +13,7 @@ from app.models.index_outbox import IndexOutbox, IndexOutboxStatus
 from app.models.reference_type import ReferenceType
 from app.models.attribute_type import AttributeTypeDataType
 from app.models.status import Status, StatusCategory
+from app.public_api.objecttype_schema_cache import purge_public_objecttype_schema_cache
 from app.schemas.crud import (
     SchemaCreate,
     SchemaUpdate,
@@ -36,8 +37,8 @@ from app.services.cache_service import (
     CACHE_TTL_ENTITY,
 )
 from app.services.record_permission_service import build_record_permission_filter
-from app.services.select_option_service import ensure_option_ids, option_ids_from_structure
-from app.services.translation_service import delete_translations_for
+from app.services.select_option_service import ensure_option_ids
+from app.services.translation_service import delete_dependent_translations
 from app.db.redis import get_arq_pool
 from app.db import async_session_maker
 from app.services.audit_service import audit_log, model_to_dict
@@ -83,6 +84,41 @@ async def _enqueue_schema_index_job(schema_id: uuid.UUID, job_name: str) -> None
         )
     except Exception:
         pass
+
+
+async def enqueue_schema_search_removal(
+    schema_id: uuid.UUID, object_type_ids: List[uuid.UUID]
+) -> None:
+    """Best-effort search cleanup for a schema whose rows are already gone."""
+    # D-20: Remove each contained ObjectType's documents from the shared Schema
+    # ES index.
+    try:
+        arq_pool = await get_arq_pool()
+        for object_type_id in object_type_ids:
+            await arq_pool.enqueue_job(
+                "remove_object_type_job",
+                str(object_type_id),
+                str(schema_id),
+                _job_id=f"remove_object_type_{object_type_id}_{uuid.uuid4().hex}",
+            )
+    except Exception:
+        pass
+    # Mark any pending index outbox entries as DONE so the sweeper
+    # never re-enqueues them for a now-deleted schema
+    try:
+        async with async_session_maker() as outbox_db:
+            await outbox_db.execute(
+                update(IndexOutbox).where(
+                    IndexOutbox.object_id == schema_id,
+                    IndexOutbox.operation == "index_schema",
+                    IndexOutbox.status.in_(["PENDING", "ENQUEUED"]),
+                ).values(status=IndexOutboxStatus.DONE.value)
+            )
+            await outbox_db.commit()
+    except Exception:
+        pass
+    # D-20: Remove from Elasticsearch (best-effort)
+    await _enqueue_schema_index_job(schema_id, "remove_schema_job")
 
 
 async def create_schema(
@@ -330,6 +366,23 @@ async def update_schema(
     return schema
 
 
+async def invalidate_schema_tree_caches(object_type_ids: List[uuid.UUID]) -> None:
+    """Drop every cached read of what a schema or source delete removed."""
+    for entity_type in (
+        "schema",
+        "object_type",
+        "object_type_attribute",
+        "object",
+        "object_value",
+        "object_ref",
+        "status",
+        "reference_type",
+        "search",
+    ):
+        await invalidate_entity_cache(entity_type)
+    await purge_public_objecttype_schema_cache([str(type_id) for type_id in object_type_ids])
+
+
 async def delete_schema(db: AsyncSession, schema_id: uuid.UUID, actor_id: uuid.UUID) -> bool:
     result = await db.execute(select(Schema).where(Schema.id == schema_id))
     schema = result.scalar_one_or_none()
@@ -342,10 +395,12 @@ async def delete_schema(db: AsyncSession, schema_id: uuid.UUID, actor_id: uuid.U
         select(ObjectType).where(ObjectType.schema_id == schema_id)
     )
     object_types = ot_result.scalars().all()
-    await assert_types_deletable(db, [ot.id for ot in object_types])
+    object_type_ids = [ot.id for ot in object_types]
+    await assert_types_deletable(db, object_type_ids)
     old_values = model_to_dict(schema)
     await audit_log(db, "schemas", schema_id, "DELETE", actor_id,
                     old_values=old_values, new_values=None)
+    await delete_dependent_translations(db, schema_ids=[schema_id])
     # D-XX: delete object types in leaf-first order (children before parents) to
     # avoid the CircularDependencyError SQLAlchemy raises when a self-referential
     # parent_id (ondelete=CASCADE) makes the delete graph unorderable. The
@@ -359,17 +414,6 @@ async def delete_schema(db: AsyncSession, schema_id: uuid.UUID, actor_id: uuid.U
             )
         )
         attributes = ota_result.scalars().all()
-        # WR-01: select_option translation rows are keyed off each SELECT
-        # option's own id (not a real FK) — purge them here since this path
-        # deletes ObjectTypeAttribute rows directly rather than relying on a
-        # DB cascade, and nothing else cleans up entity_id-polymorphic rows.
-        option_ids = [
-            opt_id
-            for ota in attributes
-            for opt_id in option_ids_from_structure(ota.structure)
-        ]
-        if option_ids:
-            await delete_translations_for(db, "select_option", option_ids)
         for ota in attributes:
             await db.delete(ota)
         by_id = {ot.id: ot for ot in object_types}
@@ -385,49 +429,13 @@ async def delete_schema(db: AsyncSession, schema_id: uuid.UUID, actor_id: uuid.U
             return d
         for ot in sorted(object_types, key=depth, reverse=True):
             await db.delete(ot)
-    # D-20: Remove each contained ObjectType's documents from the shared Schema
-    # ES index (best-effort) before the Postgres cascade delete removes the rows.
-    try:
-        arq_pool = await get_arq_pool()
-        for ot in object_types:
-            await arq_pool.enqueue_job(
-                "remove_object_type_job",
-                str(ot.id),
-                str(schema_id),
-                _job_id=f"remove_object_type_{ot.id}_{uuid.uuid4().hex}",
-            )
-    except Exception:
-        pass
     # 246 D-10 lifecycle: drop the per-schema keygen SEQUENCE with the schema.
     await drop_schema_sequence(db, schema_id)
     await db.delete(schema)
     await db.commit()
-    # Mark any pending index outbox entries as DONE so the sweeper
-    # never re-enqueues them for a now-deleted schema
-    try:
-        async with async_session_maker() as outbox_db:
-            await outbox_db.execute(
-                update(IndexOutbox).where(
-                    IndexOutbox.object_id == schema_id,
-                    IndexOutbox.operation == "index_schema",
-                    IndexOutbox.status.in_(["PENDING", "ENQUEUED"]),
-                ).values(status=IndexOutboxStatus.DONE.value)
-            )
-            await outbox_db.commit()
-    except Exception:
-        pass
-    # D-20: Remove from Elasticsearch (best-effort)
-    await _enqueue_schema_index_job(schema_id, "remove_schema_job")
-    await invalidate_entity_cache("schema")
-    # 290 D-15: the cascade above removes every contained ObjectType and
-    # Object row, so their entity caches must not keep serving them (mirrors
-    # delete_object_type's own object_type invalidation). The same cascade
-    # also removes the contained ObjectValue/ObjectRef rows — invalidate those
-    # tiers too, not just object/object_type.
-    await invalidate_entity_cache("object_type")
-    await invalidate_entity_cache("object")
-    await invalidate_entity_cache("object_value")
-    await invalidate_entity_cache("object_ref")
+    await enqueue_schema_search_removal(schema_id, object_type_ids)
+    # 290 D-15: the cascade removes every contained row, so no tier may keep serving them.
+    await invalidate_schema_tree_caches(object_type_ids)
     return True
 
 
