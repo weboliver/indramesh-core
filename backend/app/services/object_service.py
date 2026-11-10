@@ -26,7 +26,11 @@ from app.services.classification_service import (
     classification_kwargs,
     set_labels,
 )
-from app.services.translation_service import resolve_translations, delete_translations_for
+from app.services.translation_service import (
+    resolve_translations,
+    delete_dependent_translations,
+    delete_translations_for,
+)
 from app.services.cache_service import (
     build_cache_key,
     build_list_cache_key,
@@ -37,8 +41,8 @@ from app.services.cache_service import (
     CACHE_TTL_LIST,
     CACHE_TTL_ENTITY,
 )
-from app.services.record_permission_service import build_record_permission_filter, _batch_check_has_deny_record_permission, _batch_check_has_record_permission
-from app.services.object_type_service import get_descendant_type_ids, resolve_ancestor_ota_by_name
+from app.services.record_permission_service import build_record_permission_filter, _batch_check_has_deny_record_permission, _batch_check_has_record_permission, delete_dependent_record_permissions
+from app.services.object_type_service import resolve_ancestor_ota_by_name
 from app.services.value_lock_service import (
     assert_types_deletable,
     assert_value_writable,
@@ -601,6 +605,40 @@ async def list_objects(
     is_superuser: bool = False,
     lang: str | None = None,  # V-06 name resolution (224-04)
 ) -> tuple[List[Object], int]:
+    # The list cache is keyed by the call's arguments only, so the key is built
+    # and read before any database work: a hit costs no statement at all (no
+    # descendant probe, no filter pre-fetch, no role lookup, no record filter).
+    filter_tree_json = json.dumps(filter_tree, sort_keys=True) if filter_tree else None
+    pk_filter_hash = None
+    if pk_filter is not None:
+        pk_filter_hash = hashlib.md5(
+            str(sorted([str(pid) for pid in pk_filter])).encode()
+        ).hexdigest()
+    object_type_ids_key = (
+        ",".join(sorted(str(t) for t in object_type_ids)) if object_type_ids else None
+    )
+    cache_key = build_list_cache_key(
+        "object", skip=skip, limit=limit,
+        object_type_id=object_type_id, object_type_ids=object_type_ids_key,
+        schema_id=schema_id, q=q,
+        attr_filters=json.dumps(attr_filters, sort_keys=True) if attr_filters and not filter_tree else None,
+        filter_tree=filter_tree_json,
+        pk_filter=pk_filter_hash,  # NEW — separates ES-narrowed from unnarrowed cache keys
+        sort_by=sort_by,
+        sort_order=sort_order,
+        user_role=user_role,  # NEW per D-11
+        user_id=user_id,
+        lang=lang,  # 224-04: lang partitions the list cache per language (MULTI-06 pattern)
+    )
+    cached = await get_cached(cache_key)
+    if cached is not None:
+        cached_items = cached.get("items") if isinstance(cached, dict) else None
+        if isinstance(cached_items, list) and all(
+            isinstance(item, dict) and isinstance(item.get("classification_labels"), list)
+            for item in cached_items
+        ):
+            return cached["items"], cached["total"]
+
     query = select(Object)
     count_query = select(func.count()).select_from(Object)
     if schema_id:
@@ -624,23 +662,18 @@ async def list_objects(
         query = query.where(Object.object_type_id.in_(object_type_ids))
         count_query = count_query.where(Object.object_type_id.in_(object_type_ids))
     elif object_type_id:
-        # D-01: exact-type-only scoping is the base rule.
+        # D-01: exact-type-only scoping — the equality already excludes every
+        # descendant type id, so no separate descendant lookup is needed.
         query = query.where(Object.object_type_id == object_type_id)
         count_query = count_query.where(Object.object_type_id == object_type_id)
-        # D-02/D-03: if the requested type has descendants, exclude them explicitly
-        # via a cycle-safe recursive CTE (mirrors object_type_service.is_ancestor).
-        # The EXISTS pre-check inside get_descendant_type_ids makes leaf types
-        # skip the CTE entirely (early-exit), so this is cheap for the common case.
-        descendant_ids = await get_descendant_type_ids(db, object_type_id)
-        if descendant_ids:
-            query = query.where(Object.object_type_id.notin_(descendant_ids))
-            count_query = count_query.where(Object.object_type_id.notin_(descendant_ids))
     if q:
         query = query.where(Object.name.ilike(f"%{q}%"))
         count_query = count_query.where(Object.name.ilike(f"%{q}%"))
     if filter_tree:
         from app.services.filter_utils import evaluate_filter_tree
-        tree_clause = await evaluate_filter_tree(filter_tree, db)
+        tree_clause = await evaluate_filter_tree(
+            filter_tree, db, user_id=user_id, is_superuser=is_superuser
+        )
         if tree_clause is not None:
             query = query.where(tree_clause)
             count_query = count_query.where(tree_clause)
@@ -654,14 +687,34 @@ async def list_objects(
             except ValueError:
                 pass
 
-        # Batch-load all OTAs with their AttributeTypes in one query
+        # Batch-load all OTAs with their AttributeTypes in one query.
+        # D-18 / TRI317-68: a name whose AttributeType carries a record DENY for
+        # this caller, or whose OTA row is hidden, must be indistinguishable
+        # from a name that does not exist — otherwise the object set answers
+        # questions about data the caller may not read. The predicate rides the
+        # one pre-fetch statement (a join plus its clauses), so a denied or
+        # hidden id never enters attr_lookup and falls into the existing
+        # `if attr_id not in attr_lookup: continue` below, exactly like an
+        # unknown id. No per-condition lookup, no post-query Python filtering.
         attr_lookup = {}  # attr_id → (ObjectTypeAttribute, AttributeType)
         if unique_attr_ids:
-            result = await db.execute(
+            ota_statement = (
                 select(ObjectTypeAttribute)
                 .options(selectinload(ObjectTypeAttribute.attribute_type))
                 .where(ObjectTypeAttribute.id.in_(unique_attr_ids))
             )
+            if user_id is not None and not is_superuser:
+                from app.services.value_visibility import (
+                    visible_attribute_conditions,
+                )
+
+                ota_statement = ota_statement.join(
+                    AttributeType,
+                    ObjectTypeAttribute.attribute_type_id == AttributeType.id,
+                ).where(
+                    *await visible_attribute_conditions(db, user_id, False)
+                )
+            result = await db.execute(ota_statement)
             for attr in result.scalars():
                 attr_lookup[attr.id] = (attr, attr.attribute_type)
 
@@ -775,36 +828,6 @@ async def list_objects(
         query = query.order_by(sort_column.desc())
     else:
         query = query.order_by(sort_column.asc())
-    filter_tree_json = json.dumps(filter_tree, sort_keys=True) if filter_tree else None
-    pk_filter_hash = None
-    if pk_filter is not None:
-        pk_filter_hash = hashlib.md5(
-            str(sorted([str(pid) for pid in pk_filter])).encode()
-        ).hexdigest()
-    object_type_ids_key = (
-        ",".join(sorted(str(t) for t in object_type_ids)) if object_type_ids else None
-    )
-    cache_key = build_list_cache_key(
-        "object", skip=skip, limit=limit,
-        object_type_id=object_type_id, object_type_ids=object_type_ids_key,
-        schema_id=schema_id, q=q,
-        attr_filters=json.dumps(attr_filters, sort_keys=True) if attr_filters and not filter_tree else None,
-        filter_tree=filter_tree_json,
-        pk_filter=pk_filter_hash,  # NEW — separates ES-narrowed from unnarrowed cache keys
-        sort_by=sort_by,
-        sort_order=sort_order,
-        user_role=user_role,  # NEW per D-11
-        user_id=user_id,
-        lang=lang,  # 224-04: lang partitions the list cache per language (MULTI-06 pattern)
-    )
-    cached = await get_cached(cache_key)
-    if cached is not None:
-        cached_items = cached.get("items") if isinstance(cached, dict) else None
-        if isinstance(cached_items, list) and all(
-            isinstance(item, dict) and isinstance(item.get("classification_labels"), list)
-            for item in cached_items
-        ):
-            return cached["items"], cached["total"]
     count_result = await db.execute(count_query)
     total = count_result.scalar()
     result = await db.execute(query.offset(skip).limit(limit))
@@ -1316,6 +1339,8 @@ async def delete_object(
         actor_id=actor_id,
         origin=effective_origin.as_payload(),
     )
+    await delete_dependent_translations(db, object_ids=[object_id])
+    await delete_dependent_record_permissions(db, object_ids=[object_id])
     storage_keys = [f.storage_key for f in obj.files]  # capture before deletion — rows vanish with the CASCADE
     outbox_entry = _new_outbox_entry(
         object_id, obj_type_id, "remove", schema_id=obj_schema_id,
@@ -1342,5 +1367,7 @@ async def delete_object(
         schema_id=str(obj_schema_id),
     )
     await invalidate_entity_cache("object")
+    await invalidate_entity_cache("object_value")
+    await invalidate_entity_cache("object_ref")
     await invalidate_entity_cache("search")
     return True

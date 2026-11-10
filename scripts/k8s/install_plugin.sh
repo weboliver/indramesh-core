@@ -32,14 +32,21 @@
 #      and validate it under the loader's own character class (T-282-04)
 #   5. verify the declared api_version against the DEPLOYED backend, which runs
 #      the Core's own rule — before any destination or copy work (D-13)
-#   6. preflight the destination: cluster reachable, claim slot free
+#   6. preflight the destination: cluster reachable, then the update decision
+#      from the installed plugin.toml — a higher version replaces, the same one
+#      is a no-op, a lower one is refused, and a destination without a readable
+#      three-part version (for example a directory created by hand) is refused
 #   7. discover the CURRENTLY DEPLOYED backend image (never a hardcoded tag) and
 #      render the disposable copy-Pod from it; apply it, wait for Running
-#      (bounded), `kubectl cp` the STAGED tree in, delete the Pod
+#      (bounded). Inside that Pod: drop `<name>.new`, `kubectl cp` the STAGED
+#      tree to `<name>.new`, move `<name>` to `<name>.old`, move `<name>.new` to
+#      `<name>`. `<name>.old` marks an unfinished update and is only removed at
+#      the very end
 #   8. run the plugin migration runner in the live backend pod (k8s never
 #      self-migrates, unlike Compose's start.sh) — BEFORE the restart, so one
 #      restart suffices
 #   9. rollout restart backend + worker, wait for both bounded
+#  10. remove `<name>.old` inside the copy Pod, then delete the Pod
 set -euo pipefail
 
 usage() {
@@ -119,6 +126,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The private tmpdir holds the rendered copy-Pod manifest AND the installed
+# plugin.toml read off the claim for the version decision below.
+TMP_DIR="$(mktemp -d)"
+
 # ---------------------------------------------------------------------------
 # Acquisition and staging (shared helper), in the fixed order.
 # ---------------------------------------------------------------------------
@@ -152,45 +163,120 @@ step "install_plugin: verifying the plugin API version against the deployed back
 DECLARED_API="$(plugin_manifest_api_version "$STAGED_DIR")" || exit 1
 plugin_verify_api_k8s "$DECLARED_API" || exit 1
 
-step "install_plugin: checking the destination is free"
+step "install_plugin: checking the installed version"
 if kubectl_indramesh get pod "$COPY_POD_NAME" -n "$NAMESPACE_NAME" >/dev/null 2>&1; then
   step "install_plugin: removing a leftover copy Pod from a previous run"
   kubectl_indramesh delete pod "$COPY_POD_NAME" -n "$NAMESPACE_NAME" --wait=true >/dev/null 2>&1 || true
 fi
-if kubectl_indramesh exec -n "$NAMESPACE_NAME" deploy/indramesh-backend -- \
-    test -e "/opt/indramesh/plugins/$NAME" 2>/dev/null; then
-  die "install_plugin" "/opt/indramesh/plugins/$NAME already exists on the claim — remove it deliberately first if you mean to replace it (this script never overwrites)"
+
+DEST_PATH="/opt/indramesh/plugins/$NAME"
+DEST_EXISTS=0
+DEST_OLD_EXISTS=0
+DEST_NEW_EXISTS=0
+kubectl_indramesh exec -n "$NAMESPACE_NAME" deploy/indramesh-backend -- \
+  test -e "$DEST_PATH" 2>/dev/null && DEST_EXISTS=1 || true
+kubectl_indramesh exec -n "$NAMESPACE_NAME" deploy/indramesh-backend -- \
+  test -e "$DEST_PATH.old" 2>/dev/null && DEST_OLD_EXISTS=1 || true
+kubectl_indramesh exec -n "$NAMESPACE_NAME" deploy/indramesh-backend -- \
+  test -e "$DEST_PATH.new" 2>/dev/null && DEST_NEW_EXISTS=1 || true
+
+IS_INSTALL=0
+IS_UPDATE=0
+RESUME_UPDATE=0
+CLEAN_STAGING_ONLY=0
+if [ "$DEST_EXISTS" = 1 ]; then
+  mkdir -p "$TMP_DIR/installed"
+  if ! kubectl_indramesh exec -n "$NAMESPACE_NAME" deploy/indramesh-backend -- \
+      cat "$DEST_PATH/plugin.toml" > "$TMP_DIR/installed/plugin.toml" 2>/dev/null \
+      || [ ! -s "$TMP_DIR/installed/plugin.toml" ]; then
+    die "install_plugin" "$DEST_PATH already exists on the claim but carries no readable three-part version in its plugin.toml — refusing to replace a directory this script did not install (remove it deliberately first if you mean to replace it)"
+  fi
+  INSTALLED_VERSION="$(plugin_manifest_version "$TMP_DIR/installed")" \
+    || die "install_plugin" "$DEST_PATH already exists on the claim but carries no readable three-part version in its plugin.toml — refusing to replace a directory this script did not install (remove it deliberately first if you mean to replace it)"
+  NEW_VERSION="$(plugin_manifest_version "$STAGED_DIR")" || exit 1
+  ACTION="$(plugin_update_action "$INSTALLED_VERSION" "$NEW_VERSION")" || exit 1
+  case "$ACTION" in
+    refuse)
+      die "install_plugin" "$DEST_PATH is at version $INSTALLED_VERSION and the source carries $NEW_VERSION — refusing a downgrade (plugin migrations only run forward)"
+      ;;
+    same)
+      if [ "$DEST_OLD_EXISTS" = 0 ] && [ "$DEST_NEW_EXISTS" = 0 ]; then
+        step "install_plugin: $NAME is already at version $NEW_VERSION — nothing to do"
+        echo "  The installed plugin is unchanged: no copy, no migration and no rollout was performed."
+        exit 0
+      fi
+      if [ "$DEST_OLD_EXISTS" = 1 ]; then
+        step "install_plugin: resuming an unfinished update of $NAME to version $NEW_VERSION"
+        RESUME_UPDATE=1
+      else
+        step "install_plugin: removing a leftover staging directory from an interrupted copy"
+        CLEAN_STAGING_ONLY=1
+      fi
+      ;;
+    replace)
+      step "install_plugin: updating $NAME from version $INSTALLED_VERSION to $NEW_VERSION"
+      IS_UPDATE=1
+      ;;
+  esac
+else
+  IS_INSTALL=1
 fi
 
-step "install_plugin: discovering the currently deployed backend image"
-BACKEND_IMAGE="$(kubectl_indramesh get deployment indramesh-backend -n "$NAMESPACE_NAME" \
-  -o jsonpath='{.spec.template.spec.containers[0].image}')"
-[ -n "$BACKEND_IMAGE" ] || die "install_plugin" "could not read the deployed backend image — is the release healthy?"
-step "install_plugin: using $BACKEND_IMAGE (guaranteed restricted-PSA-compatible: the same image backend/worker already run under)"
+# A pure no-op never starts a copy Pod: every write goes through it, so there is
+# nothing to do without one.
+if [ "$IS_INSTALL" = 1 ] || [ "$IS_UPDATE" = 1 ] || [ "$RESUME_UPDATE" = 1 ] || [ "$CLEAN_STAGING_ONLY" = 1 ]; then
+  step "install_plugin: discovering the currently deployed backend image"
+  BACKEND_IMAGE="$(kubectl_indramesh get deployment indramesh-backend -n "$NAMESPACE_NAME" \
+    -o jsonpath='{.spec.template.spec.containers[0].image}')"
+  [ -n "$BACKEND_IMAGE" ] || die "install_plugin" "could not read the deployed backend image — is the release healthy?"
+  step "install_plugin: using $BACKEND_IMAGE (guaranteed restricted-PSA-compatible: the same image backend/worker already run under)"
 
-TMP_DIR="$(mktemp -d)"
-RENDERED_POD_MANIFEST="$TMP_DIR/plugin-copy-pod.yaml"
-sed "s#__IMAGE__#$BACKEND_IMAGE#" "$COPY_POD_MANIFEST" > "$RENDERED_POD_MANIFEST"
+  RENDERED_POD_MANIFEST="$TMP_DIR/plugin-copy-pod.yaml"
+  sed "s#__IMAGE__#$BACKEND_IMAGE#" "$COPY_POD_MANIFEST" > "$RENDERED_POD_MANIFEST"
 
-step "install_plugin: applying the disposable writable copy Pod"
-kubectl_indramesh apply -f "$RENDERED_POD_MANIFEST" || exit 1
+  step "install_plugin: applying the disposable writable copy Pod"
+  kubectl_indramesh apply -f "$RENDERED_POD_MANIFEST" || exit 1
 
-step "install_plugin: waiting for the copy Pod to be Running (bounded $COPY_POD_TIMEOUT)"
-if ! kubectl_indramesh wait --for=jsonpath='{.status.phase}'=Running "pod/$COPY_POD_NAME" \
-    -n "$NAMESPACE_NAME" --timeout="$COPY_POD_TIMEOUT"; then
-  preflight_error "install_plugin: copy Pod never reached Running — see events below"
-  kubectl_indramesh describe pod "$COPY_POD_NAME" -n "$NAMESPACE_NAME" >&2 || true
-  exit 1
+  step "install_plugin: waiting for the copy Pod to be Running (bounded $COPY_POD_TIMEOUT)"
+  if ! kubectl_indramesh wait --for=jsonpath='{.status.phase}'=Running "pod/$COPY_POD_NAME" \
+      -n "$NAMESPACE_NAME" --timeout="$COPY_POD_TIMEOUT"; then
+    preflight_error "install_plugin: copy Pod never reached Running — see events below"
+    kubectl_indramesh describe pod "$COPY_POD_NAME" -n "$NAMESPACE_NAME" >&2 || true
+    exit 1
+  fi
+
+  if [ "$IS_INSTALL" = 1 ] || [ "$IS_UPDATE" = 1 ]; then
+    # The STAGED tree (shared helper), never the source as found: the exclusion
+    # pass is what keeps version-control and CI metadata off the claim (D-12).
+    # It lands in `<name>.new`, so a half-written tree is never a plugin.
+    step "install_plugin: copying the staged plugin to plugins-storage:$DEST_PATH.new"
+    kubectl_indramesh exec -n "$NAMESPACE_NAME" "$COPY_POD_NAME" -- rm -rf "$DEST_PATH.new" \
+      || die "install_plugin" "could not clear the staging directory $DEST_PATH.new in the copy Pod"
+    kubectl_indramesh cp "$STAGED_DIR" "$NAMESPACE_NAME/$COPY_POD_NAME:$DEST_PATH.new" \
+      || die "install_plugin" "kubectl cp failed — the copy Pod's logs/events may explain why"
+    if [ "$IS_INSTALL" = 0 ]; then
+      kubectl_indramesh exec -n "$NAMESPACE_NAME" "$COPY_POD_NAME" -- rm -rf "$DEST_PATH.old" \
+        || die "install_plugin" "could not clear the previous update marker $DEST_PATH.old in the copy Pod"
+      kubectl_indramesh exec -n "$NAMESPACE_NAME" "$COPY_POD_NAME" -- mv "$DEST_PATH" "$DEST_PATH.old" \
+        || die "install_plugin" "could not move $DEST_PATH aside to $DEST_PATH.old in the copy Pod"
+    fi
+    kubectl_indramesh exec -n "$NAMESPACE_NAME" "$COPY_POD_NAME" -- mv "$DEST_PATH.new" "$DEST_PATH" \
+      || die "install_plugin" "could not move $DEST_PATH.new into place in the copy Pod"
+  else
+    # Resuming (or cleaning up) leaves a stray staging directory behind; the
+    # installed tree itself is already the new version.
+    kubectl_indramesh exec -n "$NAMESPACE_NAME" "$COPY_POD_NAME" -- rm -rf "$DEST_PATH.new" \
+      || die "install_plugin" "could not clear the leftover staging directory $DEST_PATH.new in the copy Pod"
+  fi
 fi
 
-# The STAGED tree (shared helper), never the source as found: the exclusion pass
-# is what keeps version-control and CI metadata off the claim (D-12).
-step "install_plugin: copying the staged plugin to plugins-storage:/opt/indramesh/plugins/$NAME"
-kubectl_indramesh cp "$STAGED_DIR" "$NAMESPACE_NAME/$COPY_POD_NAME:/opt/indramesh/plugins/$NAME" \
-  || die "install_plugin" "kubectl cp failed — the copy Pod's logs/events may explain why"
-
-step "install_plugin: removing the copy Pod"
-kubectl_indramesh delete pod "$COPY_POD_NAME" -n "$NAMESPACE_NAME" --wait=false >/dev/null 2>&1 || true
+if [ "$CLEAN_STAGING_ONLY" = 1 ]; then
+  step "install_plugin: removing the copy Pod"
+  kubectl_indramesh delete pod "$COPY_POD_NAME" -n "$NAMESPACE_NAME" --wait=false >/dev/null 2>&1 || true
+  step "install_plugin: done — check the Plugins admin page"
+  echo "  $NAME was already at version $NEW_VERSION; only a leftover staging directory was removed."
+  exit 0
+fi
 
 # 2026-09-22 finding: unlike Compose (backend/start.sh runs `alembic upgrade
 # head && python -m app.plugin_system.migrate` on EVERY container start, so a
@@ -227,6 +313,17 @@ step "install_plugin: restarting the worker so its registry re-scans the migrate
 kubectl_indramesh rollout restart deployment/indramesh-worker -n "$NAMESPACE_NAME"
 kubectl_indramesh rollout status deployment/indramesh-worker -n "$NAMESPACE_NAME" --timeout="$ROLLOUT_TIMEOUT" \
   || die "install_plugin" "worker rollout did not complete in time"
+
+# The update marker goes last: while `<name>.old` exists the update is not
+# finished, so a rerun after an abort at any earlier step finishes it instead of
+# reporting "nothing to do". The copy Pod is still Running and holds the only
+# writable mount of the claim; it is deleted immediately afterwards.
+step "install_plugin: removing the update marker $DEST_PATH.old"
+kubectl_indramesh exec -n "$NAMESPACE_NAME" "$COPY_POD_NAME" -- rm -rf "$DEST_PATH.old" \
+  || die "install_plugin" "could not remove the update marker $DEST_PATH.old in the copy Pod — the update is unfinished; rerun the same command"
+
+step "install_plugin: removing the copy Pod"
+kubectl_indramesh delete pod "$COPY_POD_NAME" -n "$NAMESPACE_NAME" --wait=false >/dev/null 2>&1 || true
 
 step "install_plugin: done — check the Plugins admin page, or:"
 echo "  KUBECONFIG=\$HOME/.kube/config kubectl exec -n $NAMESPACE_NAME deploy/indramesh-backend -- curl -s http://localhost:8000/api/v1/plugins/$NAME"

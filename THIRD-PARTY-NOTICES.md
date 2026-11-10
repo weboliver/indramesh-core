@@ -46,9 +46,9 @@ version can move without a change to the declared set.
 | bcrypt | 4.3.0 | Apache-2.0 |
 | bleach | 6.4.0 | Apache-2.0 |
 | cron_descriptor | 2.1.0 | MIT |
-| cryptography | 49.0.0 | Apache-2.0 OR BSD-3-Clause |
+| cryptography | 50.0.2 | Apache-2.0 OR BSD-3-Clause |
 | fastapi | 0.141.1 | MIT |
-| graphql-core | 3.3.0 | MIT |
+| graphql-core | 3.3.1 | MIT |
 | httpx | 0.28.1 | BSD-3-Clause |
 | instructor | 1.15.4 | MIT |
 | jsonschema | 4.26.0 | MIT |
@@ -57,11 +57,10 @@ version can move without a change to the declared set.
 | opensearch-py | 3.2.0 | Apache-2.0 |
 | prometheus-fastapi-instrumentator | 8.1.0 | ISC |
 | psycopg2-binary | 2.9.12 | LGPL with exceptions |
-| pyasn1 | 0.6.4 | BSD-2-Clause |
 | pydantic | 2.13.4 | MIT |
 | pydantic-settings | 2.14.2 | MIT |
+| PyJWT | 2.15.1 | MIT |
 | python-dotenv | 1.2.2 | BSD-3-Clause |
-| python-jose | 3.5.0 | MIT |
 | python-multipart | 0.0.32 | Apache-2.0 |
 | pytz | 2026.3.post1 | MIT |
 | redis | 5.3.1 | MIT |
@@ -83,14 +82,14 @@ The direct production dependencies declared in the `dependencies` section of
 | @dagrejs/dagre | 3.1.0 | MIT |
 | @tanstack/react-query | 5.101.4 | MIT |
 | @xyflow/react | 12.11.2 | MIT |
-| axios | 1.19.0 (declared: ^1.16.1) | MIT |
+| axios | 1.20.0 | MIT |
 | clsx | 2.1.1 | MIT |
-| dompurify | 3.4.15 | MPL-2.0 OR Apache-2.0 |
+| dompurify | 3.4.17 | MPL-2.0 OR Apache-2.0 |
 | fuse.js | 7.4.2 | Apache-2.0 |
 | graphql | 16.14.2 (declared: ^16.9.0) | MIT |
 | i18next | 26.3.6 | MIT |
 | lucide-react | 1.28.0 | ISC |
-| markdown-it | 15.0.2 | MIT |
+| markdown-it | 15.0.3 | MIT |
 | react | 19.2.8 | MIT |
 | react-colorful | 5.7.0 | MIT |
 | react-day-picker | 10.0.1 | MIT |
@@ -110,12 +109,11 @@ Compose image cannot reach the published tree with a guessed license.
 
 | Image | License |
 |---|---|
-| valkey/valkey:9.1.1-alpine | BSD-3-Clause |
 | nginx:1.30.6-alpine | BSD-2-Clause |
-| grafana/loki:3.7.8 | AGPL-3.0 |
-| grafana/alloy:v1.20.1 | Apache-2.0 |
+| grafana/loki:3.7.9 | AGPL-3.0 |
+| grafana/alloy:v1.21.3 | Apache-2.0 |
 | ghcr.io/tecnativa/docker-socket-proxy:v0.5.0 | Apache-2.0 |
-| grafana/grafana:13.2.3 | AGPL-3.0 |
+| grafana/grafana:13.2.5 | AGPL-3.0 |
 
 ## Own stateful images from this repository
 
@@ -141,6 +139,13 @@ image:
 | Component | Version (pinned) | License |
 |---|---|---|
 | OpenSearch | 3.9.0 (`opensearchproject/opensearch:3.9.0` base image) | Apache-2.0 |
+
+`indramesh-stateful-valkey` — the wrapper only applies the Alpine package updates and makes
+`/data` group-writable for an arbitrary-UID pod; the server itself is the upstream image:
+
+| Component | Version (pinned) | License |
+|---|---|---|
+| Valkey | 9.1.1 (`valkey/valkey:9.1.1-alpine` base image) | BSD-3-Clause |
 
 ## Kubernetes Deployment Infrastructure
 

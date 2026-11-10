@@ -12,7 +12,11 @@
 # argv); an existing Secret whose data matches the .env material is a no-op;
 # a mismatch fails non-zero naming only the Secret/key boundary — never
 # values, encoded values, or digests — and requires an explicit operator
-# rotation; a normal rerun NEVER overwrites an existing Secret. Only
+# rotation; a normal rerun NEVER overwrites an existing Secret. A key the
+# Secret lacks (a credential a later release added to its group, e.g.
+# DB_APP_PASSWORD in Phase 322 D-03) is appended through ONE private merge
+# patch that carries only those missing keys — existing values are never
+# touched and a run that refuses a rotation writes nothing. Only
 # sensitive keys (passwords, JWT/Fernet keys, admin/API credentials) become
 # Secret data; URLs, ports, and feature flags stay non-secret chart
 # configuration (D-08).
@@ -69,11 +73,16 @@ _K8S_SECRETS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the database secret because both Helm migration Jobs read it via an optional
 # secretKeyRef from indramesh-database. The non-secret PLUGIN_DB_USER is
 # deliberately NOT here — it is the chart value plugins.dbUser, empty by default
-# (D-08); setting it activates the boundary. A Secret that predates this key is
-# reported as MISSING the key (not as a rotation) so the operator extends it
-# explicitly; see docs/CONFIGURATION.md for the plugin-role credentials.
+# (D-08); setting it activates the boundary. A Secret that predates a key is
+# extended with exactly the missing key (Phase 322 D-03 additive merge), so a
+# 1.0.0 upgrade needs no manual kubectl patch; see docs/CONFIGURATION.md for the
+# plugin-role credentials.
+#
+# Phase 322 (D-03): DB_APP_PASSWORD joins the database group so the k3s
+# application role reaches every workload through the same secretKeyRef chain.
+# An existing indramesh-database Secret gains ONLY that key.
 SECRET_GROUPS=(
-  "indramesh-database|POSTGRES_PASSWORD:DB_PASSWORD DB_PASSWORD PLUGIN_DB_PASSWORD"
+  "indramesh-database|POSTGRES_PASSWORD:DB_PASSWORD DB_PASSWORD PLUGIN_DB_PASSWORD DB_APP_PASSWORD"
   "indramesh-valkey|VALKEY_PASSWORD"
   "indramesh-opensearch|OPENSEARCH_PASSWORD"
   "indramesh-backend-auth|JWT_SECRET_KEY FERNET_KEY ADMIN_PASSWORD"
@@ -160,6 +169,34 @@ _secret_data_key() {  # _secret_data_key <name> <namespace> <key> — echo the b
   _kubectl_indramesh get secret "$1" -n "$2" -o "jsonpath={.data['$escaped']}" 2>/dev/null || true
 }
 
+_merge_missing_secret_keys() {  # _merge_missing_secret_keys <secret> <namespace> <dir> <key...>
+  # Phase 322 D-03: append ONLY the named keys to an existing Secret through one
+  # JSON merge patch. The patch file holds base64 values and is written under the
+  # private 0600 workspace, so no value ever reaches argv or the command log
+  # (T-322-04). The caller has already compared every existing key, so a refused
+  # rotation reaches this function with nothing to write.
+  local name="$1" ns="$2" dir="$3"
+  shift 3
+  local patch_file="$dir/missing-keys-patch.json" key first=1
+  {
+    printf '{"data":{'
+    for key in "$@"; do
+      [ "$first" -eq 1 ] || printf ','
+      first=0
+      printf '"%s":"%s"' "$key" "$(base64 -w0 < "$dir/$key")"
+    done
+    printf '}}\n'
+  } > "$patch_file"
+  chmod 600 "$patch_file"
+  if ! _kubectl_indramesh patch secret "$name" -n "$ns" --type=merge --patch-file "$patch_file" >/dev/null; then
+    rm -f "$patch_file"
+    preflight_error "secret '$name' could not be extended with the missing key(s) — the merge patch failed; inspect the Secret and rerun (D-03)"
+    return 1
+  fi
+  rm -f "$patch_file"
+  return 0
+}
+
 reconcile_secret_group() {  # reconcile_secret_group <secret> <namespace> <env_file> <tmp_dir> <key[:source]...>
   # Compare-before-create for one split Secret (D-07). Writes each desired
   # value to a private 0600 file under <tmp_dir>, creates the Secret with
@@ -219,25 +256,34 @@ reconcile_secret_group() {  # reconcile_secret_group <secret> <namespace> <env_f
     # Iterate the RESOLVED Secret keys, never the raw table tokens
     # (T-308.2-05): a '<key>:<source>' token names no file, so the [ -f ]
     # guard would skip it and a real mismatch would pass silently.
+    local -a missing_keys=()
     for key in "${resolved_keys[@]}"; do
       [ -f "$dir/$key" ] || continue
       enc="$(base64 -w0 < "$dir/$key")"
       existing="$(_secret_data_key "$name" "$ns" "$key")"
-      # WR-04: an ABSENT key is not rotation. A Secret that predates a newly
-      # configured credential (e.g. PLUGIN_DB_PASSWORD on a Phase 287.1 upgrade)
-      # must be extended explicitly, not "rotated" — the old message sent the
-      # operator down the wrong path. Still fail closed: a rerun never
-      # overwrites an existing Secret (D-07).
+      # WR-04 + Phase 322 D-03: an ABSENT key is not rotation. A Secret that
+      # predates a newly configured credential (PLUGIN_DB_PASSWORD on a 287.1
+      # upgrade, DB_APP_PASSWORD on the 1.0.0 -> 1.0.1 upgrade) gains exactly
+      # that key through the additive merge patch applied after this loop — no
+      # manual kubectl patch, and no existing value is ever overwritten.
       if [ -z "$existing" ]; then
-        preflight_error "secret '$name' is missing key '$key' that .env now provides — add the key explicitly (a rerun never overwrites an existing Secret, D-07); see the plugin-role credentials in docs/CONFIGURATION.md"
-        return 1
+        missing_keys+=("$key")
+        continue
       fi
+      # A differing existing value IS a rotation and stays a deliberate
+      # operator action (D-07). The branch returns before anything is written,
+      # so a refused rotation changes nothing in the cluster.
       if [ "$existing" != "$enc" ]; then
         preflight_error "secret '$name' key '$key' differs from .env — rotation requires an explicit operator action; a rerun never overwrites it (D-07)"
         return 1
       fi
     done
-    step "secrets: '$name' matches .env material — no change (D-07)"
+    if [ "${#missing_keys[@]}" -gt 0 ]; then
+      _merge_missing_secret_keys "$name" "$ns" "$dir" "${missing_keys[@]}" || return 1
+      step "secrets: '$name' gained missing key(s) ${missing_keys[*]} from .env material — existing values untouched (D-03)"
+    else
+      step "secrets: '$name' matches .env material — no change (D-07)"
+    fi
   else
     step "secrets: creating '$name' from .env material (D-05, D-06)"
     _kubectl_indramesh create secret generic "$name" -n "$ns" "${from_args[@]}" >/dev/null || return 1

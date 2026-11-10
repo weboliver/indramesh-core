@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 
 from graphql import (
     DocumentNode,
@@ -163,68 +165,222 @@ def _is_statement_timeout(exc: object) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class FragmentGraph:
+    """One document's fragments, prepared once for every limit axis.
+
+    ``fragments`` maps a fragment name to its definition, ``spreads`` to the
+    fragment names it spreads (inline-fragment nesting collected, unknown names
+    kept verbatim), ``order`` is a dependency order — every spread target before
+    its user, cycle members excluded — and ``cyclic`` is the EXACT set of
+    fragments that participate in a spread cycle. ``document`` is the parsed
+    document the graph was built from: the cost fold needs it to build the
+    per-fragment ``ValidationContext``.
+
+    The graph carries no module-level state: it is built per document and
+    discarded with it, so one request's fragment values are never observable by
+    another (TRI317-66).
+    """
+
+    fragments: Mapping[str, FragmentDefinitionNode]
+    spreads: Mapping[str, tuple[str, ...]]
+    order: tuple[str, ...]
+    cyclic: frozenset[str]
+    document: DocumentNode
+
+
+def prepare_fragment_graph(document_ast: DocumentNode) -> FragmentGraph:
+    """Build the shared dependency-order fragment graph in one pass (TRI317-64).
+
+    Both halves are iterative with explicit stacks, never recursive: the whole
+    point is that a long chain of single spreads costs one pass and cannot
+    exhaust the interpreter stack. ``cyclic`` is computed from the strongly
+    connected components (size > 1, plus every self-spreading fragment) — NOT
+    as "left unplaced by Kahn", because Kahn also leaves every fragment that
+    merely *depends* on a cycle unplaced, and those must still be measured.
+    """
+    fragments: dict[str, FragmentDefinitionNode] = {
+        definition.name.value: definition
+        for definition in document_ast.definitions
+        if isinstance(definition, FragmentDefinitionNode)
+    }
+    spreads: dict[str, tuple[str, ...]] = {
+        name: _spread_names(fragment.selection_set)
+        for name, fragment in fragments.items()
+    }
+    # Unknown spread targets are not nodes: they contribute 0, exactly as the
+    # old recursive walks did when a definition could not be found.
+    dependencies: dict[str, tuple[str, ...]] = {
+        name: tuple(target for target in targets if target in fragments)
+        for name, targets in spreads.items()
+    }
+    cyclic = _cyclic_fragments(fragments, dependencies)
+    return FragmentGraph(
+        fragments=fragments,
+        spreads=spreads,
+        order=_dependency_order(fragments, dependencies, cyclic),
+        cyclic=cyclic,
+        document=document_ast,
+    )
+
+
+def evaluate_fragments(
+    graph: FragmentGraph,
+    fold: Callable[[str, Mapping[str, int]], int],
+) -> dict[str, int]:
+    """Fold every fragment of ``graph`` exactly once, in dependency order.
+
+    Cycle members are written into the result as ``0`` BEFORE the first fold
+    call, so no fold ever needs a back-edge lookup and the order of spreads
+    cannot matter (TRI317-65). ``fold`` receives the fragment name and the
+    values known so far; every fragment it spreads is already present — a
+    dependency (order guarantee) or a cycle member (seeded above).
+    """
+    values: dict[str, int] = {name: 0 for name in graph.cyclic}
+    for name in graph.order:
+        values[name] = fold(name, values)
+    return values
+
+
+def _spread_names(selection_set: SelectionSetNode | None) -> tuple[str, ...]:
+    """Every fragment name spread inside a selection set, in first-seen order."""
+    names: list[str] = []
+    seen: set[str] = set()
+    stack: list[SelectionSetNode] = [] if selection_set is None else [selection_set]
+    while stack:
+        current = stack.pop()
+        for selection in current.selections:
+            if isinstance(selection, FragmentSpreadNode):
+                name = selection.name.value
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+            elif isinstance(selection, (FieldNode, InlineFragmentNode)):
+                if selection.selection_set is not None:
+                    stack.append(selection.selection_set)
+    return tuple(names)
+
+
+def _cyclic_fragments(
+    fragments: Mapping[str, FragmentDefinitionNode],
+    dependencies: Mapping[str, tuple[str, ...]],
+) -> frozenset[str]:
+    """Members of every spread cycle — iterative Tarjan, no recursion.
+
+    A component of one member is a cycle only when that fragment spreads
+    itself. A fragment that merely spreads a cycle is a component of its own
+    and is NOT a member (plan review 2026-11-02): it keeps its own
+    contribution instead of having its whole selection zeroed out.
+    """
+    index: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    cyclic: set[str] = set()
+    counter = 0
+
+    for root in fragments:
+        if root in index:
+            continue
+        work: list[tuple[str, int]] = [(root, 0)]
+        while work:
+            name, position = work.pop()
+            if position == 0:
+                index[name] = counter
+                lowlink[name] = counter
+                counter += 1
+                stack.append(name)
+                on_stack.add(name)
+            successors = dependencies[name]
+            descended = False
+            while position < len(successors):
+                successor = successors[position]
+                position += 1
+                if successor not in index:
+                    work.append((name, position))
+                    work.append((successor, 0))
+                    descended = True
+                    break
+                if successor in on_stack:
+                    lowlink[name] = min(lowlink[name], index[successor])
+            if descended:
+                continue
+            if lowlink[name] == index[name]:
+                members: list[str] = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    members.append(member)
+                    if member == name:
+                        break
+                if len(members) > 1 or name in dependencies[name]:
+                    cyclic.update(members)
+            if work:
+                parent = work[-1][0]
+                lowlink[parent] = min(lowlink[parent], lowlink[name])
+    return frozenset(cyclic)
+
+
+def _dependency_order(
+    fragments: Mapping[str, FragmentDefinitionNode],
+    dependencies: Mapping[str, tuple[str, ...]],
+    cyclic: frozenset[str],
+) -> tuple[str, ...]:
+    """Kahn peeling with the cycle members treated as already placed.
+
+    A fragment is ready when every fragment it spreads is placed; because the
+    cyclic members start out placed, every non-member lands in the order —
+    which is exactly what an "unplaced means cyclic" reading would get wrong.
+    The queue is seeded in definition order, so the result is deterministic.
+    """
+    pending = {
+        name: sum(1 for target in dependencies[name] if target not in cyclic)
+        for name in fragments
+        if name not in cyclic
+    }
+    dependents: dict[str, list[str]] = {name: [] for name in fragments}
+    for name, targets in dependencies.items():
+        if name in cyclic:
+            continue
+        for target in targets:
+            if target not in cyclic:
+                dependents[target].append(name)
+
+    ready = deque(
+        name for name in fragments if name not in cyclic and pending[name] == 0
+    )
+    order: list[str] = []
+    while ready:
+        name = ready.popleft()
+        order.append(name)
+        for dependent in dependents[name]:
+            pending[dependent] -= 1
+            if pending[dependent] == 0:
+                ready.append(dependent)
+    return tuple(order)
+
+
 def count_aliases(document_ast: DocumentNode) -> int:
     """Count aliased fields across every operation of the document.
 
     Mirrors the semantics of Strawberry's ``count_fields_with_alias``: the
     count is a DOCUMENT total (every operation contributes, never one selected
     operation's share), a fragment spread is expanded at its use site — a
-    definition is never counted once as a root selection — and a fragment is
-    never re-entered recursively through itself.
+    definition is never counted once as a root selection.
 
-    TRI317-56: each fragment's count is computed once and reused at every
-    spread (memoized, cycle-safe — the same pattern as
-    ``CostAccumulator._fragment_cost``). Re-walking it per spread made a short
-    document of chained, twice-spread fragments cost 2^n selections inside a
-    synchronous validation rule. The expanded totals are unchanged.
+    TRI317-56/TRI317-65: every fragment is measured ONCE, in dependency order,
+    by :func:`prepare_fragment_graph` + :func:`evaluate_fragments` (the one
+    helper the cost axis shares). For an acyclic document the expanded totals
+    are unchanged; a fragment that participates in a spread cycle contributes
+    ``0`` deterministically, in any declaration order.
     """
-    fragments: Mapping[str, FragmentDefinitionNode] = {
-        definition.name.value: definition
-        for definition in document_ast.definitions
-        if isinstance(definition, FragmentDefinitionNode)
-    }
-    fragment_counts: dict[str, int] = {}
+    graph = prepare_fragment_graph(document_ast)
+    values = evaluate_fragments(graph, partial(_fold_aliases, graph=graph))
     return sum(
-        _count_aliased_selections(
-            definition.selection_set, fragments, fragment_counts, set()
-        )
+        _count_selection_aliases(definition.selection_set, values)
         for definition in document_ast.definitions
         if isinstance(definition, OperationDefinitionNode)
     )
-
-
-def _count_aliased_selections(
-    selection_set: SelectionSetNode | None,
-    fragments: Mapping[str, FragmentDefinitionNode],
-    fragment_counts: dict[str, int],
-    expanding_fragments: set[str],
-) -> int:
-    if selection_set is None:
-        return 0
-
-    total = 0
-    for selection in selection_set.selections:
-        if isinstance(selection, (FieldNode, InlineFragmentNode)):
-            if isinstance(selection, FieldNode) and selection.alias:
-                total += 1
-            total += _count_aliased_selections(
-                selection.selection_set, fragments, fragment_counts,
-                expanding_fragments,
-            )
-        elif isinstance(selection, FragmentSpreadNode):
-            name = selection.name.value
-            fragment = fragments.get(name)
-            if fragment is None or name in expanding_fragments:
-                continue
-            if name not in fragment_counts:
-                expanding_fragments.add(name)
-                fragment_counts[name] = _count_aliased_selections(
-                    fragment.selection_set, fragments, fragment_counts,
-                    expanding_fragments,
-                )
-                expanding_fragments.discard(name)
-            total += fragment_counts[name]
-    return total
 
 
 def measure_depth(document_ast: DocumentNode) -> int:
@@ -238,21 +394,16 @@ def measure_depth(document_ast: DocumentNode) -> int:
     once from its definition. The document value is the maximum across every
     operation.
 
-    TRI317-56: a fragment's depth is relative to its spread site, so it is
-    computed once and reused at every spread (memoized, cycle-safe), like
-    :func:`count_aliases`.
+    TRI317-56/TRI317-65: a fragment's depth is relative to its spread site, so
+    it is measured once in dependency order (the same helper as
+    :func:`count_aliases`). A fragment that participates in a spread cycle
+    contributes ``0``, deterministically in any declaration order.
     """
-    fragments: Mapping[str, FragmentDefinitionNode] = {
-        definition.name.value: definition
-        for definition in document_ast.definitions
-        if isinstance(definition, FragmentDefinitionNode)
-    }
-    fragment_depths: dict[str, int] = {}
+    graph = prepare_fragment_graph(document_ast)
+    values = evaluate_fragments(graph, partial(_fold_depth, graph=graph))
     return max(
         (
-            _depth_of_selection_set(
-                definition.selection_set, fragments, fragment_depths, set()
-            )
+            _depth_of_selection_set(definition.selection_set, values)
             for definition in document_ast.definitions
             if isinstance(definition, OperationDefinitionNode)
         ),
@@ -260,55 +411,67 @@ def measure_depth(document_ast: DocumentNode) -> int:
     )
 
 
+def _count_selection_aliases(
+    selection_set: SelectionSetNode | None,
+    values: Mapping[str, int],
+) -> int:
+    """Aliases of one selection set, fragments read from the prepared values."""
+    if selection_set is None:
+        return 0
+
+    total = 0
+    for selection in selection_set.selections:
+        if isinstance(selection, FieldNode):
+            if selection.alias:
+                total += 1
+            total += _count_selection_aliases(selection.selection_set, values)
+        elif isinstance(selection, InlineFragmentNode):
+            total += _count_selection_aliases(selection.selection_set, values)
+        elif isinstance(selection, FragmentSpreadNode):
+            # A prepared value (dependency order) or a cycle member seeded to 0;
+            # an unknown fragment name contributes 0 exactly as before.
+            total += values.get(selection.name.value, 0)
+    return total
+
+
 def _depth_of_selection_set(
     selection_set: SelectionSetNode,
-    fragments: Mapping[str, FragmentDefinitionNode],
-    fragment_depths: dict[str, int],
-    expanding_fragments: set[str],
+    values: Mapping[str, int],
 ) -> int:
+    """Depth of one selection set, fragments read from the prepared values."""
     return max(
         (
-            _depth_of_selection(
-                selection, fragments, fragment_depths, expanding_fragments
-            )
+            _depth_of_single_selection(selection, values)
             for selection in selection_set.selections
         ),
         default=0,
     )
 
 
-def _depth_of_selection(
-    selection: object,
-    fragments: Mapping[str, FragmentDefinitionNode],
-    fragment_depths: dict[str, int],
-    expanding_fragments: set[str],
-) -> int:
+def _depth_of_single_selection(selection: object, values: Mapping[str, int]) -> int:
     if isinstance(selection, FieldNode):
         if selection.name.value.startswith("__") or selection.selection_set is None:
             return 0
-        return 1 + _depth_of_selection_set(
-            selection.selection_set, fragments, fragment_depths,
-            expanding_fragments,
-        )
+        return 1 + _depth_of_selection_set(selection.selection_set, values)
     if isinstance(selection, FragmentSpreadNode):
-        name = selection.name.value
-        fragment = fragments.get(name)
-        if fragment is None or name in expanding_fragments:
-            return 0
-        if name not in fragment_depths:
-            expanding_fragments.add(name)
-            fragment_depths[name] = _depth_of_selection_set(
-                fragment.selection_set, fragments, fragment_depths,
-                expanding_fragments,
-            )
-            expanding_fragments.discard(name)
-        return fragment_depths[name]
-    if isinstance(selection, (InlineFragmentNode, FragmentDefinitionNode)):
-        return _depth_of_selection_set(
-            selection.selection_set, fragments, fragment_depths,
-            expanding_fragments,
-        )
+        return values.get(selection.name.value, 0)
+    if isinstance(selection, InlineFragmentNode):
+        return _depth_of_selection_set(selection.selection_set, values)
     return 0
+
+
+def _fold_aliases(
+    name: str, values: Mapping[str, int], *, graph: FragmentGraph
+) -> int:
+    """The alias axis's per-fragment fold: ``values`` is a plain lookup."""
+    return _count_selection_aliases(graph.fragments[name].selection_set, values)
+
+
+def _fold_depth(
+    name: str, values: Mapping[str, int], *, graph: FragmentGraph
+) -> int:
+    """The depth axis's per-fragment fold: relative to the spread site."""
+    return _depth_of_selection_set(graph.fragments[name].selection_set, values)
 
 
 class AliasLimitRule(ValidationRule):
@@ -387,6 +550,33 @@ def _noop_error_sink(_error: GraphQLError) -> None:
     """Swallow errors for measurement-only walks (nothing here reports)."""
 
 
+def _fold_cost(
+    name: str,
+    values: Mapping[str, int],
+    *,
+    schema: GraphQLSchema,
+    graph: FragmentGraph,
+) -> int:
+    """The cost axis's per-fragment fold, in dependency order.
+
+    One ``TypeInfo`` seeded from the fragment's type condition (its parent type
+    is fixed by the definition, never by the spread site) and one accumulator
+    over a no-op error sink — the same construction graphql-core's
+    ``validate`` uses internally. Every spread met inside the fragment is a
+    plain dictionary lookup into ``values``: a dependency is already measured
+    and a cycle member is seeded to 0, so no fold ever re-enters another.
+    """
+    fragment = graph.fragments[name]
+    fragment_type = type_from_ast(schema, fragment.type_condition)
+    if fragment_type is None:
+        return 0
+    type_info = TypeInfo(schema, initial_type=fragment_type)
+    context = ValidationContext(schema, graph.document, type_info, _noop_error_sink)
+    nested = CostAccumulator(context, fragment_values=values)
+    visit(fragment.selection_set, TypeInfoVisitor(type_info, nested))
+    return nested.measured_cost
+
+
 class CostAccumulator(ValidationRule):
     """The ONE cost algorithm — shared by enforcement and measurement.
 
@@ -413,32 +603,33 @@ class CostAccumulator(ValidationRule):
       exemption, D-11): the frame is pushed with multiplier 0, so every
       descendant folds into a zero product.
     * Fragment definitions are SKIPped — their selections are counted at the
-      spread sites, each of which expands the definition through a memoized
-      nested walk with its own ``TypeInfo`` seeded from the fragment's type
-      condition. A fragment's subtotal is independent of the spread site (its
-      type condition fixes the parent type), which is what makes the memo
-      sound; a spread cycle (invalid GraphQL) costs 0 instead of recursing.
+      spread sites, which read the fragment's subtotal from ONE prepared map
+      (``prepare_fragment_graph`` + ``evaluate_fragments``, the same dependency
+      order the alias and depth axes use). A fragment's subtotal is independent
+      of the spread site (its type condition fixes the parent type), which is
+      what makes the shared map sound; a spread cycle (invalid GraphQL) costs 0
+      because its members are seeded to 0 before the first fold.
     """
 
     def __init__(
         self,
         context: ValidationContext,
         *,
-        fragment_costs: dict[str, int] | None = None,
-        expanding_fragments: frozenset[str] = frozenset(),
+        fragment_costs: Mapping[str, int] | None = None,
+        fragment_values: Mapping[str, int] | None = None,
     ) -> None:
         super().__init__(context)
         self._frames: list[list[int]] = []
         self.measured_cost = 0
-        self._fragment_costs: dict[str, int] = (
-            {} if fragment_costs is None else fragment_costs
+        # ``fragment_costs`` is the historical name for the same thing: a
+        # prepared name -> cost map. Either one is used as-is, so a caller that
+        # measured the document already (``estimate_cost``) pays nothing here;
+        # with neither, the map is prepared lazily from this context's document
+        # — one graph per accumulator instance, never a module-level cache.
+        prepared = fragment_values if fragment_values is not None else fragment_costs
+        self._fragment_values: dict[str, int] | None = (
+            None if prepared is None else dict(prepared)
         )
-        self._expanding_fragments: frozenset[str] = expanding_fragments
-        self._fragments: Mapping[str, FragmentDefinitionNode] = {
-            definition.name.value: definition
-            for definition in context.document.definitions
-            if isinstance(definition, FragmentDefinitionNode)
-        }
 
     # ── the walk ──
 
@@ -497,34 +688,24 @@ class CostAccumulator(ValidationRule):
             return _clamp_limit(int(passed.value.value))
         return MAX_LIMIT
 
-    # ── fragment expansion (memoized, cycle-safe) ──
+    # ── fragment expansion (one prepared map, dependency order) ──
 
     def _fragment_cost(self, name: str) -> int:
-        if name in self._fragment_costs:
-            return self._fragment_costs[name]
-        if name in self._expanding_fragments:
-            return 0
-        fragment = self._fragments.get(name)
-        if fragment is None:
-            return 0
-        fragment_type = type_from_ast(self.context.schema, fragment.type_condition)
-        if fragment_type is None:
-            return 0
-        type_info = TypeInfo(self.context.schema, initial_type=fragment_type)
-        context = ValidationContext(
-            self.context.schema,
-            self.context.document,
-            type_info,
-            _noop_error_sink,
-        )
-        nested = CostAccumulator(
-            context,
-            fragment_costs=self._fragment_costs,
-            expanding_fragments=self._expanding_fragments | {name},
-        )
-        visit(fragment.selection_set, TypeInfoVisitor(type_info, nested))
-        self._fragment_costs[name] = nested.measured_cost
-        return nested.measured_cost
+        """The fragment's prepared subtotal — never a nested walk.
+
+        A name absent from the map contributes 0, exactly as before: an unknown
+        spread, or a fragment whose type condition does not resolve.
+        """
+        return self._prepared_values().get(name, 0)
+
+    def _prepared_values(self) -> Mapping[str, int]:
+        if self._fragment_values is None:
+            graph = prepare_fragment_graph(self.context.document)
+            self._fragment_values = evaluate_fragments(
+                graph,
+                partial(_fold_cost, schema=self.context.schema, graph=graph),
+            )
+        return self._fragment_values
 
 
 class CostLimitRule(CostAccumulator):
@@ -559,12 +740,21 @@ def estimate_cost(graphql_schema: GraphQLSchema, document_ast: DocumentNode) -> 
     construction ``graphql.validation.validate`` uses internally (with a no-op
     error sink — nothing is reported here) and returns the accumulator's
     ``measured_cost``.
+
+    TRI317-64/TRI317-67: the fragment subtotals are prepared ONCE, in
+    dependency order, and handed to the accumulator — so every fragment is
+    folded exactly once no matter how often it is spread, and the numbers are
+    the same ones the alias and depth axes read.
     """
+    graph = prepare_fragment_graph(document_ast)
+    values = evaluate_fragments(
+        graph, partial(_fold_cost, schema=graphql_schema, graph=graph)
+    )
     type_info = TypeInfo(graphql_schema)
     context = ValidationContext(
         graphql_schema, document_ast, type_info, _noop_error_sink
     )
-    accumulator = CostAccumulator(context)
+    accumulator = CostAccumulator(context, fragment_values=values)
     visit(document_ast, TypeInfoVisitor(type_info, accumulator))
     return accumulator.measured_cost
 
@@ -596,6 +786,24 @@ class DocumentAnalysis:
     cost: int | None
 
 
+def _recursion_limit_error() -> GraphQLError:
+    """The contract-shaped answer when a document is too deep to analyse.
+
+    ``actual`` is a lower bound, never 0: the contract's reading is
+    ``actual > allowed``, and a client shrinking against ``actual: 0`` would be
+    told the document is fine. ``settings.graphql_max_depth + 1`` is the
+    smallest value the breach proves.
+    """
+    allowed = settings.graphql_max_depth
+    return make_limit_error(
+        "Query nests too deeply to analyse; the actual depth is at least "
+        f"{allowed + 1} and exceeds the allowed maximum of {allowed}",
+        "depth",
+        allowed + 1,
+        allowed,
+    )
+
+
 def analyze_document(
     graphql_schema: GraphQLSchema,
     document_ast: DocumentNode,
@@ -614,29 +822,39 @@ def analyze_document(
     import ``app.graphql.schema`` at module level (see the module docstring), and
     taking the schema as an argument is what lets every caller resolve it the way
     its own context requires.
+
+    TRI317-64: the whole analysis sits inside a ``RecursionError`` guard. The
+    fragment walkers are iterative, but the parser, ``count_tokens``' own parse
+    and the field/inline-fragment nesting inside a single fragment stay
+    recursive; without this arm a deep document escapes as an unhandled 500 on
+    saved-query save and as a generic error (dropping the D-04 cost headers) on
+    execute. The guard never re-raises: both doors consume contract errors.
     """
     errors: list[GraphQLError] = []
-    allowed_tokens = settings.graphql_max_tokens
-    actual_tokens = count_tokens(document_text)
-    if actual_tokens > allowed_tokens:
-        errors.append(
-            make_limit_error(
-                f"Query uses {actual_tokens} tokens; the allowed maximum is {allowed_tokens}",
-                "tokens",
-                actual_tokens,
-                allowed_tokens,
+    try:
+        allowed_tokens = settings.graphql_max_tokens
+        actual_tokens = count_tokens(document_text)
+        if actual_tokens > allowed_tokens:
+            errors.append(
+                make_limit_error(
+                    f"Query uses {actual_tokens} tokens; the allowed maximum is {allowed_tokens}",
+                    "tokens",
+                    actual_tokens,
+                    allowed_tokens,
+                )
+            )
+        errors.extend(
+            validate(
+                graphql_schema,
+                document_ast,
+                [AliasLimitRule, DepthLimitRule, CostLimitRule],
             )
         )
-    errors.extend(
-        validate(
-            graphql_schema,
-            document_ast,
-            [AliasLimitRule, DepthLimitRule, CostLimitRule],
-        )
-    )
-    return DocumentAnalysis(
-        errors=errors, cost=estimate_cost(graphql_schema, document_ast)
-    )
+        cost = estimate_cost(graphql_schema, document_ast)
+    except RecursionError:
+        errors.append(_recursion_limit_error())
+        return DocumentAnalysis(errors=errors, cost=0)
+    return DocumentAnalysis(errors=errors, cost=cost)
 
 
 def validate_document_limits(query_text: str) -> list[GraphQLError]:

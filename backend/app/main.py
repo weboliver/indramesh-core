@@ -56,7 +56,7 @@ from app.middleware.cache_control import CacheControlMiddleware
 from app.middleware.request_context import RequestContextMiddleware
 from app.db.opensearch import init_opensearch, close_opensearch
 from app.db.redis import init_redis, close_redis, close_arq_pool
-from app.db import async_session_maker
+from app.db import async_session_maker, log_identity_split_warning
 from app.services.init_service import init_db_on_startup
 from app.logging.levels import LevelController
 from app.logging.discovery import LoggingCategoryDiscovery
@@ -65,6 +65,7 @@ from app.plugin_system import init_plugin_registry
 from app.plugin_system.mounting import mount_plugin_routes
 from app.crypto import init_fernet
 from app.services.cache_service import invalidate_entity_cache
+from app.services.secret_validation import validate_jwt_secret_key
 from app.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -72,16 +73,18 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # D-08 / Pitfall 10: an explicit DATABASE_URL silently disables the
+    # runtime/maintenance identity split. Make the weakened state visible at
+    # startup; never abort — the operator's URL is an allowed configuration.
+    log_identity_split_warning(logger)
+
     # Phase 80: Validate security-critical environment variables BEFORE any initialization.
     # RuntimeErrors here are caught by ExceptionHandlerMiddleware (outermost middleware).
 
-    # Validate JWT_SECRET_KEY (presence only — any string is valid for HS256)
-    jwt_key = os.environ.get("JWT_SECRET_KEY")
-    if not jwt_key:
-        raise RuntimeError(
-            "JWT_SECRET_KEY environment variable is required but not set. "
-            "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
-        )
+    # Validate JWT_SECRET_KEY: present AND at least 32 characters (SESS-04). One
+    # helper, shared with auth_service.get_secret_key, names the variable and the
+    # minimum; it never echoes the value.
+    validate_jwt_secret_key(os.environ.get("JWT_SECRET_KEY"))
 
     # Validate FERNET_KEY (presence + format)
     fernet_key = os.environ.get("FERNET_KEY")

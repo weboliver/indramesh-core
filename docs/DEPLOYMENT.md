@@ -69,10 +69,13 @@ the shared project name can otherwise replace running containers with worktree
 bind mounts. The read-only Docker socket mounted into the backend supports log
 discovery; a read-only mount is not a Docker API authorization boundary.
 
-`ENVIRONMENT=production` changes the Compose backend command to non-reload Uvicorn
-and builds the frontend into `/srv/frontend-dist`, served with Vite preview. Other
-or unset values use the development commands. This is a repository-supported
-preview mode; the hardened static frontend image is the k3s-specific Caddy image.
+`ENVIRONMENT=production` changes the Compose backend command to non-reload Uvicorn.
+The base stack serves the built SPA from the same Caddy static image the cluster
+uses (`deploy/k8s-images/frontend/Dockerfile`, in-container port 8080), and the
+strict Content-Security-Policy stays with nginx rather than with the static
+server. That policy carries the import-map hash instead of an inline/eval
+allowance, and no WebSocket source in `connect-src`. Other or unset values use the development commands; the dev overlay
+(`docker-compose.dev.yml`) is the only form that runs a Vite dev server.
 
 ### k3s and Helm
 
@@ -125,6 +128,14 @@ default, `localhostForwarding` in `.wslconfig`), so no Windows hosts entry, port
 administrator permission is involved. On a native host other machines reach the stack at
 `https://<host-ip>`; the installer adds that address to the certificate.
 
+Traefik publishes the app on port 80 and port 443. The Compose stack uses `8180`/`8443`, so both
+stacks can run on the same machine side by side. The bundled certificate comes from the installer's
+own certificate authority and is self-signed for the browser: accept the warning once, exactly as
+with the Compose stack. The installer touches no trust store — neither this host's nor, on WSL2,
+the Windows one. The certificate carries `localhost`, `127.0.0.1` and, on
+a native Linux host, the host's own IPv4 address. The closing banner prints that address, and
+`INDRAMESH_HOST_IP` overrides or (set empty) disables it.
+
 Two Windows-side conditions can break the bootstrap on WSL2, and the installer can only fail fast
 on them rather than work around them: Docker Desktop installed under a path containing a space
 (k3s's kubelet fails to start when that path is mounted into the distro with the space unescaped),
@@ -135,10 +146,21 @@ installer or `./start` appears to hang or a browser request returns an unexpecte
 A fresh clone reaches a logged-in UI with one command: `./install_indramesh_k8s.sh` creates `.env`
 from `.env.example` when the file is absent, generates every secret in it, installs or reuses the
 cluster, provisions TLS through cert-manager, builds and imports the local application images into
-the cluster and reconciles the Helm release. The quickstart is lean by default: the monitoring
+the cluster, reconciles the Helm release, verifies that `https://localhost` answers (from the Windows side on
+WSL2), and closes by printing the login URL and — only on the run that generated it —
+the admin password. The quickstart is lean by default: the monitoring
 stack, Headlamp and the log stack are installed only when their switch in the root `.env` is
 exactly the string `true` — `MONITORING_ENABLED`, `HEADLAMP_ENABLED` and `LOGINFRA_ENABLED`,
-all defaulting to `false`. Switching one off stops managing that component; nothing is removed.
+all defaulting to `false`:
+
+| Switch | Default | Turns on |
+|---|---|---|
+| `MONITORING_ENABLED` | `false` | `kube-prometheus-stack` (Prometheus and Grafana) in the `monitoring` namespace |
+| `HEADLAMP_ENABLED` | `false` | [Headlamp](https://headlamp.dev/), the browser-based cluster UI, under `/headlamp/` |
+| `LOGINFRA_ENABLED` | `false` | The log stack (Loki and the Alloy collector) beside the monitoring stack |
+
+Switching a component off only stops managing it: nothing is removed, no release is deleted and no
+data is touched. A switched-off run is a lean run, not a cleanup.
 
 The chart renders PostgreSQL, Valkey, OpenSearch, and the internal storage
 service as StatefulSets. It renders the backend, worker, and frontend as
@@ -169,6 +191,36 @@ only writer of the evidence file beside it: after moving an image tag, re-run th
 verifier from the main checkout so the file records the digests actually imported.
 
 Jira is not included in the k3s chart.
+
+### Measured Quickstart Times
+
+A cold quickstart on a clean host, from `git clone` through the first successful login, is measured
+as follows. These are measured values, not targets. Each installer prints its own per-step timings,
+so anyone re-measuring can see where the time goes.
+
+**Docker Compose:** **2 min 21 s** — measured on 2026-10-24: WSL2 Ubuntu 24.04.5 LTS on an Intel Core i7-9750H at 2.60 GHz with 12 logical cores and 19 GiB RAM, Docker Engine 29.7.2, Docker Compose v2. The time runs from `./install_indramesh_docker.sh` to a reachable login page with the Core stack only; installing the five first-party plugins afterwards adds about **1 min 45 s**, because each install restarts the backend and the worker. The running stack settles at **≈ 2.3 GiB**, of which OpenSearch alone is ≈ 1.6 GiB (`docker stats`, 2026-10-24) — the memory above that leaves room for the build.
+
+**k3s:** **4 min 20 s** — measured cold on 2026-10-24: WSL2 Ubuntu 24.04.5 LTS on an Intel Core i7-9750H at 2.60 GHz with 12 logical cores and 19 GiB RAM, Docker Engine 29.7.2, Docker Compose v2, k3s v1.36.4+k3s1. The previous cluster, its volumes and the image pool were removed first, so the cluster install, the image builds and the image imports all happened inside the measured interval; the three opt-in components (`MONITORING_ENABLED`, `HEADLAMP_ENABLED`, `LOGINFRA_ENABLED`) stayed off, so this is the lean quickstart. The application pods settle at **≈ 1.9 GiB** (`kubectl top pods -n indramesh`, 2026-10-24) — leave the room above that free for the build.
+
+## What the Installer Changes on Your Host
+
+The k3s installer mutates the host it runs on. It never removes anything itself, and a rerun is
+idempotent: an existing cluster, existing data and an existing `.env` are reused, never reset.
+Every change, with the way back:
+
+| Change | Removal path |
+|---|---|
+| The **k3s** cluster itself — the server binary, its systemd service and its embedded containerd. | `/usr/local/bin/k3s-uninstall.sh`, the uninstaller k3s installs alongside the server. |
+| The **bootstrap packages**, apt-installed when missing: `curl`, `ca-certificates`, `tar`, `coreutils`, `gnupg` — plus `socat`, installed for the local-forward bridge below. | `sudo apt-get remove curl ca-certificates tar coreutils gnupg socat` (or only the ones you do not want to keep). |
+| The **kernel setting** OpenSearch needs: `vm.max_map_count`, persisted as `/etc/sysctl.d/90-indramesh-max-map-count.conf`. | Delete that file and run `sudo sysctl --system`. |
+| The **WSL configuration**: `[boot]` `systemd=true` in `/etc/wsl.conf`. A change here stops the run with exit code 3, because it needs a WSL restart (`wsl --shutdown`) followed by a rerun. | Remove the entry from `/etc/wsl.conf` and restart WSL. |
+| The **WSL memory floor**: `[wsl2]` `memory=` in the Windows-side `%USERPROFILE%\.wslconfig` (an already larger value is left alone). | Remove that line and restart WSL. |
+| The **local-forward service**: the `indramesh-local-forward@.service` systemd template unit at `/etc/systemd/system/indramesh-local-forward@.service`, with its environment file `/etc/indramesh/local-forward.env`; it relays `127.0.0.1:80` and `127.0.0.1:443` to the cluster's Traefik load balancer, which is what makes `https://localhost` work. | `sudo systemctl disable --now indramesh-local-forward@80.service indramesh-local-forward@443.service`, then delete both files and run `sudo systemctl daemon-reload`. |
+| Only **before 1.0.1**: a trust-store import. The retained CA root was copied to `/usr/local/share/ca-certificates/indramesh-local-ca.crt` and registered with `update-ca-certificates`; on a WSL2 host it also went into the Windows `CurrentUser\Root` store (or `LocalMachine\Root` from an elevated terminal). Since 1.0.1 the installer imports nothing, but an entry left by an earlier install stays — and a stale `indramesh-local-ca` of a removed cluster makes the browser reject the new one (`ERR_CERT_AUTHORITY_INVALID`). | Delete `indramesh-local-ca.crt` and run `sudo update-ca-certificates --fresh`; remove every `indramesh-local-ca` entry in the Windows certificate manager (`certmgr.msc`, Trusted Root Certification Authorities). |
+
+The cluster-side resources (the namespace, the Secrets, the Helm release and its retained PVCs)
+live inside that cluster — remove them through the cluster (`helm uninstall indramesh -n indramesh`)
+before running the uninstaller above.
 
 ## Legacy Jira Core Cut-over (One-way)
 
@@ -201,9 +253,12 @@ images.
 `docker-compose.yml` defines a one-shot `cutover` service behind the
 `maintenance` profile. It runs the backend image on the final bind-mounted code
 and executes `python -m app.maintenance clear-queue` → `alembic upgrade head` →
-`python -m app.plugin_system.bootstrap_role` → `python -m app.maintenance
-purge-cache` as one fatal chain. It never runs the plugin runner, never calls
-`docker compose down`, and never deletes a volume.
+`python -m app.plugin_system.bootstrap_role` → `python -m app.db.roles` →
+`python -m app.maintenance purge-cache` as one fatal chain. The `app.db.roles`
+step creates or reconciles the DML-only application role, its grants and the
+keygen functions as the privileged `DB_USER` identity, so a cut-over never
+leaves the runtime role missing or stale. It never runs the plugin runner, never
+calls `docker compose down`, and never deletes a volume.
 
 ```bash
 # 1. Quiesce the old producers (stop external producers too)
@@ -223,9 +278,12 @@ docker compose up -d worker
 The chart keeps the two-job migration split and adds two bounded pre-upgrade
 maintenance hooks around the Core migration Job, ordered by ascending hook
 order: `indramesh-maintenance-clear-queue` (before) → `indramesh-migration`
-(Core migrate) → `indramesh-maintenance-purge-cache` (after). The plugin
-migration runner stays in its own post-upgrade Job and no maintenance hook
-mounts the plugin PVC.
+(Core migrate) → `indramesh-maintenance-purge-cache` (after). The migration Job
+runs one fatal chain as the privileged `DB_USER` identity: `alembic upgrade
+head` → `python -m app.plugin_system.bootstrap_role` → `python -m app.db.roles`,
+so the application role and its grants exist before the new backend and worker
+start. The plugin migration runner stays in its own post-upgrade Job and no
+maintenance hook mounts the plugin PVC.
 
 Both maintenance hooks are opt-in: they render only when
 `apps.maintenance.cutover` is `true` (default `false`). A routine upgrade
@@ -298,15 +356,15 @@ from the main checkout, never a git worktree, and never call `docker compose dow
 
 `backend/start.sh` already runs the whole migration chain at backend startup, in this fatal-ordered
 sequence: `alembic upgrade head` (the Core drop) → `python -m app.plugin_system.bootstrap_role` →
-`python -m app.plugin_system.migrate` (the plugin's private `0001_suggestions` → `0002_runs`
-chain).
+`python -m app.db.roles` (the application role and its grants) → `python -m app.plugin_system.migrate`
+(the plugin's private `0001_suggestions` → `0002_runs` chain).
 
 ```bash
 # 1. Quiesce the worker so no legacy job runs during the drop.
 docker compose stop worker
 
 # 2. Deploy the final backend. start.sh runs alembic upgrade head (Core drop)
-#    -> bootstrap_role -> plugin migrate.
+#    -> bootstrap_role -> app.db.roles -> plugin migrate.
 ./rebuild_indramesh_docker.sh backend
 
 # 3. Remove the retired legacy AI job/status keys exactly once (allowlisted,
@@ -395,6 +453,63 @@ Exit codes:
 The historical cut-over verbs (`clear-queue`, `purge-cache`, `cleanup-legacy-translations`,
 `cutover`) keep their fail-closed `0`/`1` contract; `--json` is accepted for every command
 and read by `revalidate-saved-queries` only.
+
+## Search Index Repair
+
+`python -m app.maintenance repair-search-indexes [--apply] [--json]` repairs a search index whose
+field mappings are incomplete. Each Schema owns one `objects_<schema_id>` index shared by all of its
+ObjectTypes, but an index created before an ObjectType existed carries only the field mappings of the
+type whose document created it — range, sort and exact-match search then answer wrongly for every
+other type of that Schema. The command compares every index mapping with the definitions stored in
+the database and reports exactly which schemas, ObjectTypes and fields diverge (a missing field, a
+field mapped with the wrong type, or a field of a deleted attribute). *Releases from 1.0.1 on create
+the index with the full schema-wide mapping*, so this command is only needed for an installation that
+was upgraded with an index created by an older release.
+
+Run it as a dry run first — it writes nothing:
+
+```bash
+docker compose exec -T backend python -m app.maintenance repair-search-indexes
+```
+
+```bash
+KUBECONFIG=$HOME/.kube/config kubectl -n indramesh exec deploy/indramesh-backend -- python -m app.maintenance repair-search-indexes
+```
+
+Read the report: it names each diverging schema with the affected `object_type_id`, field and reason.
+Only when that list is understood, rebuild the diverging indices — a deliberate second command, never
+the automatic follow-up of the first:
+
+```bash
+docker compose exec -T backend python -m app.maintenance repair-search-indexes --apply
+```
+
+```bash
+KUBECONFIG=$HOME/.kube/config kubectl -n indramesh exec deploy/indramesh-backend -- python -m app.maintenance repair-search-indexes --apply
+```
+
+`--json` renders the same report as a JSON document (`docker compose exec -T backend python -m
+app.maintenance repair-search-indexes --json`). Only diverging schemas are deleted, recreated with
+the complete mapping and reindexed; a schema whose mapping already matches is never touched.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | Clean: every index matches its definitions (a schema without an index is listed as unmapped, not as a divergence). |
+| `1` | A dry run found at least one divergence, or a rebuild completed with warnings. |
+| `2` | The run itself failed (e.g. the search backend was unreachable); nothing was reported as clean. |
+
+**Search returns no hits for a schema while its index is rebuilt.** The command deletes the old index
+before recreating it, so run it in a maintenance window and expect the affected schema to be
+unsearchable for the duration of its rebuild. Fields of deleted attributes are listed but never
+rebuilt: OpenSearch cannot drop a field without a rebuild, and the leftover field changes no result.
+The CLI rebuild does not run plugin `before_index`/`after_index` hooks — the command process has no
+initialised plugin registry, and no bundled plugin subscribes to them.
+
+Nothing runs this command automatically: no installer step, no migration and no upgrade hook calls it
+— deleting and rebuilding indices unattended is not recoverable in place. The 1.0.1 release notes name
+it as the upgrade step for installations that want their older indices repaired.
 
 ## Fernet Key Rotation
 
@@ -535,23 +650,26 @@ production-hardening checklist — are collected in [OPERATIONS.md](./OPERATIONS
    `VALKEY_PASSWORD is missing or empty in .env after the fill … set it manually and rerun`. Set the
    named key in `.env` by hand — keeping every existing value, because `JWT_SECRET_KEY` and
    `FERNET_KEY` must survive or the values already encrypted in the database become unreadable — and
-   run the installer again. It rebuilds every locally built image (including the database and search
-   images), recreates the changed services and waits until the backend and nginx answer:
+   run the installer again.
+
+   The application-identity keys are the exception: the installer appends the missing `DB_APP_USER`
+   and `DB_APP_PASSWORD` lines itself and generates the password, so this upgrade needs no hand edit
+   for them. `DB_USER`/`DB_PASSWORD` stay untouched. It rebuilds every locally built image
+   (including the database and search images), recreates the changed services and waits until the
+   backend and nginx answer:
 
    ```bash
    ./install_indramesh_docker.sh
    ```
 
-   The backend applies the database migrations itself when it starts (`alembic upgrade head`, then
-   the plugin migrations — see [Build Pipeline](#build-pipeline)); there is no separate migration
-   step.
-4. Restart nginx so it resolves the recreated containers' new addresses:
-
-   ```bash
-   docker compose restart nginx
-   ```
-
-5. Log in and check that the application works. If a release note says the search
+   The backend then applies the whole chain when it starts: `alembic upgrade head`, then
+   `python -m app.plugin_system.bootstrap_role`, then `python -m app.db.roles`, which creates the
+   application role, its grants and the keygen functions, and only then the plugin migrations (see
+   [Build Pipeline](#build-pipeline)); there is no separate migration step. Nginx re-resolves
+   `backend` and `frontend` at runtime, so no manual restart or reload is needed after the rebuild: a
+   recreated container is picked up within about ten seconds, and a 502 during that window clears by
+   itself.
+4. Log in and check that the application works. If a release note says the search
    index changed, run the full reindex (`POST /api/v1/search/reindex/all`, or the reindex task in
    the UI).
 
@@ -566,16 +684,52 @@ production-hardening checklist — are collected in [OPERATIONS.md](./OPERATIONS
    ./install_indramesh_k8s.sh && ./rebuild_indramesh_k8s.sh
    ```
 
-   The installer validates `.env` against the new release (it stops and names any key the release
-   added, so you can set it and rerun), reconciles the Secrets and the stateful services, and builds
-   and imports the release's images. The rebuild performs one Helm upgrade with the new image tags;
-   the chart's pre-upgrade Job runs the Core migrations and the post-upgrade Job runs the plugin
-   migrations.
+   The installer validates `.env` against the new release (it still stops and names a key the release
+   added, so you can set that key and rerun), appends the missing `DB_APP_USER` and `DB_APP_PASSWORD`
+   lines to `.env` and generates the password, and adds only the missing `DB_APP_PASSWORD` key to the
+   `indramesh-database` Secret — an existing key is never overwritten, and a value that differs from
+   `.env` is still refused as a rotation. `DB_USER`/`DB_PASSWORD` stay unchanged. It reconciles the
+   Secrets and the stateful services, and builds and imports the release's images. The rebuild
+   performs one Helm upgrade with the new image tags and carries `postgres.appUser` through the
+   deployed values; the chart's pre-upgrade Job runs the Core migrations and then
+   `python -m app.db.roles` (the application role, its grants and the keygen functions), and the
+   post-upgrade Job runs the plugin migrations.
 4. Check the rollout with `KUBECONFIG=$HOME/.kube/config kubectl get pods -n indramesh` and log in.
 
-Installed plugins are versioned separately: update a plugin from its own repository with
-`install_plugin_docker.sh` or `install_plugin_k8s.sh` (see the plugin's README) when its release
-notes say it needs the new Core release.
+### Verifying the application role
+
+After either upgrade, connect as the runtime identity and confirm that it can read and write but
+cannot change the schema. Substitute your `DB_APP_USER` value (`indramesh_app` in the shipped
+`.env.example`) and keep the `-d "$POSTGRES_DB"` argument: `DB_NAME` defaults to `app`, while psql
+would otherwise connect to a database named after the role.
+
+```bash
+# Compose
+docker compose exec -T postgres sh -c 'psql -U indramesh_app -d "$POSTGRES_DB"'
+
+# k3s
+KUBECONFIG=$HOME/.kube/config kubectl -n indramesh exec statefulset/postgres -- \
+  sh -c 'psql -U indramesh_app -d "$POSTGRES_DB"'
+```
+
+Run these statements in that session:
+
+```sql
+select current_user;                                   -- must return the application role
+update alembic_version set version_num = version_num;  -- must fail: permission denied
+create table probe(x int);                             -- must fail: permission denied
+select count(*) from sources;                          -- must succeed
+```
+
+An ordinary list request in the interface — or `GET /api/v1/objects` with a valid token — must still
+work. If `select current_user` returns `postgres`, the runtime identity did not switch: check that
+`DB_APP_USER` reaches the backend and worker and that `DATABASE_URL` is unset, because an explicit
+`DATABASE_URL` outranks `DB_APP_*` and disables the split.
+
+Installed plugins are versioned separately: update a plugin from its own repository by re-running its
+install command — `install_plugin_docker.sh` or `install_plugin_k8s.sh` (see the plugin's README) —
+when its release notes say it needs the new Core release. [Updating a Plugin](#updating-a-plugin)
+describes what the installer does with each version it finds.
 
 **A re-install over an existing namespace keeps its secrets.** If the checkout's `.env` carries a
 different value for a generated credential than the cluster's Secret, the installer stops in
@@ -630,8 +784,9 @@ Database migrations run before the Compose backend starts through
 
 1. `alembic upgrade head` (Core migration; fatal on failure).
 2. `python -m app.plugin_system.bootstrap_role` (configured role/bootstrap failures are fatal).
-3. `python -m app.plugin_system.migrate` (plugin-specific failures isolate that plugin).
-4. Uvicorn starts; the worker does not run migrations.
+3. `python -m app.db.roles` (application role, grants and keygen functions; fail-closed on drift).
+4. `python -m app.plugin_system.migrate` (plugin-specific failures isolate that plugin).
+5. Uvicorn starts; the worker does not run migrations.
 
 Do not use the generic build/start commands for a database still requiring the
 destructive cut-over: follow the quiesce-first runbook above instead.
@@ -777,6 +932,53 @@ See [CONFIGURATION.md § Plugin migration-role requirements](./CONFIGURATION.md#
   plugin health, not just Helm status. Successful hook Jobs are deleted by
   `hook-succeeded`, so capture logs before deletion or use log aggregation.
 
+### Updating a Plugin
+
+**A plugin update is the same command as its installation — there is no update flag.** Both
+installers compare the version in the source's `plugin.toml` with the version of the installed
+plugin:
+
+- **Higher version** — the installed plugin is replaced. Files the new version no longer ships are
+  gone afterwards: an update is a replace, never a merge.
+- **Same version** — the installer reports that the plugin is already current, exits `0` and changes
+  nothing: no copy, no migration and no restart.
+- **Lower version** — the installer refuses before writing anything. Plugin migrations only run
+  forward, so an older tree is never installed over a newer one.
+
+A destination without a readable three-part `version` — for example a directory someone created by
+hand — is still refused, so only a directory an installer created is ever replaced.
+
+```bash
+# Compose stack — in the checkout
+./install_plugin_docker.sh https://github.com/weboliver/indramesh-plugin-ai-translation --ref v1.1.0
+```
+
+```bash
+# k3s — from the release checkout
+./install_plugin_k8s.sh https://github.com/weboliver/indramesh-plugin-ai-translation --ref v1.1.0
+```
+
+**After an interruption, run the same command again.** The installer stages the new tree as
+`<name>.new` and moves the installed one to `<name>.old`; the plugin scan skips both, so neither can
+surface as a plugin. `<name>.old` means an update did not finish: the next run at the same version
+catches up the migrations and the restarts, then removes the marker. A successful run leaves neither
+directory behind.
+
+**The plugin keeps its activation state.** An update does not touch the plugin's row in the
+database, so an administrator's choice to have it active or inactive survives the update.
+
+**Raise the plugin's `version` when you publish an update.** The plugin's frontend bundle is fetched
+with the manifest version as its cache key, so an update that keeps the same version can keep serving
+the previous bundle in an open browser. A version bump makes the update visible on the next page load
+and verifiable through `GET /api/v1/plugins/<name>`.
+
+**Two k3s prerequisites** apply to plugins that need more than the plugin itself (both are described
+in this document): a plugin that owns a database needs the plugin DB role
+(`PLUGIN_DB_USER`/`PLUGIN_DB_PASSWORD` in `.env`; the installer carries the role name into the chart),
+and a plugin whose generation calls an external AI provider needs that provider to be reachable
+from the cluster — a hosted provider on port 443 is by default, a private or non-443 endpoint needs
+an explicit egress entry.
+
 ## Transport Security and Networking
 
 In Compose, Nginx listens on `${HTTP_PORT:-8180}` and `${HTTPS_PORT:-8443}`.
@@ -886,5 +1088,11 @@ The installer provisions `kube-prometheus-stack` in the `monitoring` namespace.
 The chart includes an IndraMesh dashboard ConfigMap. Prometheus uses ephemeral
 storage with a seven-day retention configuration, so it is not a historical
 metrics archive. Grafana is proxied at the configured local route
-`https://localhost/grafana/`.
+`https://localhost/grafana/`. Both optional surfaces — Grafana and Headlamp — are
+off by default (`MONITORING_ENABLED` and `HEADLAMP_ENABLED` in the root `.env`,
+each installed only when set to exactly `true`). Grafana's admin credential is
+owned by the installer: it lives in the Secret `indramesh-grafana-admin` in the
+`monitoring` namespace (keys `admin-user` and `admin-password`), which the chart
+consumes through `grafana.admin.existingSecret`; a rerun adds a missing key and
+never overwrites an existing value.
 

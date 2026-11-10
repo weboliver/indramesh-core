@@ -135,6 +135,29 @@ class IndraMeshPlugin:
         """
         return None
 
+    async def on_language_deleted(self, ctx: Any, **kwargs: Any) -> None:
+        """Observe the deletion of a Language AFTER the deleting transaction commits.
+
+        Deliberately different from the object hooks: this one fires with
+        ``active_session=None``, so ``ctx.db()`` hands the subscriber its OWN
+        session and the subscriber commits itself. A plugin that cleans up its
+        own rows must persist that work independently — sharing the caller's
+        transaction would let a plugin-side DB failure abort the language delete
+        even though hooks must never gate the mutation they observe (T-323.1-31).
+
+        The session shape does not change the context kind: ``ctx.context_kind``
+        is ``"hook"`` here exactly as for every other hook, because the hook bus
+        states it explicitly (``dispatch_hook``) instead of deriving it from the
+        session. The Core-data write surface therefore stays closed — a
+        subscriber deletes only its OWN tables through ``ctx.db()``; an SDK
+        Core-data write raises the stable ``hook_context`` code.
+
+        Payload: ``language_code`` (the deleted row's code) and ``actor_id`` (the
+        authenticated actor that issued the delete). Not fired from a rejected
+        delete (the bundled / referenced 409 branches).
+        """
+        return None
+
     async def before_index(self, ctx: Any, **kwargs: Any) -> None:
         return None
 

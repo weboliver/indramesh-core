@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 
 from app.db.base import Base
-from app.db import get_database_url
+from app.db import get_maintenance_database_url
 from app.db.migration_filters import include_object
 from app.logging import configure_logging
 from app.models import (
@@ -30,7 +30,9 @@ configure_logging("alembic")
 
 config = context.config
 
-config.set_main_option("sqlalchemy.url", get_database_url())
+# D-08/DEPL-03: core migrations always run as DB_USER. The runtime identity is
+# DML-only and must never be the connection that applies a revision.
+config.set_main_option("sqlalchemy.url", get_maintenance_database_url())
 
 target_metadata = Base.metadata
 

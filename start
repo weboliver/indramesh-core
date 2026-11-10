@@ -1,11 +1,32 @@
 #!/bin/bash
-# IndraMesh k3s lifecycle wrapper (BOOT-02, D-16..D-20).
+# IndraMesh lifecycle wrapper: k3s by default, Docker Compose when k3s is absent.
 #
-# Starts the k3s systemd service directly: `sudo systemctl start k3s` when a
-# transition is needed, then polls `systemctl is-active` for the target state
-# within a short bounded timeout (default 30s; override only for tests).
-# Idempotent: an already-active service is a successful no-op. Never touches
-# Helm, workloads, PVCs, uninstall, or Compose (D-19, T-254-04).
+# Shape detection (D-08): `systemctl list-unit-files 'k3s.service'` decides.
+#   - unit present -> the k3s path below runs exactly as before. A bare
+#     ./start on a mixed host (k3s and Compose both installed) stays k3s.
+#   - unit absent, `docker compose version` succeeds and `compose ps -a -q`
+#     lists at least one container -> the Compose path (D-09): `docker compose
+#     start` from the repository root, then `docker compose ps`. Never `up`,
+#     `down`, `restart` or `create`: only containers that already exist are
+#     started, in the shape they were created in. With no container at all the
+#     script stops and points at `docker compose up -d` instead of creating one.
+#   - neither -> non-zero with a message naming both ways in (installer or
+#     Compose start).
+# `--compose` / `--k3s` force the shape on a host where both are installed;
+# giving both is an error. `--enable` is k3s-only and is REJECTED with a
+# non-zero exit in Compose mode rather than silently ignored (D-10). The flags
+# are additions: every existing call and flag keeps its meaning (docs/STABILITY.md).
+#
+# Compose reads COMPOSE_FILE/COMPOSE_PROFILES from the project .env (never from
+# the shell unless exported), so run ./start --compose in the same environment
+# the stack was created in — see docs/K3S-WSL2.md.
+#
+# k3s path: starts the k3s systemd service directly: `sudo systemctl start k3s`
+# when a transition is needed, then polls `systemctl is-active` for the target
+# state within a short bounded timeout (default 30s; override only for tests).
+# Idempotent: an already-active service is a successful no-op. The k3s path
+# never touches Helm, workloads, PVCs, uninstall, or the Compose stack
+# (D-19, T-254-04).
 #
 # Also (re)starts the indramesh-local-forward@{80,443} reachability bridge
 # (scripts/k8s/lib/local_forward.sh) if it is installed — symmetric with
@@ -21,17 +42,77 @@
 # them for the current boot only and leaves persistence as it found it (D-19:
 # service enablement is configured by the installer, not by `./start`). Runs in
 # the already-active path too, so "running" and "comes back after a reboot" can
-# be set independently.
+# be set independently. k3s-only: the Compose path rejects it (D-10).
 set -euo pipefail
+
+# Compose resolves its project from the current directory. Pin it to this
+# script's own directory (the repository root), so `./start` never starts
+# containers of a different Compose project that happens to sit in the cwd —
+# and so an invocation from outside the checkout works at all (D-09).
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
 
 K3S_UNIT="k3s"
 STATE_TIMEOUT_SECS="${K3S_START_TIMEOUT_SECS:-30}"
 POLL_INTERVAL=1
 LOCAL_FORWARD_PORTS="80 443"
 ENABLE_UNITS=0
+COMPOSE_MODE=0
+K3S_MODE=0
+SHAPE=""
 
 k3s_state() {
   systemctl is-active "$K3S_UNIT" 2>/dev/null || true
+}
+
+# `list-unit-files` matches unit FILE names on disk, needs no sudo and changes
+# nothing — the same probe start_local_forward_bridge already uses for the
+# bridge template.
+k3s_unit_installed() {
+  systemctl list-unit-files 'k3s.service' >/dev/null 2>&1
+}
+
+compose_available() {
+  # Availability probe, not `command -v`: a docker binary without the Compose
+  # plugin (or with an unreachable daemon) is not a usable Compose host.
+  docker compose version </dev/null >/dev/null 2>&1
+}
+
+compose_container_count() {
+  # `-a` counts stopped containers too: after ./stop --compose the containers
+  # still exist, and ./start --compose must bring exactly those back (D-09).
+  docker compose ps -a -q </dev/null 2>/dev/null | grep -c . || true
+}
+
+resolve_shape() {
+  if [ "$COMPOSE_MODE" -eq 1 ] && [ "$K3S_MODE" -eq 1 ]; then
+    die "--compose and --k3s both given — pick one: they select the installation shape on a host that has both"
+  fi
+  if [ "$COMPOSE_MODE" -eq 1 ]; then
+    if ! compose_available; then
+      die "--compose requested but 'docker compose' is not available — install Docker and the Compose plugin (docs/GETTING-STARTED.md), or pass --k3s"
+    fi
+    SHAPE="compose"
+    return 0
+  fi
+  if [ "$K3S_MODE" -eq 1 ]; then
+    if ! k3s_unit_installed; then
+      die "--k3s requested but k3s.service is not installed — install it with ./install_indramesh_k8s.sh"
+    fi
+    SHAPE="k3s"
+    return 0
+  fi
+  # Bare invocation. k3s wins whenever its unit exists, because that is exactly
+  # what this script did before the Compose path existed (D-08).
+  if k3s_unit_installed; then
+    SHAPE="k3s"
+    return 0
+  fi
+  if compose_available && [ "$(compose_container_count)" -gt 0 ]; then
+    SHAPE="compose"
+    return 0
+  fi
+  die "no installation found here: k3s.service is not installed and this Compose project has no containers — install k3s with ./install_indramesh_k8s.sh, or create the Compose stack first with: docker compose up -d"
 }
 
 die() {
@@ -99,15 +180,48 @@ enable_lifecycle_units() {
   echo "k3s and the reachability bridge start again on boot (undo with: ./stop --disable)."
 }
 
+start_compose() {
+  # D-09: only containers that already exist. No `up`, no `down`, no
+  # `--force-recreate` — a Compose `down` leaves nothing to start, and that case
+  # is an explicit abort pointing at `docker compose up -d`.
+  local containers
+  containers="$(compose_container_count)"
+  if [ "$containers" -eq 0 ]; then
+    die "no container exists for this Compose project — create the stack first with: docker compose up -d (this wrapper only starts existing containers)"
+  fi
+  echo "Starting the Compose stack (docker compose start)..."
+  if ! docker compose start </dev/null; then
+    die "docker compose start failed — diagnose with: docker compose ps"
+  fi
+  echo "Compose stack started."
+  docker compose ps </dev/null
+  echo "Next: ./stop --compose to stop it again"
+}
+
 main() {
   local current elapsed arg
 
   for arg in "$@"; do
     case "$arg" in
       --enable) ENABLE_UNITS=1 ;;
-      *) die "unknown argument: $arg (usage: ./start [--enable])" ;;
+      --compose) COMPOSE_MODE=1 ;;
+      --k3s) K3S_MODE=1 ;;
+      *) die "unknown argument: $arg (usage: ./start [--enable] [--compose|--k3s])" ;;
     esac
   done
+
+  # Shape first, then the flag veto: the loop above has already read every
+  # argument, so the rejection also holds in the auto-detected Compose mode and
+  # does not depend on argument order.
+  resolve_shape
+
+  if [ "$SHAPE" = "compose" ]; then
+    if [ "$ENABLE_UNITS" -eq 1 ]; then
+      die "--enable is k3s-only: it restores boot-time enablement of k3s.service and the reachability bridge. The Compose stack is managed by Compose — rerun without --enable"
+    fi
+    start_compose
+    exit 0
+  fi
 
   if [ "$ENABLE_UNITS" -eq 1 ]; then
     enable_lifecycle_units

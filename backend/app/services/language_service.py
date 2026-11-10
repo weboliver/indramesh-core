@@ -2,13 +2,17 @@ import uuid
 from typing import List
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Language, Schema, SchemaLanguage
+from app.data import BUNDLED_LANGUAGE_CODES
+from app.models import Language, Schema, SchemaLanguage, UserProfile
+from app.plugin_system import get_plugin_registry
+from app.plugin_system import hooks as plugin_hooks
 from app.schemas.crud import LanguageCreate, LanguageUpdate
 from app.services.audit_service import audit_log, model_to_dict
+from app.services.cache_service import invalidate_entity_cache
 
 
 async def create_language(db, language_data: LanguageCreate, actor_id: uuid.UUID) -> Language:
@@ -70,6 +74,15 @@ async def delete_language(db, language_id: uuid.UUID, actor_id: uuid.UUID) -> bo
     language = result.scalar_one_or_none()
     if not language:
         return False
+    # Bundled languages ship a committed catalog and are part of the
+    # application, not operator data. Rejected BEFORE the schema-reference
+    # check so the answer is stable (409, row stays) regardless of which
+    # schemas happen to reference it.
+    if language.code in BUNDLED_LANGUAGE_CODES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot delete language '{language.code}': it is bundled with the application.",
+        )
     # D-02: DELETE is blocked when the language is enabled in ANY schema's subset
     # OR is ANY schema's default. Never silently cascades schema_languages rows.
     subset_schemas = await _find_subset_schemas(db, language.id)
@@ -80,11 +93,51 @@ async def delete_language(db, language_id: uuid.UUID, actor_id: uuid.UUID) -> bo
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Cannot delete language '{language.code}': still referenced by schema(s): {', '.join(referencing)}. Remove it from every schema's subset first.",
         )
+    # user_profiles.ui_language carries no FK, so clearing the preference is the
+    # only thing that keeps a deleted code from lingering on a profile.
+    await db.execute(
+        update(UserProfile)
+        .where(UserProfile.ui_language == language.code)
+        .values(ui_language=None)
+    )
+    # Captured before the row disappears: the post-commit hook reports the CODE,
+    # never the id (a recreated code is a different row).
+    code = language.code
     await audit_log(db, "languages", language_id, "DELETE", actor_id,
                     old_values=model_to_dict(language), new_values=None)
     await db.delete(language)
     await db.commit()
+    # The UI dictionary is cached per language CODE (not per id) and the cache
+    # outlives the row — without this, recreating the same code would serve the
+    # deleted language's dictionary.
+    await invalidate_entity_cache("ui_translations")
+    # D-19: plugins clean up their own rows for this code. Fired AFTER the commit
+    # and with no active session, so a subscriber opens its own transaction and a
+    # plugin-side failure can never undo or block the language delete.
+    await _fire_language_deleted_hook(code, actor_id)
     return True
+
+
+async def _fire_language_deleted_hook(code: str, actor_id: uuid.UUID) -> None:
+    """Fire the generic ``on_language_deleted`` hook (D-19) best-effort.
+
+    Core names no plugin table and imports nothing from ``plugins/``: it only
+    announces the deleted code. A missing/uninitialized registry (unit tests
+    calling this service without the app lifespan) skips the hook silently, the
+    same additive-only rule the object hooks follow. Because hooks never gate,
+    the subscriber's own errors are isolated by the hook bus.
+    """
+    try:
+        registry = get_plugin_registry()
+    except RuntimeError:
+        return
+    await plugin_hooks.fire_hook(
+        registry,
+        "on_language_deleted",
+        active_session=None,
+        language_code=code,
+        actor_id=actor_id,
+    )
 
 
 async def _find_subset_schemas(db, language_id: uuid.UUID) -> list[str]:

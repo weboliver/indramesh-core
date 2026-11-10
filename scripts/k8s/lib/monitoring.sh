@@ -23,6 +23,13 @@
 # (A5 closed). Ordering constraint: provision_monitoring_stack MUST run BEFORE
 # the indramesh full Helm pass — the monitoring.coreos.com/v1 CRDs must exist before
 # the chart renders the ServiceMonitor, else the API server rejects the manifest.
+#
+# Phase 323 (D-04, DEPL-01): the Grafana admin credential belongs to the
+# installer. ensure_grafana_admin_secret makes the Secret
+# 'indramesh-grafana-admin' exist in the monitoring namespace (adopting the
+# chart's own values on a first run over an existing installation, adding only
+# missing keys otherwise) BEFORE the pinned install renders Grafana;
+# verify_grafana_credentials checks that same Secret against the live API.
 set -euo pipefail
 
 MONITORING_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +38,12 @@ ROOT_DIR="$(cd "$MONITORING_SH_DIR/../../.." && pwd)"
 # Bounded readiness window (D-07): total budget = attempts * interval seconds.
 MONITORING_READY_ATTEMPTS="${MONITORING_READY_ATTEMPTS:-60}"
 MONITORING_READY_INTERVAL="${MONITORING_READY_INTERVAL:-2}"
-GRAFANA_SECRET_NAME="kube-prometheus-stack-grafana"
+# Phase 323 (D-04): the Grafana admin credential is installer-owned. The chart
+# consumes it through grafana.admin.existingSecret (scripts/k8s/monitoring-values.yaml);
+# GRAFANA_CHART_SECRET_NAME is the Secret the kube-prometheus-stack chart renders
+# itself, read ONLY to adopt its values on a first run over an existing install.
+GRAFANA_SECRET_NAME="indramesh-grafana-admin"
+GRAFANA_CHART_SECRET_NAME="kube-prometheus-stack-grafana"
 GRAFANA_SERVICE_NAME="kube-prometheus-stack-grafana"
 GRAFANA_CHECK_ATTEMPTS="${GRAFANA_CHECK_ATTEMPTS:-30}"
 GRAFANA_CHECK_INTERVAL="${GRAFANA_CHECK_INTERVAL:-2}"
@@ -99,6 +111,158 @@ _wait_for_monitoring_ready() {  # _wait_for_monitoring_ready — bounded Availab
   done
   preflight_error "monitoring: prometheus-operator Deployment not Available within the bounded window — refusing to proceed (D-07)"
   return 1
+}
+
+ensure_grafana_admin_secret() {  # ensure_grafana_admin_secret — make the installer-owned Grafana admin
+  # credential exist without ever overwriting an existing value (Phase 323 D-04,
+  # T-323-02/T-323-03/T-323-21).
+  #
+  # The chart consumes $GRAFANA_SECRET_NAME through grafana.admin.existingSecret
+  # (scripts/k8s/monitoring-values.yaml), so the Secret must exist BEFORE
+  # `helm upgrade --install` renders the Grafana pod (Pitfall 4). Presence is
+  # classified with _monitoring_resource_absent, never with the error-swallowing
+  # presence helper (it discards every kubectl error, so a transient API failure
+  # would look like "absent" and produce a freshly generated password over a
+  # live one). Existing values are read through a checked exit code for the same
+  # reason, and only missing keys are added — a rotation stays an explicit
+  # operator action (Phase 322 D-03/D-07). Values travel through private 0600
+  # files and --from-file / --patch-file only, never argv or logs.
+  local rc=0 dir="" key value_b64
+  local admin_user_b64="" admin_pass_b64=""
+  local -a missing_keys=()
+
+  _monitoring_resource_absent secret "$GRAFANA_SECRET_NAME" -n "$MONITORING_NAMESPACE" || rc=$?
+  case "$rc" in
+    1)
+      # The installer-owned Secret already exists. Add ONLY what is missing: a
+      # present key is never rewritten, so a live Grafana admin keeps working.
+      for key in admin-user admin-password; do
+        value_b64=""
+        if ! value_b64="$(_kubectl_indramesh get secret "$GRAFANA_SECRET_NAME" -n "$MONITORING_NAMESPACE" \
+              -o "jsonpath={.data['$key']}" 2>/dev/null)"; then
+          preflight_error "monitoring: Secret '$GRAFANA_SECRET_NAME' in '$MONITORING_NAMESPACE' exists but key '$key' could not be read — refusing to patch over a value this run cannot see (D-04)"
+          return 1
+        fi
+        [ -n "$value_b64" ] || missing_keys+=("$key")
+      done
+      if [ "${#missing_keys[@]}" -eq 0 ]; then
+        step "monitoring: Grafana admin Secret '$GRAFANA_SECRET_NAME' already complete — no change (D-04)"
+        return 0
+      fi
+      dir="$(mktemp -d "${TMPDIR:-/tmp}/indramesh-grafana-secret.XXXXXX")" || {
+        preflight_error "monitoring: failed to create private Grafana Secret storage — refusing to proceed (D-04)"
+        return 1
+      }
+      chmod 700 "$dir" || {
+        rm -rf "$dir"
+        preflight_error "monitoring: failed to secure private Grafana Secret storage — refusing to proceed (D-04)"
+        return 1
+      }
+      for key in "${missing_keys[@]}"; do
+        case "$key" in
+          admin-user) printf 'admin' > "$dir/$key" || { rm -rf "$dir"; preflight_error "monitoring: failed to write the missing Grafana admin key — refusing to proceed (D-04)"; return 1; } ;;
+          admin-password) generate_secret_value admin > "$dir/$key" || { rm -rf "$dir"; preflight_error "monitoring: failed to generate the Grafana admin password — refusing to proceed (D-04)"; return 1; } ;;
+        esac
+        chmod 600 "$dir/$key" || { rm -rf "$dir"; preflight_error "monitoring: failed to secure the missing Grafana admin key — refusing to proceed (D-04)"; return 1; }
+      done
+      if ! _merge_missing_secret_keys "$GRAFANA_SECRET_NAME" "$MONITORING_NAMESPACE" "$dir" "${missing_keys[@]}"; then
+        rm -rf "$dir"
+        return 1
+      fi
+      rm -rf "$dir"
+      step "monitoring: Grafana admin Secret '$GRAFANA_SECRET_NAME' gained missing key(s) ${missing_keys[*]} — existing values untouched (D-04)"
+      return 0
+      ;;
+    0)
+      # No installer-owned Secret yet. STEP 1: the namespace must exist BEFORE
+      # the Secret is written — on a fresh host the only thing that ever created
+      # it was helm's --create-namespace, which runs later. reconcile_indramesh_namespace
+      # is NOT reused here: it is the indramesh PSA path (D-04).
+      rc=0
+      _monitoring_resource_absent namespace "$MONITORING_NAMESPACE" || rc=$?
+      case "$rc" in
+        0)
+          if ! _kubectl_indramesh create namespace "$MONITORING_NAMESPACE" >/dev/null; then
+            # Losing a race with a parallel creator is fine; anything else aborts.
+            rc=0
+            _monitoring_resource_absent namespace "$MONITORING_NAMESPACE" || rc=$?
+            if [ "$rc" -ne 1 ]; then
+              preflight_error "monitoring: namespace '$MONITORING_NAMESPACE' is missing and could not be created — the Grafana admin Secret cannot be written (D-04)"
+              return 1
+            fi
+          fi
+          ;;
+        1) ;;
+        *) return 1 ;;
+      esac
+      # STEP 2: adopt the chart's values when this is a first run over an
+      # existing installation — never lock the operator out (Pitfall 5).
+      rc=0
+      _monitoring_resource_absent secret "$GRAFANA_CHART_SECRET_NAME" -n "$MONITORING_NAMESPACE" || rc=$?
+      case "$rc" in
+        1)
+          admin_user_b64="$(_secret_data_key "$GRAFANA_CHART_SECRET_NAME" "$MONITORING_NAMESPACE" admin-user)"
+          admin_pass_b64="$(_secret_data_key "$GRAFANA_CHART_SECRET_NAME" "$MONITORING_NAMESPACE" admin-password)"
+          if [ -z "$admin_user_b64" ] || [ -z "$admin_pass_b64" ]; then
+            preflight_error "monitoring: chart Secret '$GRAFANA_CHART_SECRET_NAME' in '$MONITORING_NAMESPACE' is missing or incomplete — refusing to derive '$GRAFANA_SECRET_NAME' from it (D-04)"
+            return 1
+          fi
+          ;;
+        0) ;;
+        *) return 1 ;;
+      esac
+      # STEP 3: write both keys from private 0600 files. Either adopted from the
+      # chart Secret (decoded, byte-identical) or freshly generated.
+      dir="$(mktemp -d "${TMPDIR:-/tmp}/indramesh-grafana-secret.XXXXXX")" || {
+        preflight_error "monitoring: failed to create private Grafana Secret storage — refusing to proceed (D-04)"
+        return 1
+      }
+      chmod 700 "$dir" || {
+        rm -rf "$dir"
+        preflight_error "monitoring: failed to secure private Grafana Secret storage — refusing to proceed (D-04)"
+        return 1
+      }
+      if [ -n "$admin_user_b64" ]; then
+        if ! printf '%s' "$admin_user_b64" | base64 --decode > "$dir/admin-user"; then
+          rm -rf "$dir"
+          preflight_error "monitoring: failed to carry the chart's Grafana admin user over — refusing to proceed (D-04)"
+          return 1
+        fi
+      else
+        printf 'admin' > "$dir/admin-user" || { rm -rf "$dir"; preflight_error "monitoring: failed to write the Grafana admin user — refusing to proceed (D-04)"; return 1; }
+      fi
+      if [ -n "$admin_pass_b64" ]; then
+        if ! printf '%s' "$admin_pass_b64" | base64 --decode > "$dir/admin-password"; then
+          rm -rf "$dir"
+          preflight_error "monitoring: failed to carry the chart's Grafana admin password over — refusing to proceed (D-04)"
+          return 1
+        fi
+      else
+        generate_secret_value admin > "$dir/admin-password" || { rm -rf "$dir"; preflight_error "monitoring: failed to generate the Grafana admin password — refusing to proceed (D-04)"; return 1; }
+      fi
+      chmod 600 "$dir/admin-user" "$dir/admin-password" || {
+        rm -rf "$dir"
+        preflight_error "monitoring: failed to secure the Grafana admin credential files — refusing to proceed (D-04)"
+        return 1
+      }
+      if ! _kubectl_indramesh create secret generic "$GRAFANA_SECRET_NAME" -n "$MONITORING_NAMESPACE" \
+             --from-file="admin-user=$dir/admin-user" --from-file="admin-password=$dir/admin-password" >/dev/null; then
+        rm -rf "$dir"
+        preflight_error "monitoring: failed to create the Grafana admin Secret '$GRAFANA_SECRET_NAME' in '$MONITORING_NAMESPACE' (D-04)"
+        return 1
+      fi
+      rm -rf "$dir"
+      if [ -n "$admin_pass_b64" ]; then
+        step "monitoring: adopted the existing chart credential into '$GRAFANA_SECRET_NAME' — the value is unchanged (D-04)"
+      else
+        step "monitoring: created '$GRAFANA_SECRET_NAME' with a generated admin password (D-04)"
+      fi
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 verify_grafana_credentials() {  # verify_grafana_credentials — prove the Grafana Secret authenticates (D-04..D-10)
@@ -302,6 +466,12 @@ provision_monitoring_stack() {  # provision_monitoring_stack <versions_file> <ch
   fi
   keyring_path="$keyring_path.bin"
   helm_bin="$(helm_binary_path "$platform_arch" "$verified_helm_archive" "$tmp_dir")" || return 1
+  # Phase 323 (D-04, Pitfall 4/Pitfall 5): the installer-owned admin Secret must
+  # exist BEFORE the chart renders Grafana — otherwise the pod starts against a
+  # Secret that is not there. Anchored after the keyring/dearmor proof so a
+  # failed provenance check never writes Secret material, and before the upgrade
+  # so the chart never points at a missing Secret.
+  ensure_grafana_admin_secret || return 1
   sudo env KUBECONFIG="$K3S_KUBECONFIG" "$helm_bin" upgrade --install kube-prometheus-stack --reset-values \
     "$KUBE_PROMETHEUS_STACK_CHART" \
     --version "$KUBE_PROMETHEUS_STACK_VERSION" \

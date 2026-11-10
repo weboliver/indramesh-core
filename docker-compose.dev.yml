@@ -41,17 +41,33 @@ services:
       - ./backend:/app
 
   frontend:
-    # Phase 317.3 (D-03): the base file builds and serves the production SPA
-    # (literal `ENVIRONMENT: production`, `vite preview`, strict nginx CSP). The
-    # overlay is the only place that selects the development image and the Vite
-    # dev server again — HMR exists with this overlay and nowhere else.
+    # Phase 323 (D-14/D-16): the base file builds the static Caddy image from the
+    # repository root and serves it on container port 8080. This overlay is the
+    # only place that selects the development image and the Vite dev server
+    # again — it resets the build context, the Dockerfile, both build args and
+    # the command, so HMR exists with this overlay and nowhere else.
+    #
+    # The `!override` tag on `ports` is required, not cosmetic: Compose merges
+    # `ports` by the unique key {ip, target, published, protocol}, so an entry
+    # with a different target is APPENDED to the base 8080 entry instead of
+    # replacing it — two host-port assignments on the same published port.
+    # `!override` replaces the list outright (Docker Compose >= 2.24.4).
+    # The development image gets its own name. It must never be derived, because
+    # the base file's frontend would then hand its release tag to this build (and
+    # vice versa) — see the comment there.
+    image: indramesh-frontend-dev
     build:
+      context: ./frontend
+      dockerfile: Dockerfile
       args:
         ENVIRONMENT: development
+        VITE_ENVIRONMENT: development
     environment:
       - ENVIRONMENT=development
       - VITE_ENVIRONMENT=development
     command: ["npm", "run", "dev", "--", "--host"]
+    ports: !override
+      - "127.0.0.1:${FRONTEND_PORT:-5173}:5173"
     volumes:
       - ./frontend:/app
       - /app/node_modules

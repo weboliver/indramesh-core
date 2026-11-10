@@ -12,6 +12,11 @@
 # values.yaml of the new chart version and re-confirm every key below before
 # moving the pin (D-10).
 #
+# Phase 323 (D-20): the chart pin 18.13.8 stays — it carries appVersion 3.7.8,
+# so the image tag is raised instead (see the `loki.image.tag` override in the
+# `loki:` block). No trim key changed, and all of them keep their 18.13.8
+# verification because the chart itself did not move.
+#
 # Review-Korrekturen 2026-10-06 (verified against the real chart loki-18.13.8
 # via `helm template`; binding):
 #   1. backend/read/write.replicas MUST be 0 — chart defaults are 3 each, and
@@ -35,6 +40,16 @@
 deploymentMode: Monolithic
 
 loki:
+  # Phase 323 (D-20, IMG-07): the pinned chart 18.13.8 carries appVersion 3.7.8
+  # (`helm show chart` verified), so the image is raised to 3.7.9 — the smallest
+  # release on the same line that closes the HIGH/CRITICAL findings measured in
+  # the 1.0.0 image (.planning/security/trivy-323-1.0.1.txt). This is the
+  # component-level `loki.image.tag` key that the monolithic StatefulSet reads;
+  # verified with `helm template` against the pinned chart (rendered image:
+  # docker.io/grafana/loki:3.7.9). No chart bump, so every trim key below keeps
+  # its 18.13.8 verification.
+  image:
+    tag: "3.7.9"
   # Default true — every query would otherwise need an X-Scope-OrgID header.
   auth_enabled: false
   # Default s3. This stack has no object storage; use the local filesystem.

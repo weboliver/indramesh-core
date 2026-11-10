@@ -28,10 +28,16 @@ route:
 postgres:
   image:
     repository: indramesh-stateful-postgres
-    tag: 18.4-age1.8.0-pgv0.8.7
+    tag: 18.4-age1.8.0-pgv0.8.7-r1
     pullPolicy: IfNotPresent
   database: indramesh
   user: postgres
+  # Phase 322 (DEPL-02/D-15): the non-secret name of the DML-only application
+  # role the backend and worker query as. The password never lives here — it
+  # comes from the indramesh-database Secret (key DB_APP_PASSWORD). An empty
+  # value selects the documented DB_USER fallback; the worker then also renders
+  # DB_USER/DB_PASSWORD so it can connect at all (Pitfall 12).
+  appUser: ""
   persistence:
     storageClassName: local-path
     accessModes: [ReadWriteOnce]
@@ -466,8 +472,15 @@ plugins:
 # k3s-trim values live in scripts/k8s/monitoring-values.yaml — nothing here is
 # secret (T-254-02); operators override only the affected non-secret subtree
 # through a private values file passed to the installer.
+#
+# Phase 323 (D-01/D-02): lean by default. A chart install WITHOUT the installer
+# renders neither the ServiceMonitor/dashboards nor a front-door route to
+# Grafana; the installer writes this value on every run from MONITORING_ENABLED,
+# so its behaviour is unchanged. With the switch off the nginx ConfigMap renders
+# the /grafana/ location as a self-answering 404 instead of naming an upstream
+# that would never resolve (templates/nginx-configmap.yaml).
 monitoring:
-  enabled: true
+  enabled: false
   # Namespace the installer provisions the kube-prometheus-stack into
   # (scripts/k8s/lib/monitoring.sh). Used for the cross-namespace
   # NetworkPolicy clauses and the nginx upstream FQDN.
@@ -487,10 +500,16 @@ monitoring:
 # Phase 262 (UI-K8S-01, D-01..D-03): non-secret Headlamp Web UI defaults. The
 # headlamp.enabled switch gates the headlamp-rbac.yaml and headlamp-deployment
 # templates plus the NetworkPolicy allow-list clauses (templates/
-# networkpolicies.yaml) — D-03: default ON, consistent with monitoring/backup,
-# so after install.sh the browser inspector is reachable; UI-less environments
-# disable via values-override (optional renderable, never required). Nothing
-# here is secret (T-254-02); the login identity is a per-user TokenRequest
+# networkpolicies.yaml).
+#
+# Phase 323 (D-01/D-02): lean by default. The switch was ON here until now; a
+# chart install WITHOUT the installer therefore rendered a Headlamp Deployment
+# whose imagePullPolicy: Never never resolves, and the /headlamp/ route appeared
+# under the application host name. The installer writes this value on every run
+# from HEADLAMP_ENABLED (default false), so its behaviour is unchanged; UI-less
+# environments need no values override any more, and an operator who wants the
+# browser inspector passes a private values file with headlamp.enabled: true.
+# Nothing here is secret (T-254-02); the login identity is a per-user TokenRequest
 # token pasted at login (D-04), never chart material.
 #
 # Edit-pair contract: headlamp.image.tag is the Edit-Pair half to
@@ -500,7 +519,7 @@ monitoring:
 # 262-02 Task 1). imagePullPolicy Never follows the Phase 258 convention for
 # locally imported images (research A2: fails fast if the import was skipped).
 headlamp:
-  enabled: true
+  enabled: false
   image:
     repository: ghcr.io/headlamp-k8s/headlamp
     tag: v0.45.0

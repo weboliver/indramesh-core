@@ -127,15 +127,19 @@ endpoint_result_message() {  # endpoint_result_message — installer-facing comp
   esac
 }
 
-probe_native_https() {  # probe_native_https <url> — local curl; trust-store-verified after Phase 259, no bypass flag (D-08/D-09/BOOT-03)
+probe_native_https() {  # probe_native_https <url> — local curl; reachability only, the self-signed certificate is accepted (D-09)
   local url="$1"
   if ! command -v curl >/dev/null 2>&1; then
     preflight_error "reachability: curl is required for the native HTTPS probe (D-09)"
     return 1
   fi
   step "reachability: probing $url from the native host"
-  if ! curl --fail --silent --show-error --max-time 15 "$url" >/dev/null 2>&1; then
-    preflight_error "reachability: HTTPS probe of $url failed (DNS/TCP/HTTP/connectivity/trust error)"
+  # Release 1.0.1 (host-B finding): the installer no longer imports the CA root
+  # into any trust store — the same UX the Docker quickstart ships: the bundled
+  # certificate is self-signed and the operator accepts the browser warning. The
+  # probe therefore proves DNS, TCP, TLS handshake and HTTP status, not trust.
+  if ! curl --fail --silent --show-error --insecure --max-time 15 "$url" >/dev/null 2>&1; then
+    preflight_error "reachability: HTTPS probe of $url failed (DNS/TCP/HTTP/connectivity error)"
     return 1
   fi
   return 0
@@ -149,31 +153,23 @@ probe_windows_https() {  # probe_windows_https <url> — Windows-origin probe vi
     return 1
   fi
   step "reachability: probing $url from Windows (powershell.exe)"
-  # Trust-store-verified after Phase 259: the retained CA root is imported
-  # into the Windows LocalMachine\Root store by trust_store.sh BEFORE this
-  # probe, so curl.exe runs with NO bypass flag (-k) — a successful probe
-  # proves trust as well as connectivity (BOOT-03, research 429). DNS, TCP,
-  # HTTP, and status failures remain errors (D-08). The full URL (host and
-  # path/query) is allowlist-validated by _validate_endpoint_url before this
-  # function is ever reached (T-254-03), and is additionally passed via the
-  # INDRAMESH_PROBE_URL environment variable rather than string interpolation,
-  # so it can never share a quoting context with the PowerShell command
-  # string itself.
-  #
-  # gap-closure (BOOT-03 follow-up, confirmed live): --ssl-no-revoke is
-  # required, not optional. curl.exe on Windows uses Schannel, which
-  # performs an online CRL/OCSP revocation check by default and HARD-fails
-  # the handshake (CRYPT_E_NO_REVOCATION_CHECK) when the certificate offers
-  # neither — exactly the case for our internal cert-manager-issued chain.
-  # A real browser soft-fails this same missing-revocation-info case and
-  # loads the page normally, so this flag only closes that curl.exe/browser
-  # trust-check gap — it does NOT skip certificate, hostname, or chain
-  # validation the way -k/--insecure would, and BOOT-03's no-bypass
-  # contract is unaffected.
-  ps_cmd='$code = & curl.exe -s -o NUL -w "%{http_code}" --ssl-no-revoke $env:INDRAMESH_PROBE_URL; if ($code -ge 200 -and $code -lt 400) { exit 0 } else { exit 1 }'
-  # WSLENV registration required — see trust_store.sh's _trust_import_windows
-  # for why an unregistered variable arrives as $null in the Windows process
-  # (no /p flag here: INDRAMESH_PROBE_URL is a URL, not a filesystem path).
+  # Release 1.0.1 (host-B finding): reachability only, like the native probe.
+  # The former trust-store import needed an elevated Windows session for
+  # LocalMachine\Root and a consent dialog for CurrentUser\Root, so a normal
+  # operator terminal could never register the CA — and a stale CA of an
+  # earlier install with the same subject made Schannel reject the chain
+  # (0x80096004). The probe now accepts the self-signed certificate (-k) and
+  # proves what the operator's browser needs: DNS, TCP, TLS handshake and an
+  # HTTP status from the Windows side. The full URL is allowlist-validated by
+  # _validate_endpoint_url before this function is ever reached (T-254-03) and
+  # is passed via the INDRAMESH_PROBE_URL environment variable rather than
+  # string interpolation, so it never shares a quoting context with the
+  # PowerShell command string itself.
+  ps_cmd='$code = & curl.exe -s -k -o NUL -w "%{http_code}" $env:INDRAMESH_PROBE_URL; if ($code -ge 200 -and $code -lt 400) { exit 0 } else { exit 1 }'
+  # WSLENV registration required: WSL does not forward a shell variable to an
+  # interop-launched Windows process unless WSLENV names it — an unregistered
+  # INDRAMESH_PROBE_URL arrives as $null in PowerShell (no /p flag here: it is a
+  # URL, not a filesystem path).
   local _wslenv="INDRAMESH_PROBE_URL"
   [ -n "${WSLENV:-}" ] && _wslenv="${WSLENV}:${_wslenv}"
   if ! INDRAMESH_PROBE_URL="$url" WSLENV="$_wslenv" powershell.exe -NoProfile -NonInteractive -Command "$ps_cmd" >/dev/null 2>&1; then

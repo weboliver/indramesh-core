@@ -1217,6 +1217,7 @@ class PluginRegistry:
         task_id: uuid.UUID | None = None,
         step_sequence: tuple[str, ...] | None = None,
         task: Task | None = None,
+        context_kind: str | None = None,
     ) -> PluginContext:
         """Build the ``PluginContext`` for plugin ``name``.
 
@@ -1234,6 +1235,12 @@ class PluginRegistry:
         the worker passes the very row it marked RUNNING, so the context's
         task-bound members never look a task up themselves. A route/hook call
         passes neither, and its context refuses those members (review 1).
+
+        ``context_kind`` is stated explicitly by the caller whose call shape
+        alone would misclassify the context — the hook bus passes ``"hook"``
+        for every hook, including the post-commit ``on_language_deleted`` that
+        carries no borrowed session (D-19). Omitted, the context derives it
+        from ``task``/``active_session``.
         """
         if active_session is not None:
             row = await self._get_row(active_session, name)
@@ -1256,6 +1263,7 @@ class PluginRegistry:
             config_schema=config_schema,
             step_sequence=step_sequence,
             task=task,
+            context_kind=context_kind,
         )
 
     def get_plugins_for_capability(

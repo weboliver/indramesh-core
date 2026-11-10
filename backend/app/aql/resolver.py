@@ -17,6 +17,10 @@ from app.services.filter_utils import evaluate_filter_tree
 from app.services.object_type_service import get_descendant_type_ids
 from app.services.record_permission_service import build_record_permission_filter
 from app.services.select_option_service import resolve_select_literal
+from app.services.object_ref_service import (
+    denied_ref_attribute_clause,
+    hidden_ref_clause,
+)
 from app.services.value_visibility import (
     visible_attribute_conditions,
     visible_object_ids_subquery,
@@ -819,6 +823,25 @@ class AQLResolver:
                     ObjectTypeAttribute.name == ObjectRef.from_attribute_name,
                 ),
             ).where(ObjectTypeAttribute.reference_type_id.in_(reftype_ids))
+
+        if self._has_principal():
+            # AUTHZ-08 / D-08 ("every exit"): this traversal selected ObjectRef
+            # rows with no attribute filter at all — not even the metadata-only
+            # `is_hidden` one — so a reference of a denied or hidden attribute
+            # could still match a traversal hop and reveal that it exists. Both
+            # clauses are the selection seam the REST/GraphQL exits use; name
+            # resolution (`_restrict_attribute_statement`) stays untouched.
+            hidden_reference_clause = await hidden_ref_clause(self.db)
+            if hidden_reference_clause is not None:
+                query = query.where(hidden_reference_clause)
+            denied_reference_clause = await denied_ref_attribute_clause(
+                self.db,
+                user_id=self.user_id,
+                role_ids=self.role_ids,
+                is_superuser=self.is_superuser,
+            )
+            if denied_reference_clause is not None:
+                query = query.where(denied_reference_clause)
 
         result = await self.db.execute(query)
         return set(result.scalars().all())

@@ -56,6 +56,11 @@ import re
 #   1.0  v22 requirement flags: the manifest gains the optional
 #        requires_log_store and requires_llm booleans (default false). Additive
 #        and optional, so the pinned surface moves without a version bump.
+#   1.0  v23 outbound URL guard: the plugin SDK facade exports
+#        assert_outbound_url and OUTBOUND_RESOLVE_TIMEOUT_SECONDS so a plugin
+#        can run the same outbound-target policy the core uses (SSRF guard).
+#        Additive and optional; the pinned snapshot in
+#        backend/tests/test_plugin_manifest.py was updated with this line.
 CORE_API_VERSION = "1.0.0"
 
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")

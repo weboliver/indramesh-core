@@ -22,8 +22,12 @@ from app.services.classification_service import (
     load_classifications,
     set_labels,
 )
-from app.services.translation_service import resolve_translations, delete_translations_for
-from app.services.select_option_service import ensure_option_ids, removed_option_ids, option_ids_from_structure
+from app.services.translation_service import (
+    resolve_translations,
+    delete_dependent_translations,
+    delete_translations_for,
+)
+from app.services.select_option_service import ensure_option_ids, removed_option_ids
 from app.services.record_permission_service import (
     _batch_check_has_deny_record_permission,
     build_record_permission_filter,
@@ -1200,13 +1204,7 @@ async def delete_object_type_attribute(
     old_values = model_to_dict(attribute)
     # D-15 / MULTI-07: purge the polymorphic translation rows in the SAME
     # transaction as the entity delete — no orphans.
-    await delete_translations_for(db, "object_type_attribute", [attribute_id])
-    # WR-01: the attribute's own SELECT option ids also own select_option
-    # translation rows — purge those too (entity_id is not a real FK, so
-    # nothing at the DB level cleans them up).
-    option_ids = option_ids_from_structure(attribute.structure)
-    if option_ids:
-        await delete_translations_for(db, "select_option", option_ids)
+    await delete_dependent_translations(db, attribute_ids=[attribute_id])
     # EXT-09-D1 / D-12: a deleted reference attribute takes its refs with it —
     # across the subtree that resolved to it, with a shadowing descendant's own
     # same-named refs untouched. Maintenance deletion (no per-row hook), in the
@@ -1244,6 +1242,8 @@ async def delete_object_type_attribute(
     # mapping through the one put_mapping seam.
     await refresh_index_mapping(attribute_object_type_id)
     await invalidate_entity_cache("object_type_attribute")
+    await invalidate_entity_cache("object_value")
+    await invalidate_entity_cache("object")
     if refs_deleted:
         await invalidate_entity_cache("object_ref")
     await _invalidate_descendant_resolved_caches(db, attribute_object_type_id)

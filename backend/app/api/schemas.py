@@ -137,7 +137,7 @@ async def get_schema_route(
 async def get_schema_template_data_route(
     schema_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: UserResponse = Depends(require_permission("schemas", "read")),
+    current_user: UserResponse = Depends(require_record_permission("schemas", "read", "schema", "schema_id")),
 ):
     return await get_schema_template_data(db, schema_id)
 
@@ -146,7 +146,7 @@ async def get_schema_template_data_route(
 async def get_schema_template_route(
     schema_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: UserResponse = Depends(require_permission("schemas", "read")),
+    current_user: UserResponse = Depends(require_record_permission("schemas", "read", "schema", "schema_id")),
 ):
     result = await db.execute(select(Schema).where(Schema.id == schema_id))
     schema = result.scalar_one_or_none()
@@ -166,7 +166,7 @@ async def update_schema_template_route(
     schema_id: uuid.UUID,
     template_update: TemplateColorsUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: UserResponse = Depends(require_permission("schemas", "create")),
+    current_user: UserResponse = Depends(require_record_permission("schemas", "create", "schema", "schema_id")),
 ):
     fields = template_update_to_schema_update(template_update)
     if not fields:

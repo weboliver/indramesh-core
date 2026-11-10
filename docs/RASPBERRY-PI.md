@@ -49,8 +49,11 @@ On a Raspberry Pi 5 with 8 GB the cold install took **3 min 13.5 s** (measured 2
 
 **From another machine on the network**, use the Pi's IP address, not its host name:
 `https://<pi-ip>:8443`. Add that origin to `CORS_ALLOWED_ORIGINS` in `.env` and restart the stack.
-A host name such as `raspberrypi.local` is refused by the frontend in 1.0 (its preview server only
-accepts `localhost`, `nginx` and IP addresses).
+A host name such as `raspberrypi.local` is refused by the Vite dev server, whose
+`server.allowedHosts` (`frontend/vite.config.js`) lists only `localhost`, `nginx` and IP
+addresses. That restriction belongs to the dev overlay; in 1.0's shipped base stack the SPA
+comes from Caddy (`deploy/k8s-images/frontend/Dockerfile`), which serves files and never inspects
+the `Host` header.
 
 ## k3s quickstart
 
@@ -108,14 +111,11 @@ Memory is still tight. Stop a Compose stack running on the same Pi before the in
 
 ### Access
 
-On the Pi itself, open `https://localhost`; the installer imports its certificate authority into the
-Pi's trust store.
+On the Pi itself, open `https://localhost` and accept the browser warning for the self-signed
+certificate; the installer touches no trust store.
 
 From another machine on the network, open `https://<pi-ip>`. The installer detects the Pi's primary
-IPv4 address and adds it to the certificate; the closing banner prints that address. To trust the
-certificate there, copy the certificate authority from
-`/usr/local/share/ca-certificates/indramesh-local-ca.crt` on the Pi and import it into that
-machine's trust store, or accept the browser warning.
+IPv4 address and adds it to the certificate; the closing banner prints that address. Accept the browser warning there as well.
 
 If the Pi's address changes (DHCP), run the installer again; it reissues the certificate for the new
 address. Give the Pi a fixed address or a DHCP reservation to avoid that. `INDRAMESH_HOST_IP=<ip>`
@@ -124,6 +124,6 @@ sets the address explicitly, `INDRAMESH_HOST_IP=` switches IP access off.
 ## Removing it again
 
 The removal paths are the same as on any other host — see
-[What the installer changes on your host](../README.md#what-the-installer-changes-on-your-host).
+[What the installer changes on your host](DEPLOYMENT.md#what-the-installer-changes-on-your-host).
 Additionally remove `cgroup_memory=1 cgroup_enable=memory` from `/boot/firmware/cmdline.txt` if
 nothing else on the Pi needs it.

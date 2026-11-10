@@ -1,7 +1,8 @@
-# Root-context .dockerignore — applies ONLY to the production frontend image
-# build (deploy/k8s-images/frontend/Dockerfile), the only build whose context is
-# the repository root; every other image build uses its own subdirectory context
-# (backend/, frontend/, deploy/k8s-images/stateful/*) with its own .dockerignore.
+# Root-context .dockerignore — applies to EVERY build whose context is the
+# repository root, i.e. each build of deploy/k8s-images/frontend/Dockerfile: the
+# k3s release image and the Compose base-stack image (Phase 323, D-14/D-15).
+# Every other image build uses its own subdirectory context (backend/, frontend/,
+# deploy/k8s-images/stateful/*) with its own .dockerignore.
 # These entries keep local development state out of the build context: the
 # multi-hundred-MB node_modules transfer on every image build, stray .env
 # secrets and Playwright session/trace state (T-257-07 supply-chain hygiene).

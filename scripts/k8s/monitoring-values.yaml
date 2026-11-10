@@ -44,6 +44,15 @@ prometheus-node-exporter:
   hostRootFsMount:
     enabled: false
 grafana:
+  # Phase 323 (D-04): the admin credential is installer-owned. The installer
+  # ensures the Secret 'indramesh-grafana-admin' in the monitoring namespace
+  # (keys admin-user/admin-password) before this chart is rendered, and
+  # scripts/k8s/lib/monitoring.sh verifies the SAME Secret against the live API
+  # afterwards. The chart's own default keys are exactly admin-user and
+  # admin-password, so no userKey/passwordKey entries are needed. No password
+  # ever lives in this checked-in file (T-254-02 / T-323-02).
+  admin:
+    existingSecret: indramesh-grafana-admin
   # Raised 2026-09-03 (live 502s, Phase 261 D-05 caps too tight in practice):
   # kubectl top showed the grafana container pinned at its 200m CPU limit
   # (throttled) with memory at 470Mi/512Mi (near its ceiling too), causing

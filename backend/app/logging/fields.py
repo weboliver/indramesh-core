@@ -51,6 +51,7 @@ PROCESS_NAMES = (
     "migration-child",
     "plugin-runner",
     "bootstrap-role",
+    "db-roles",
     "alembic",
     "maintenance",
     "storage",

@@ -8,9 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
 from app.models.role import UserRole, Role
+from app.models.permission import RolePermission
 from app.models.user_group import UserGroup
 from app.models.group_role import GroupRole
-from app.services.auth_service import get_password_hash
+from app.services import auth_service
 from app.services.cache_service import invalidate_user_permissions_cache
 from app.services.audit_service import audit_log, model_to_dict
 from app.schemas.crud import UserCreate, UserUpdate, UserRoleAssign
@@ -41,7 +42,7 @@ async def create_user(
     db_user = User(
         username=user_data.username,
         email=user_data.email,
-        password_hash=get_password_hash(user_data.password),
+        password_hash=auth_service.get_password_hash(user_data.password),
         is_active=user_data.is_active if user_data.is_active is not None else True,
         is_superuser=user_data.is_superuser if user_data.is_superuser is not None else False,
     )
@@ -227,7 +228,7 @@ async def reset_user_password(
     if not user or user.is_service_account:
         return False
     old_values = model_to_dict(user)
-    user.password_hash = get_password_hash(new_password)
+    user.password_hash = auth_service.get_password_hash(new_password)
     await db.flush()
     await audit_log(db, "users", user_id, "UPDATE", actor_id,
                     old_values=old_values, new_values=model_to_dict(user))
@@ -262,13 +263,20 @@ async def delete_user(
 
 
 async def assign_role_to_user(
-    db: AsyncSession, user_id: uuid.UUID, assign: UserRoleAssign, actor_id: uuid.UUID | None = None
+    db: AsyncSession, user_id: uuid.UUID, assign: UserRoleAssign, *, actor_id: uuid.UUID
 ) -> UserRole:
     """Assign a role to a user.
 
-    Verifies user and role exist. Inserts UserRole; on IntegrityError
-    (duplicate via uq_user_role constraint → 409). Invalidates the
-    affected user's permission cache after commit.
+    Verifies user and role exist, then applies the SESS-06 grant ceiling
+    before anything is written: an actor may only hand out a role whose
+    granted permissions they already hold (directly or through a group).
+    Inserts UserRole; on IntegrityError (duplicate via uq_user_role
+    constraint → 409). Invalidates the affected user's permission cache
+    after commit.
+
+    ``actor_id`` is a required keyword on purpose: a default would let a new
+    caller silently skip the ceiling, which is exactly the escalation path
+    SESS-06 exists to close.
     """
     # D-06 / WR-04 — verify the target user exists and is not a synthetic
     # service account BEFORE any role lookup/insert: an admin holding
@@ -288,6 +296,15 @@ async def assign_role_to_user(
     role = role_result.scalar_one_or_none()
     if not role:
         raise HTTPException(status_code=404, detail="Role not found")
+
+    # SESS-06 / T-321-07 — the grant ceiling runs BEFORE the insert, so a
+    # refused assignment leaves no row behind.
+    await assert_actor_may_grant_roles(
+        db,
+        [assign.role_id],
+        actor_id,
+        detail="Not authorized. Cannot assign a role that grants permissions you do not hold.",
+    )
 
     user_role = UserRole(user_id=user_id, role_id=assign.role_id)
     db.add(user_role)
@@ -386,3 +403,66 @@ async def resolve_effective_role_ids(
         )
     result = await db.execute(union(direct, grouped))
     return {row[0] for row in result.all()}
+
+
+def granted_permission_names(roles) -> set[str]:
+    """Permission names granted by ``roles`` (deny rows excluded).
+
+    A ``RolePermission`` with ``is_deny=True`` subtracts a permission instead
+    of granting one, so it can never widen an actor's reach. Excluding deny
+    rows here keeps a deny-only role assignable (the empty set is a subset of
+    anything) and stops a deny from counting as a capability the actor needs
+    to hold.
+    """
+    return {
+        role_permission.permission.name
+        for role in roles
+        for role_permission in role.permissions
+        if not role_permission.is_deny
+    }
+
+
+async def assert_actor_may_grant_roles(
+    db: AsyncSession,
+    role_ids,
+    actor_id: uuid.UUID,
+    *,
+    detail: str,
+) -> None:
+    """SESS-06 / D-09 privilege ceiling shared by every grant path.
+
+    An actor may grant only roles whose granted permissions are a subset of
+    their own effective permissions. The effective permission resolver is the
+    single source for "effective": it is deny-aware and covers direct roles
+    AND group-inherited roles, so a membership and a direct assignment can
+    never disagree about what the actor actually holds.
+
+    A superuser bypasses the ceiling explicitly (the TRI317-50 precedent) by
+    loading their actor row here, so no route has to remember to pass a flag.
+    An empty ``role_ids`` is a no-op.
+    """
+    wanted_ids = list(role_ids)
+    if not wanted_ids:
+        return
+
+    actor = (
+        await db.execute(select(User).where(User.id == actor_id))
+    ).scalar_one_or_none()
+    if actor is not None and actor.is_superuser:
+        return
+
+    result = await db.execute(
+        select(Role)
+        .options(selectinload(Role.permissions).selectinload(RolePermission.permission))
+        .where(Role.id.in_(wanted_ids))
+    )
+    roles = result.scalars().all()
+    granted = granted_permission_names(roles)
+    if not granted:
+        # Empty role, deny-only role, or unknown ids: nothing to exceed.
+        return
+
+    held = await auth_service.resolve_user_permissions(str(actor_id))
+    if granted - held:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+

@@ -69,7 +69,6 @@ from app.services.auth_service import (
     require_public_object_create,
     require_public_object_write,
 )
-from app.services.cache_service import invalidate_entity_cache
 from app.services.hook_origin import user_origin
 from app.services.object_ref_service import create_object_ref
 from app.services.object_service import (
@@ -80,7 +79,9 @@ from app.services.object_service import (
     delete_object,
 )
 from app.services.object_value_service import create_object_value
+from app.services.record_permission_service import resolve_record_permission
 from app.services.value_lock_service import ValueLockConflict
+from app.services.value_visibility import resolve_principal_roles
 
 # CORESEAM-11/D-14: the Core-owned origin names for the public write verbs.
 # The public consumer is a distinct authenticated actor (the synthetic service
@@ -121,11 +122,13 @@ from app.public_api.object_read_service import (
     build_public_object_cache_key,
     cache_public_object_shape,
     load_object_read,
+    record_filter_denied_attributes,
     record_filter_object_shape,
 )
 from app.public_api.object_shape import build_object_shape
 from app.public_api.object_write_service import (
     assert_object_delete_attribute_types_allowed,
+    invalidate_composite_write_caches,
     purge_public_object_cache,
     replace_object_values,
     validate_object_payload,
@@ -146,6 +149,32 @@ async def public_create_object(
     db: AsyncSession = Depends(get_db),
     current_user: UserResponse = Depends(require_public_object_create()),
 ):
+    # AUTHZ-07 / D-01/D-03/D-17: the container id arrives in the body, so only
+    # the handler can decide. Readability first, and it answers the route's OWN
+    # missing-container answer (validate_object_payload's exact
+    # "Unknown objectTypeId", 400) so an invisible container is byte-identical
+    # to a nonexistent one — a 404 here would distinguish itself from that 400
+    # and turn the route into an existence oracle. Then the create action: 403
+    # in the public write envelope family ({"errors": [...]}). Both run BEFORE
+    # validate_object_payload on purpose: validation resolves the container's
+    # attribute definitions and would otherwise answer 400 errors naming
+    # attributes the caller must not know about. require_public_object_create()
+    # stays type-level only (D-13/D-17) — the record gate lives here, not in
+    # the dependency.
+    if not current_user.is_superuser:
+        read_decision = await resolve_record_permission(
+            str(current_user.id), "object_type", payload.objectTypeId, "read"
+        )
+        if read_decision is False:
+            raise HTTPException(status_code=400, detail="Unknown objectTypeId")
+        create_decision = await resolve_record_permission(
+            str(current_user.id), "object_type", payload.objectTypeId, "create"
+        )
+        if create_decision is False:
+            raise HTTPException(
+                status_code=403,
+                detail={"errors": ["Not authorized for this object type."]},
+            )
     # D-01: fail-fast pre-validation BEFORE any shared-service call. The
     # validation pass resolves every objectTypeAttributeId, enforces data
     # types, status options, reference targets, cardinality, label presence,
@@ -218,9 +247,23 @@ async def public_create_object(
             for rop in entry.ref_ops:
                 rop.from_object_id = obj.id
                 rop.from_attribute_name = entry.attr_def["name"]
+                # AUTHZ-07: the principal rides along so the shared service's
+                # read filter and its `from` write gate are a second line here
+                # rather than a bypass. The gate stays permissive: the source
+                # is the object this request is creating (it carries no DENY),
+                # and reference TARGETS only have to be readable — validation
+                # already rejected an unreadable one above (D-02 as revised
+                # 2026-11-01).
+                # AUTHZ-08 / D-09: attribute_type_checked — validate_object_payload
+                # step 8b already decided every payload attribute type, this
+                # reference's included, in one batched statement (REV-03), so the
+                # per-reference gate in the service must not run a second time.
                 await create_object_ref(
                     db, rop, actor_id, origin=create_origin,
+                    user_id=str(current_user.id),
+                    is_superuser=current_user.is_superuser,
                     commit=False, emit_index_outbox=False, invalidate_cache=False,
+                    attribute_type_checked=True,
                 )
 
         # D-15: ONE "Updated" touch for the whole payload, never one per value
@@ -260,14 +303,14 @@ async def public_create_object(
         raise
 
     # Post-commit: one enqueue for the one outbox row (persist_status=False —
-    # the row is already ENQUEUED), then one invalidation per namespace (not
-    # one per value).
+    # the row is already ENQUEUED), then one purge of the four namespaces a
+    # composite write can change (D-14: the same helper the PUT path calls),
+    # not one per value.
     await _enqueue_index_job(
         db, obj.id, "index_object_job",
         outbox_id=outbox_entry.id, persist_status=False,
     )
-    await invalidate_entity_cache("object")
-    await invalidate_entity_cache("search")
+    await invalidate_composite_write_caches()
 
     # D-18..D-21: post-commit, best-effort public cache purge. Create
     # changes object/objecttype/schema count keys, so include_hierarchy=True.
@@ -288,9 +331,21 @@ async def public_create_object(
     key = build_public_object_cache_key(str(obj.id), None)
     await cache_public_object_shape(key, shape, ttl=60)  # fail-open
     # quick 261012-blo: filter the caller's response AFTER seeding the shared
-    # (caller-independent, unfiltered) entry.
-    return await record_filter_object_shape(
+    # (caller-independent, unfiltered) entry. D-10/D-11: the composite write
+    # response is a read exit too — the attribute-type DENY strip runs after
+    # the reference strip, exactly like GET, and the D-23 seed stays unfiltered.
+    role_ids = await resolve_principal_roles(
+        db, str(current_user.id), current_user.is_superuser
+    )
+    shape = await record_filter_object_shape(
         db, shape, obj.id, str(current_user.id), is_superuser=current_user.is_superuser
+    )
+    return await record_filter_denied_attributes(
+        db,
+        shape,
+        str(current_user.id),
+        is_superuser=current_user.is_superuser,
+        role_ids=role_ids,
     )
 
 
@@ -371,8 +426,21 @@ async def public_replace_object(
     # seeding the new shape would race with the cache-purge pattern above).
     data = await load_object_read(db, object_id)
     shape = build_object_shape(data)
-    return await record_filter_object_shape(
+    # D-10/D-11: same two post-build filters as the create route — the PUT
+    # response must not echo the values of an attribute type the caller is
+    # denied to read, while the administrator's identical PUT still shows them.
+    role_ids = await resolve_principal_roles(
+        db, str(current_user.id), current_user.is_superuser
+    )
+    shape = await record_filter_object_shape(
         db, shape, object_id, str(current_user.id), is_superuser=current_user.is_superuser
+    )
+    return await record_filter_denied_attributes(
+        db,
+        shape,
+        str(current_user.id),
+        is_superuser=current_user.is_superuser,
+        role_ids=role_ids,
     )
 
 

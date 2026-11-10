@@ -19,6 +19,14 @@ Commands (bounded; there is no ``--all``/``--flush``/namespace override):
   verifies only and writes nothing. Exit codes: ``0`` safe (the old key can be
   removed), ``1`` not safe, ``2`` the run itself failed. Redis is deliberately
   not initialised for this verb.
+* ``repair-search-indexes`` — compare every ``objects_<schema_id>`` index
+  mapping with the mapping the persisted ObjectType definitions imply and
+  report the schemas that diverge. A dry run by default; ``--apply`` deletes,
+  recreates and reindexes ONLY the diverging schemas (``--json`` for the JSON
+  document). Exit codes: ``0`` clean, ``1`` divergence found in a dry run (or a
+  rebuild completed with warnings), ``2`` the run itself failed. Redis is
+  deliberately not initialised for this verb, and search serves no hits for a
+  schema while its index is rebuilt.
 
 Any Redis error propagates to a non-zero exit code and no success record is
 logged, so a partial or interrupted run can never look like a successful
@@ -56,6 +64,12 @@ ROTATE_COMMAND = "rotate-fernet-key"
 ROTATE_FAILURE_EXIT_CODE = 2
 """``rotate-fernet-key``' failure code: ``1`` means "not safe", not "broken"."""
 
+SEARCH_INDEX_REPAIR_COMMAND = "repair-search-indexes"
+"""The search index repair verb (REV-01/D-01)."""
+
+REPAIR_FAILURE_EXIT_CODE = 2
+"""``repair-search-indexes``' failure code: ``1`` means "divergence found"."""
+
 COMMANDS = (
     "clear-queue",
     "purge-cache",
@@ -63,6 +77,7 @@ COMMANDS = (
     "cutover",
     REVALIDATE_COMMAND,
     ROTATE_COMMAND,
+    SEARCH_INDEX_REPAIR_COMMAND,
 )
 
 
@@ -79,12 +94,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="emit the report as JSON (read by revalidate-saved-queries only)",
+        help="emit the report as JSON (read by revalidate-saved-queries and repair-search-indexes)",
     )
     parser.add_argument(
         "--check",
         action="store_true",
         help="verify only, no writes (read by rotate-fernet-key only)",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="rebuild the diverging schema indices; without it the run only reports",
     )
     return parser
 
@@ -154,7 +174,50 @@ async def _rotate_fernet_key(*, check: bool) -> dict:
     return report
 
 
-async def _run(command: str, *, as_json: bool = False, check: bool = False) -> dict:
+async def _repair_search_indexes(*, apply: bool, as_json: bool) -> dict:
+    """Run the search index repair verb without touching Redis (REV-01/D-01).
+
+    Deliberately DB + search-backend only, like the other operator verbs: a
+    maintenance run must not depend on the cache. The pass reports its own exit
+    code and never raises a repair failure into the dispatcher.
+    """
+    from app.db import async_session_maker, engine
+    from app.db.opensearch import close_opensearch, init_opensearch
+    from app.maintenance import search_index_repair
+
+    # The verb runs outside the application lifespan, so nothing has opened the
+    # search client yet: without this, get_opensearch() raised "OpenSearch not
+    # initialized" and every run ended with exit code 2 (release 1.0.1 manual
+    # acceptance, MT-01). An unreachable search backend still fails the run.
+    try:
+        await init_opensearch()
+        report = await search_index_repair.run_repair(async_session_maker, apply=apply)
+    finally:
+        await close_opensearch()
+        await engine.dispose()
+    logger.info(
+        "search index repair report",
+        extra={
+            "command": SEARCH_INDEX_REPAIR_COMMAND,
+            "report_text": (
+                search_index_repair.format_report_json(report)
+                if as_json
+                else search_index_repair.format_report(report)
+            ),
+        },
+    )
+    return report
+
+
+async def _run(
+    command: str,
+    *,
+    as_json: bool = False,
+    check: bool = False,
+    apply: bool = False,
+) -> dict:
+    if command == SEARCH_INDEX_REPAIR_COMMAND:
+        return await _repair_search_indexes(apply=apply, as_json=as_json)
     if command == ROTATE_COMMAND:
         return await _rotate_fernet_key(check=check)
     if command == REVALIDATE_COMMAND:
@@ -184,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
         failure_code = ROTATE_FAILURE_EXIT_CODE
     elif args.command == REVALIDATE_COMMAND:
         failure_code = REVALIDATE_FAILURE_EXIT_CODE
+    elif args.command == SEARCH_INDEX_REPAIR_COMMAND:
+        failure_code = REPAIR_FAILURE_EXIT_CODE
     else:
         failure_code = 1
     try:
@@ -191,6 +256,10 @@ def main(argv: list[str] | None = None) -> int:
             report = asyncio.run(_run(args.command, check=args.check))
         elif args.command == REVALIDATE_COMMAND:
             report = asyncio.run(_run(args.command, as_json=args.json))
+        elif args.command == SEARCH_INDEX_REPAIR_COMMAND:
+            report = asyncio.run(
+                _run(args.command, as_json=args.json, apply=args.apply)
+            )
         else:
             report = asyncio.run(_run(args.command))
     except Exception:  # maintenance mode fails closed

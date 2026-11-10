@@ -37,6 +37,11 @@ ENTRY_POINT_GROUP = "indramesh.plugins"
 # crafted name can never contribute path separators or traversal segments.
 _PLUGIN_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
+# A plugin update stages the new tree as ``<name>.new`` and moves the old one to
+# ``<name>.old`` on the same volume. Neither is a plugin, also after an aborted
+# update that left one behind.
+_UPDATE_STAGING_SUFFIXES = (".new", ".old")
+
 # CORESEAM-06: every directory plugin is imported under this core-controlled,
 # deterministic prefix — never a plugin-supplied name (T-289-06-01). A package
 # directory builds on it: the manifest's ``module`` field is imported as the
@@ -107,6 +112,9 @@ def discover_directory_plugins(plugins_dir: str) -> list[DiscoveryResult]:
     results: list[DiscoveryResult] = []
 
     for entry in sorted(os.listdir(plugins_dir)):
+        if entry.endswith(_UPDATE_STAGING_SUFFIXES):
+            continue
+
         invalid = validate_plugin_name(entry)
         if invalid is not None:
             results.append(invalid)

@@ -58,7 +58,10 @@ export default function RoleAssignmentList({
         const checked = (assignedRoleNames || []).includes(role.name)
         const pending = pendingRoleId === role.id
         const lastRoleLock = checked && disableRemoveGuard
-        const disabled = !canManage || pending || lastRoleLock
+        // SESS-06 suppresses ASSIGNMENT only: a role the caller may not grant
+        // must stay un-checkable, but an already-assigned stronger role (added
+        // earlier by a superuser) stays removable — the API accepts that.
+        const disabled = !canManage || pending || lastRoleLock || (role.assignable === false && !checked)
         return (
           <label
             key={role.id}

@@ -8,6 +8,10 @@ from app.config import settings
 from app.models import ObjectType, ObjectTypeAttribute, Object, ObjectRef
 from app.schemas.crud import GraphNode, GraphEdge, GraphResponse, \
     ObjectGraphNode, ObjectGraphEdge, ObjectGraphResponse
+from app.services.object_ref_service import (
+    denied_ref_attribute_clause,
+    hidden_ref_clause,
+)
 from app.services.record_permission_service import build_record_permission_filter
 
 
@@ -266,13 +270,27 @@ async def get_object_graph(
         return None
 
     cutoff = settings.object_graph_cutoff
-    ref_result = await db.execute(
-        select(ObjectRef.id, ObjectRef.from_object_id, ObjectRef.to_object_id,
-               ObjectRef.from_attribute_name).where(
-            or_(ObjectRef.from_object_id == object_id,
-                ObjectRef.to_object_id == object_id)
-        )
+    ref_query = select(ObjectRef.id, ObjectRef.from_object_id, ObjectRef.to_object_id,
+                       ObjectRef.from_attribute_name).where(
+        or_(ObjectRef.from_object_id == object_id,
+            ObjectRef.to_object_id == object_id)
     )
+    if user_id is not None and not is_superuser:
+        # AUTHZ-08 / D-08 ("every exit"): this reader selected ObjectRef rows
+        # with NO attribute filter at all — not even the metadata-only
+        # `is_hidden` one every other reference exit already applies (the
+        # SEC313-97 family, closed here). A filtered reference contributes
+        # neither an edge nor a neighbour node nor a totalCount unit, so the
+        # graph cannot reveal that a denied or hidden reference exists.
+        hidden_reference_clause = await hidden_ref_clause(db)
+        if hidden_reference_clause is not None:
+            ref_query = ref_query.where(hidden_reference_clause)
+        denied_reference_clause = await denied_ref_attribute_clause(
+            db, user_id=user_id, is_superuser=False
+        )
+        if denied_reference_clause is not None:
+            ref_query = ref_query.where(denied_reference_clause)
+    ref_result = await db.execute(ref_query)
     ref_rows = ref_result.all()
 
     candidates = {

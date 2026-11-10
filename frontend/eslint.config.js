@@ -54,4 +54,21 @@ export default [
       'eqeqeq': 'error',
     },
   },
+  // E2E specs and browser-side helpers. Only `no-undef` is enabled here on
+  // purpose: it is the one rule that catches a call to a helper nobody
+  // imported — exactly the defect that survived into a 31-minute regression
+  // run and failed it (a spec called `accessToken` after Phase 321-08 moved
+  // it into e2e/helpers/). The remaining source rules would flag 13
+  // pre-existing unused-variable sites, which is a separate cleanup.
+  {
+    files: ['e2e/**/*.js'],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      globals: { ...globals.node, ...globals.browser },
+    },
+    rules: {
+      'no-undef': 'error',
+    },
+  },
 ]

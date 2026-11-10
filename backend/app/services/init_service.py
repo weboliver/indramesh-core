@@ -1,7 +1,7 @@
 import logging
 import os
 import uuid
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import async_session_maker
@@ -456,21 +456,26 @@ async def seed_default_roles() -> None:
 
 
 async def seed_languages() -> None:
-    """Seed the five base languages (de/en/fr/pt/es, English display names).
+    """Seed the six bundled interface languages (de/en/es/fr/it/pt).
+
+    Codes and English display names come from the single bundled-language map in
+    ``app.data``, so the seed list cannot drift from the list the rest of the
+    application treats as bundled. Display names are English because they appear
+    identically in every language picker (D-06). The API sorts its response by
+    ``code`` (de, en, es, fr, it, pt), so insertion order carries no meaning.
 
     Idempotent: skips codes that already exist. Safe to call on every startup.
     Per research: seeded at startup, not via Alembic data insert.
     """
+    from app.data import BUNDLED_LANGUAGE_CODES, BUNDLED_LANGUAGE_NAMES
+
     async with async_session_maker() as session:
         result = await session.execute(select(Language.code))
         existing_codes: set[str] = set(result.scalars().all())
 
         base_languages = [
-            {"code": "de", "name": "German"},
-            {"code": "en", "name": "English"},
-            {"code": "fr", "name": "French"},
-            {"code": "pt", "name": "Portuguese"},
-            {"code": "es", "name": "Spanish"},
+            {"code": code, "name": BUNDLED_LANGUAGE_NAMES[code]}
+            for code in BUNDLED_LANGUAGE_CODES
         ]
         to_seed = [Language(**lang) for lang in base_languages if lang["code"] not in existing_codes]
         if to_seed:
@@ -722,6 +727,15 @@ async def seed_canonical_attribute_types() -> None:
             await session.commit()
 
 
+# D-12 (Phase 323.1): the startup prune only runs when the *loaded* seed
+# catalog carries at least this many keys. A shorter list is treated as
+# truncated/vacuous — the same 1000-key threshold the lean-core locale gate
+# uses (backend/tests/test_core_lean_gate.py: MIN_LOCALE_CATALOG_KEYS), where a
+# catalog below it is a defect rather than a clean pass. Never compare against
+# a constant seed inventory: the point is to catch a damaged load.
+PRUNE_MIN_KEYS = 1000
+
+
 async def seed_ui_strings() -> bool:
     """Idempotent startup seed for the ui_strings key registry.
 
@@ -730,6 +744,16 @@ async def seed_ui_strings() -> bool:
     code-side default changed. ``seed_ui_catalog()`` invalidates the
     ui_translations cache tag once when this registry or its English systemui
     rows change; a no-op re-seed leaves the cache intact.
+
+    Since Phase 323.1 (I18N-03 / D-11..D-13) the registry is also pruned: every
+    ui_strings row whose key is no longer in the committed seed list is deleted,
+    together with its ``systemui`` translations — including orphaned systemui
+    rows from earlier deletions, so ``coverage.translated`` and the denominator
+    of the coverage can no longer disagree. The prune is one-way (no soft
+    delete, no retention window) and guarded by ``PRUNE_MIN_KEYS``: a seed list
+    shorter than that means the catalog failed to load completely, and then
+    nothing is deleted. Keys that stay, and their admin-edited translations,
+    are never touched.
 
     Per D-01/D-02 (Phase 230 CONTEXT.md), the seed list in
     backend/app/data/ui_strings.json is deliberately near-empty in this
@@ -767,6 +791,60 @@ async def seed_ui_strings() -> bool:
         if changed:
             await session.commit()
             registry_changed = True
+
+        # --- Prune (I18N-03 / D-11..D-13) -------------------------------------
+        # A key that left the code must leave the registry. Candidates are
+        # derived in Python from the rows already loaded above — sending a
+        # NOT IN list with >1700 bound parameters would be pointless traffic.
+        # Guard BEFORE any delete: a truncated catalog deletes nothing.
+        seed_keys = {item["key"] for item in seed_items}
+        if len(seed_keys) >= PRUNE_MIN_KEYS:
+            orphan_keys = [key for key in existing_rows if key not in seed_keys]
+            deleted_keys = 0
+            if orphan_keys:
+                delete_result = await session.execute(
+                    delete(UiString).where(UiString.key.in_(orphan_keys))
+                )
+                deleted_keys = delete_result.rowcount or 0
+
+            # Orphaned systemui rows (no ui_strings row) count towards
+            # coverage.translated but render nowhere. The subquery sees the
+            # deletion above — same transaction — so the keys removed just now
+            # and older orphans are cleaned in this single statement. Scoped
+            # strictly to the systemui type; other translation families that
+            # share an entity_id are not ours to touch.
+            deleted_translations = 0
+            type_result = await session.execute(
+                select(TranslationType).where(TranslationType.code == "systemui")
+            )
+            systemui_type = type_result.scalar_one_or_none()
+            if systemui_type is not None:
+                delete_result = await session.execute(
+                    delete(Translation).where(
+                        Translation.translation_type_id == systemui_type.id,
+                        Translation.entity_id.not_in(select(UiString.id)),
+                    )
+                )
+                deleted_translations = delete_result.rowcount or 0
+
+            await session.commit()
+            if deleted_keys or deleted_translations:
+                registry_changed = True
+            # Exactly one prune line per start on this path — including the
+            # no-op case — so a log grep for the prune prefix is deterministic.
+            # Counters only: never a key or a translation value.
+            logger.info(
+                "ui_strings prune: deleted %d keys, %d translations",
+                deleted_keys,
+                deleted_translations,
+            )
+        else:
+            # Nothing is deleted; the single guard line is the whole log output.
+            logger.warning(
+                "ui_strings prune: skipped — seed list %d keys, guard %d",
+                len(seed_keys),
+                PRUNE_MIN_KEYS,
+            )
 
     return registry_changed
 
@@ -842,7 +920,7 @@ async def seed_ui_translations() -> bool:
 # A partial catalog silently renders the unseeded remainder in English while the
 # locale file still looks fully translated — backend/tests/test_ui_inventory_parity.py
 # pins the two together.
-_UI_TRANSLATION_LOCALE_CODES = ("de", "es", "fr", "pt")
+_UI_TRANSLATION_LOCALE_CODES = ("de", "es", "fr", "it", "pt")
 
 
 async def seed_ui_translations_locales() -> bool:

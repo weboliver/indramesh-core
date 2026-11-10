@@ -1,7 +1,7 @@
 fastapi==0.141.1
 starlette==1.4.0
 strawberry-graphql==0.335.0
-graphql-core==3.3.0
+graphql-core==3.3.1
 uvicorn[standard]==0.52.1
 asyncpg==0.31.0
 sqlalchemy[asyncio]==2.0.51

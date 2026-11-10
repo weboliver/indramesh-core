@@ -19,6 +19,7 @@ from app.services.object_ref_service import (
     create_object_ref, list_object_refs, get_object_ref,
     update_object_ref, delete_object_ref, object_ref_visible,
     visible_ref_conditions, hidden_ref_clause, ref_hidden_by_attribute,
+    denied_ref_attribute_clause, ref_denied_by_attribute_type,
     InvalidRefAttributeError,
 )
 from app.services.record_permission_service import build_record_permission_filter
@@ -77,6 +78,18 @@ async def list_object_refs_route(
             if hidden_clause is not None:
                 query = query.where(hidden_clause)
                 count_query = count_query.where(hidden_clause)
+            # AUTHZ-08 / D-08: this branch builds its own query and never enters
+            # ``list_object_refs``, so the attribute-type deny has to be applied
+            # here too. The clause carries its own superuser guard, which keeps
+            # the branch readable even if the surrounding ``if`` changes.
+            denied_clause = await denied_ref_attribute_clause(
+                db,
+                user_id=str(current_user.id),
+                is_superuser=current_user.is_superuser,
+            )
+            if denied_clause is not None:
+                query = query.where(denied_clause)
+                count_query = count_query.where(denied_clause)
         total = (await db.execute(count_query)).scalar()
         result = await db.execute(query)
         items = result.scalars().all()
@@ -114,6 +127,16 @@ async def get_object_ref_route(
     # use, so a cached dict served above cannot bypass it. Superusers keep their
     # zero-query path (RLR-05).
     if not current_user.is_superuser and await ref_hidden_by_attribute(db, ref_id):
+        raise HTTPException(status_code=404, detail="Object reference not found")
+    # AUTHZ-08 / D-08: the same id-based shape for the attribute-type record
+    # DENY, so a cached dict served above cannot bypass it and a denied ref is
+    # indistinguishable from a nonexistent one.
+    if not current_user.is_superuser and await ref_denied_by_attribute_type(
+        db,
+        ref_id,
+        user_id=str(current_user.id),
+        is_superuser=current_user.is_superuser,
+    ):
         raise HTTPException(status_code=404, detail="Object reference not found")
     return ref
 

@@ -33,7 +33,7 @@ from app.services.audit_service import audit_log, model_to_dict, resolve_select_
 from app.services.select_option_service import build_option_map, resolve_display_value
 from app.services.translation_service import delete_translations_for, resolve_translations
 from app.services.value_lock_service import assert_value_writable
-from app.services.value_visibility import visible_value_conditions
+from app.services.value_visibility import apply_value_visibility, visible_value_conditions
 from app.services import hook_origin
 
 ENTITY_TYPE = "object_value"
@@ -845,26 +845,13 @@ async def list_object_values(
     count_query = select(func.count()).select_from(ObjectValue)
     if not is_superuser and user_id is not None:
         # D-05: the predicate lives in the SQL, before anything is cached.
+        # D-06: the joins come from the one definition in value_visibility —
+        # page and count statement share it, so neither can lose a table.
         conditions = await visible_value_conditions(
             db, user_id, False, role_ids=role_ids
         )
-        # `Select.join()` takes one target (plus an optional onclause) per
-        # call — the three join targets must be applied sequentially.
-        for target, onclause in (
-            (Object, Object.id == ObjectValue.object_id),
-            (
-                ObjectTypeAttribute,
-                ObjectTypeAttribute.id == ObjectValue.object_type_attribute_id,
-            ),
-            (
-                AttributeType,
-                AttributeType.id == ObjectTypeAttribute.attribute_type_id,
-            ),
-        ):
-            query = query.join(target, onclause)
-            count_query = count_query.join(target, onclause)
-        query = query.where(*conditions)
-        count_query = count_query.where(*conditions)
+        query = apply_value_visibility(query, conditions)
+        count_query = apply_value_visibility(count_query, conditions)
     elif exclude_hidden:
         query = query.join(ObjectTypeAttribute).where(ObjectTypeAttribute.is_hidden.is_(False))
         count_query = count_query.join(ObjectTypeAttribute).where(ObjectTypeAttribute.is_hidden.is_(False))

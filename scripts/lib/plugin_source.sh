@@ -265,6 +265,63 @@ plugin_manifest_api_version() {  # plugin_manifest_api_version <plugin-dir> — 
 }
 
 # ---------------------------------------------------------------------------
+# Version comparison for the update path (D-27). An installed plugin is only
+# ever replaced by a HIGHER version: plugin migrations run forward only, so a
+# downgrade is refused outright. Both sides must carry a readable three-part
+# numeric version — anything else is an error, never a string comparison.
+# ---------------------------------------------------------------------------
+
+PLUGIN_SOURCE_VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
+
+plugin_manifest_version() {  # plugin_manifest_version <plugin-dir> — echo the declared three-part version
+  local dir="$1" version
+  version="$(plugin_manifest_value "$dir" version)"
+  if [ -z "$version" ]; then
+    preflight_error "plugin_source: $dir/plugin.toml declares no 'version' — refusing (an installed plugin needs a readable version to be updated)"
+    return 1
+  fi
+  printf '%s' "$version"
+}
+
+plugin_compare_versions() {  # plugin_compare_versions <a> <b> — echo 1, 0 or -1 (a higher, equal, lower); refuse invalid input
+  local a="${1:-}" b="${2:-}" value i
+  local -a a_parts b_parts
+  for value in "$a" "$b"; do
+    if ! printf '%s' "$value" | grep -Eq "$PLUGIN_SOURCE_VERSION_RE"; then
+      preflight_error "plugin_source: cannot compare '$value' — a plugin version must be three numeric parts, like 1.2.3"
+      return 1
+    fi
+  done
+  IFS=. read -r -a a_parts <<< "$a"
+  IFS=. read -r -a b_parts <<< "$b"
+  for i in 0 1 2; do
+    if [ "$((10#${a_parts[$i]}))" -gt "$((10#${b_parts[$i]}))" ]; then
+      printf '1'
+      return 0
+    fi
+    if [ "$((10#${a_parts[$i]}))" -lt "$((10#${b_parts[$i]}))" ]; then
+      printf '%s' '-1'
+      return 0
+    fi
+  done
+  printf '0'
+}
+
+plugin_update_action() {  # plugin_update_action <installed-version> <new-version> — echo replace | same | refuse
+  local installed="${1:-}" new="${2:-}" verdict
+  verdict="$(plugin_compare_versions "$new" "$installed")" || return 1
+  case "$verdict" in
+    1) printf 'replace' ;;
+    0) printf 'same' ;;
+    -1) printf 'refuse' ;;
+    *)
+      preflight_error "plugin_source: internal error comparing '$installed' with '$new'"
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # The API-contract verification (D-13): the Core application's OWN rule, run
 # inside the Core container. Two entry points, because the two stacks reach the
 # container differently — the verdict itself is shared.

@@ -44,18 +44,29 @@ def sequence_name(schema_id: uuid.UUID | str) -> str:
 
 
 async def create_schema_sequence(db: AsyncSession, schema_id: uuid.UUID) -> None:
-    """Create the per-schema keygen sequence if missing (idempotent)."""
-    await db.execute(text(
-        f"CREATE SEQUENCE IF NOT EXISTS {sequence_name(schema_id)}"
-    ))
+    """Create the per-schema keygen sequence if missing (idempotent).
+
+    The runtime role holds no ``CREATE`` on schema ``public`` (D-01), so the DDL
+    runs inside the owner's ``SECURITY DEFINER`` function; the caller only needs
+    ``EXECUTE``.
+    """
+    await db.execute(
+        text("SELECT public.indramesh_keygen_sequence_create(:schema_id)"),
+        {"schema_id": schema_id},
+    )
     await db.flush()
 
 
 async def drop_schema_sequence(db: AsyncSession, schema_id: uuid.UUID) -> None:
-    """Drop the per-schema keygen sequence if present (idempotent)."""
-    await db.execute(text(
-        f"DROP SEQUENCE IF EXISTS {sequence_name(schema_id)}"
-    ))
+    """Drop the per-schema keygen sequence if present (idempotent).
+
+    Mirrors :func:`create_schema_sequence`: the drop also goes through the
+    owner's definer function, never a direct ``DROP`` from the runtime role.
+    """
+    await db.execute(
+        text("SELECT public.indramesh_keygen_sequence_drop(:schema_id)"),
+        {"schema_id": schema_id},
+    )
     await db.flush()
 
 
@@ -75,11 +86,16 @@ async def next_key(db: AsyncSession, schema: Schema) -> str:
         )
     try:
         result = await db.execute(text(
-            f"SELECT nextval('{sequence_name(schema.id)}')"
+            f"SELECT nextval('public.{sequence_name(schema.id)}')"
         ))
     except ProgrammingError as exc:
-        raise KeygenNotConfiguredError(
-            f"Schema {schema.id} has no keygen sequence; cannot mint a native key"
-        ) from exc
+        # Only a genuinely absent sequence is a domain "not configured" error.
+        # A missing grant is a ProgrammingError too and must stay visible
+        # instead of masquerading as an unconfigured schema (D-11).
+        if getattr(getattr(exc, "orig", None), "sqlstate", None) == "42P01":
+            raise KeygenNotConfiguredError(
+                f"Schema {schema.id} has no keygen sequence; cannot mint a native key"
+            ) from exc
+        raise
     number = result.scalar_one()
     return f"{schema.keygen}-{number}"

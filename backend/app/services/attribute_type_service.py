@@ -19,7 +19,7 @@ from app.services.cache_service import (
     CACHE_TTL_LIST,
     CACHE_TTL_ENTITY,
 )
-from app.services.record_permission_service import build_record_permission_filter
+from app.services.record_permission_service import build_record_permission_filter, delete_dependent_record_permissions
 from app.services.audit_service import audit_log, model_to_dict
 
 ENTITY_TYPE = "attribute_type"
@@ -261,6 +261,7 @@ async def delete_attribute_type(
     old_values = model_to_dict(attribute_type)
     await audit_log(db, "attribute_types", attribute_type_id, "DELETE", actor_id,
                     old_values=old_values, new_values=None)
+    await delete_dependent_record_permissions(db, attribute_type_ids=[attribute_type_id])
     await db.delete(attribute_type)
     await db.commit()
     await invalidate_entity_cache(ENTITY_TYPE)

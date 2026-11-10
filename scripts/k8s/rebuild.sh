@@ -63,7 +63,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Defense-in-depth (WR-02): images.sh overwrites the global ROOT_DIR with its
 # own lib-relative depth math — assert the result is still the repository root
 # so a future source reorder can never silently break the ROOT_DIR-relative
-# seams below (NGINX_CONF_FILE, CHART_DIR).
+# seams below (CHART_DIR).
 [ -f "$ROOT_DIR/rebuild_indramesh_k8s.sh" ] \
   || die "rebuild" "ROOT_DIR resolved to '$ROOT_DIR' — expected the repository root (WR-02)"
 
@@ -74,7 +74,6 @@ VERSIONS_FILE="${INDRAMESH_VERSIONS_FILE:-$K8S_DIR/versions.env}"
 HELM_UPGRADE_TIMEOUT="${HELM_UPGRADE_TIMEOUT:-10m}"
 NGINX_VALIDATE_TIMEOUT="${INDRAMESH_NGINX_VALIDATE_TIMEOUT:-120s}"
 ROLLOUT_TIMEOUT="${INDRAMESH_REBUILD_ROLLOUT_TIMEOUT:-180s}"
-NGINX_CONF_FILE="${INDRAMESH_NGINX_CONF_FILE:-$ROOT_DIR/deploy/helm/indramesh/nginx.conf}"
 NGINX_VALIDATE_MANIFEST="${INDRAMESH_NGINX_VALIDATE_MANIFEST:-$SCRIPT_DIR/nginx-validate-pod.yaml}"
 
 load_versions "$VERSIONS_FILE" || die "rebuild" "failed to load pinned versions (D-10)"
@@ -227,7 +226,25 @@ done
 # the cert-manager leaf Secret (indramesh-local-tls, D-03) so it validates the
 # exact TLS material Helm will deploy.
 # ---------------------------------------------------------------------------
+# WR-01: read the currently-deployed release values into a private contract
+# file (fail-closed, mirroring deployed_refs_from_pods's discipline): a
+# non-NotFound read failure aborts before Helm rather than silently
+# re-asserting an empty contract and letting --reset-values revert operator
+# overrides. The D-23 release-present gate above guarantees the release
+# exists, so ANY failure here is a hard error.
+DEPLOYED_VALUES_FILE="$TMP_DIR/deployed-values.yaml"
+if ! sudo env KUBECONFIG="$K3S_KUBECONFIG" "$HELM_BIN" get values "$HELM_RELEASE_NAME" -n "$HELM_NAMESPACE" -o yaml > "$DEPLOYED_VALUES_FILE" 2>"$TMP_DIR/helm-get-values.err"; then
+  preflight_error "rebuild: failed to read the deployed release values (WR-01): $(cat "$TMP_DIR/helm-get-values.err")"
+  exit 1
+fi
+
 if [ "$BUILD_NGINX" -eq 1 ]; then
+  # The validation input is the nginx.conf Helm will deploy, rendered with the
+  # deployed values above — never the raw chart file (render_chart_nginx_conf).
+  NGINX_CONF_FILE="$TMP_DIR/nginx-validate.conf"
+  step "rebuild: rendering the chart's nginx.conf with the deployed values (D-07)"
+  render_chart_nginx_conf "$HELM_BIN" "$CHART_DIR" "$DEPLOYED_VALUES_FILE" "$NGINX_CONF_FILE" || exit 1
+
   step "rebuild: creating the disposable nginx -t validation ConfigMap (D-07)"
   kubectl_indramesh create configmap "$NGINX_VALIDATE_CONFIGMAP_NAME" -n "$HELM_NAMESPACE" \
     --from-file=nginx.conf="$NGINX_CONF_FILE" \
@@ -270,18 +287,6 @@ fi
 # ---------------------------------------------------------------------------
 IMAGE_TAGS_FILE="$TMP_DIR/image-tags.yaml"
 step "rebuild: writing the private image-tags values file — full running contract (D-22/D-25)"
-
-# WR-01: read the currently-deployed release values into a private contract
-# file (fail-closed, mirroring deployed_refs_from_pods's discipline): a
-# non-NotFound read failure aborts before Helm rather than silently
-# re-asserting an empty contract and letting --reset-values revert operator
-# overrides. The D-23 release-present gate above guarantees the release
-# exists, so ANY failure here is a hard error.
-DEPLOYED_VALUES_FILE="$TMP_DIR/deployed-values.yaml"
-if ! sudo env KUBECONFIG="$K3S_KUBECONFIG" "$HELM_BIN" get values "$HELM_RELEASE_NAME" -n "$HELM_NAMESPACE" -o yaml > "$DEPLOYED_VALUES_FILE" 2>"$TMP_DIR/helm-get-values.err"; then
-  preflight_error "rebuild: failed to read the deployed release values (WR-01): $(cat "$TMP_DIR/helm-get-values.err")"
-  exit 1
-fi
 
 if [ "$BUILD_BACKEND" -eq 1 ]; then
   # D-22: backend selection unconditionally moves BOTH Backend and Worker to

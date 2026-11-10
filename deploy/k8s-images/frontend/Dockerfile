@@ -1,9 +1,11 @@
 # deploy/k8s-images/frontend/Dockerfile — production-only static frontend image
-# for the k3s release (APP-01, D-01..D-04, T-257-07/08). Multi-stage build:
-# deterministic `npm ci` against the committed frontend lockfile, `vite build`,
-# then Caddy's compiled runtime serving the SPA from /srv on unprivileged port
-# 8080 (D-03). The Compose dev image (frontend/Dockerfile) and its Vite dev
-# command are intentionally unchanged; port 5173 stays the Compose/Vite contract.
+# for the k3s release AND the Compose base stack (APP-01, D-01..D-04,
+# T-257-07/08; Phase 323 D-14 gives Compose the same definition). Multi-stage
+# build: deterministic `npm ci` against the committed frontend lockfile,
+# `vite build`, then Caddy's compiled runtime serving the SPA from /srv on
+# unprivileged port 8080 (D-03). The Compose dev image (frontend/Dockerfile) and
+# its Vite dev command are intentionally unchanged; port 5173 stays the
+# Compose/Vite dev-overlay contract.
 
 # ---- build stage: deterministic lockfile install + production build ----
 FROM node:22-alpine AS build
@@ -52,7 +54,7 @@ RUN npm run build
 # Manifest-verified dedicated static server: SPA fallback for client routes,
 # ordinary file_server for dot-suffixed assets (genuinely missing assets stay
 # HTTP 404), and a probe-only health responder — see the sibling Caddyfile.
-FROM caddy:2.10.2-alpine
+FROM caddy:2.11.9-alpine
 
 # compiled assets + the routing contract
 COPY --from=build /build/dist /srv

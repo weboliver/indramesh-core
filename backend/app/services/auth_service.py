@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Annotated, Awaitable, Callable, NamedTuple
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import (
@@ -34,30 +35,62 @@ from app.logging.security import (
     mark_permission_denied,
     mark_token_rejected,
 )
-from app.services import cache_service
+from app.services import cache_service, session_service, login_throttle
+from app.services.secret_validation import validate_jwt_secret_key
 from app.services.record_permission_service import resolve_record_permission
 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30 * 24 * 60  # 30 days — browser session lifetime
+# D-03: the browser keeps the long-lived credential in the HttpOnly refresh
+# cookie (session_service); the bearer token is short-lived by design.
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
 TOKEN_BLOCKLIST_PREFIX = "token_blocklist:"
+SESSION_BLOCKLIST_PREFIX = "session_blocklist:"
+
+# SESS-03 / D-05 — an unknown username must cost exactly the same bcrypt work as
+# a known one, so the comparison always runs. When no row matched, the submitted
+# password is checked against this fixed digest instead. It is a real bcrypt
+# hash (cost 12, the same cost `get_password_hash` uses) of a random value that
+# is not stored anywhere: only the digest ships, so there is no plaintext to
+# leak, in code, tests or comments.
+_DUMMY_PASSWORD_HASH = (
+    "$2b$12$Q./FuSUjjUOkugxgZh23IuWsB.5wWO..jSPtQLmiISmGxf2aKZhG2"
+)
+# Acceptance rule (D-05): the median `_authenticate` duration of an unknown
+# username may differ from that of a known one by at most this many seconds.
+LOGIN_TIMING_TOLERANCE_SECONDS = 0.050
+
+# SESS-05 — the revocation store fails CLOSED: an unreachable Valkey refuses a
+# token (503) instead of treating it as "not revoked". Note the deliberate
+# asymmetry with the login throttle (321-02), which fails OPEN — refusing every
+# login while the store is down would turn a cache outage into a lockout. The
+# former boolean helper returned False on error and was exactly the fail-open
+# seam removed here.
+
+
+class BlocklistState(str, Enum):
+    """Tri-state revocation result: an unavailable store is never "valid"."""
+
+    REVOKED = "revoked"
+    VALID = "valid"
+    UNAVAILABLE = "unavailable"
+
 
 _secret_key: str | None = None
 
 
 def get_secret_key() -> str:
-    """Lazily load JWT_SECRET_KEY from environment on first access.
+    """Lazily load and validate JWT_SECRET_KEY on first access.
 
-    Caches the value after first read to avoid repeated os.environ access.
-    Raises RuntimeError if not set — validated at startup in lifespan.
+    Caches the value only after a successful validation, and shares the one rule
+    with the startup lifespan (`secret_validation.validate_jwt_secret_key`), so
+    the lazy path and the startup path cannot drift. Raises RuntimeError naming
+    the variable when it is absent or shorter than the documented minimum.
     """
     global _secret_key
     if _secret_key is None:
-        _secret_key = os.environ.get("JWT_SECRET_KEY")
-        if not _secret_key:
-            raise RuntimeError(
-                "JWT_SECRET_KEY environment variable is required but not set. "
-                "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
-            )
+        value = os.environ.get("JWT_SECRET_KEY")
+        validate_jwt_secret_key(value)
+        _secret_key = value
     return _secret_key
 
 
@@ -120,19 +153,23 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     return encoded_jwt
 
 
-async def _is_token_blocklisted(jti: str) -> bool:
-    """Check if a token has been revoked via the Redis blocklist.
+async def blocklist_state(*keys: str) -> BlocklistState:
+    """Look up revocation keys and report a tri-state result (SESS-05).
 
-    Returns True if blocklisted, False if not blocklisted or if Redis is unavailable.
-    Fail-open: if Redis is down, allows the request (blocklist check is defense-in-depth,
-    not a primary auth control).
+    One ``MGET`` round trip for every key: this runs on every authenticated
+    request, so two sequential GETs would double Valkey latency for the whole
+    API. ``UNAVAILABLE`` is a distinct outcome, never collapsed into ``VALID``.
     """
+    if not keys:
+        return BlocklistState.VALID
     try:
         r = await get_redis()
-        result = await r.get(f"{TOKEN_BLOCKLIST_PREFIX}{jti}")
-        return result is not None
+        values = await r.mget(*keys)
     except (RuntimeError, RedisError):
-        return False
+        return BlocklistState.UNAVAILABLE
+    if any(value is not None for value in values):
+        return BlocklistState.REVOKED
+    return BlocklistState.VALID
 
 
 async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> UserResponse:
@@ -170,13 +207,45 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> Use
                     mark_token_rejected("expired")
                     raise credentials_exception
 
-        # Blocklist check: reject revoked tokens (D-08: reason=invalid)
-        jti = payload.get("jti")
-        if jti:
-            is_revoked = await _is_token_blocklisted(jti)
-            if is_revoked:
+        # T-321-29 — access and refresh credentials share one HS256 key, so the
+        # cookie value must be refused as a bearer token by its own claim.
+        if payload.get("typ") == "refresh":
+            mark_token_rejected("invalid")
+            raise credentials_exception
+
+        # T-321-31 — legacy cut-off: 1.0.0 minted 30-day bearer tokens. The
+        # per-token lifetime ceiling (plus clock-skew leeway) refuses every one
+        # of them at upgrade, at the cost of one forced re-login.
+        exp_claim = payload.get("exp")
+        iat_claim = payload.get("iat")
+        if exp_claim is not None and iat_claim is not None:
+            max_lifetime_seconds = (
+                ACCESS_TOKEN_EXPIRE_MINUTES * 60 + get_clock_skew_tolerance()
+            )
+            if exp_claim - iat_claim > max_lifetime_seconds:
                 mark_token_rejected("invalid")
                 raise credentials_exception
+
+        # SESS-05 — tri-state, fail-closed revocation check. One MGET covers the
+        # token id and the session id; an unreachable store refuses the request
+        # instead of silently accepting the token.
+        jti = payload.get("jti")
+        sid = payload.get("sid")
+        blocklist_keys = []
+        if jti:
+            blocklist_keys.append(f"{TOKEN_BLOCKLIST_PREFIX}{jti}")
+        if sid:
+            blocklist_keys.append(f"{SESSION_BLOCKLIST_PREFIX}{sid}")
+        state = await blocklist_state(*blocklist_keys)
+        if state is BlocklistState.UNAVAILABLE:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication temporarily unavailable",
+                headers={"Retry-After": "5"},
+            )
+        if state is BlocklistState.REVOKED:
+            mark_token_rejected("invalid")
+            raise credentials_exception
 
     except jwt.ExpiredSignatureError:
         mark_token_rejected("expired")
@@ -231,7 +300,11 @@ class AuthAttempt(NamedTuple):
 
 
 async def _authenticate(username: str, password: str) -> AuthAttempt:
-    """Resolve a login attempt, distinguishing unknown user from wrong password (D-05).
+    """Resolve a login attempt after doing identical work for every username (D-05).
+
+    Both branches run one ``SELECT`` and one bcrypt verification, in that order:
+    an unknown username is verified against ``_DUMMY_PASSWORD_HASH``, so it costs
+    a known one's cost and cannot be told apart by timing.
 
     ``failure`` is ``"unknown_user"`` for a name that does not exist and
     ``"invalid_password"`` for an existing user with a wrong password;
@@ -243,9 +316,14 @@ async def _authenticate(username: str, password: str) -> AuthAttempt:
         )
         user = result.scalar_one_or_none()
 
-    if not user:
+    hashed = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
+    password_matches = verify_password(password, hashed)
+
+    if user is None:
+        # A match against the dummy is impossible with a real hash; should the
+        # constant ever be corrupt, fail closed instead of admitting nobody.
         return AuthAttempt(None, "unknown_user", None)
-    if not verify_password(password, user.password_hash):
+    if not password_matches:
         return AuthAttempt(None, "invalid_password", str(user.id))
     return AuthAttempt(user, None, None)
 
@@ -256,8 +334,37 @@ async def authenticate_user(username: str, password: str) -> User | None:
 
 
 async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]) -> Token:
+    """Backward-compatible wrapper around ``login_with_session``.
+
+    Every existing caller keeps the ``Token`` shape; the route uses
+    ``login_with_session`` directly because it also needs the session id and the
+    user row to set the refresh cookie.
+    """
+    outcome = await login_with_session(
+        form_data, sid=session_service.new_session_id()
+    )
+    return outcome.token
+
+
+class LoginOutcome(NamedTuple):
+    """A successful login: the access token plus the row it belongs to."""
+
+    token: Token
+    user: User
+
+
+async def login_with_session(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    *,
+    sid: str,
+) -> LoginOutcome:
+    """Authenticate and mint an access token carrying the caller's session id."""
+    # SESS-03 — per-account delay FIRST, for every submitted username. Applying
+    # it after the lookup would make the throttle itself the enumeration oracle.
+    await login_throttle.apply_delay(form_data.username)
     attempt = await _authenticate(form_data.username, form_data.password)
     if attempt.user is None:
+        await login_throttle.record_failure(form_data.username)
         # The submitted username is never logged (D-05): an existing user is
         # attributed by UUID, an unknown one only reason=unknown_user.
         mark_login_failed(
@@ -270,6 +377,9 @@ async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]) -> T
             headers={"WWW-Authenticate": "Bearer"},
         )
     user = attempt.user
+    # A successful login resets the counter; combined with a delay that is never
+    # a lockout, an account can never be held shut by an attacker.
+    await login_throttle.clear_failures(form_data.username)
 
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -277,11 +387,15 @@ async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]) -> T
             "sub": str(user.id),
             "username": user.username,
             "token_version": user.token_version,
+            "sid": sid,
         },
         expires_delta=access_token_expires
     )
     mark_login_succeeded(str(user.id))
-    return Token(access_token=access_token, token_type="bearer")
+    return LoginOutcome(
+        token=Token(access_token=access_token, token_type="bearer"),
+        user=user,
+    )
 
 
 async def bump_token_version(db, user_id) -> int:
@@ -312,6 +426,20 @@ async def add_token_to_blocklist(jti: str, expires_in_seconds: int) -> None:
     r = await get_redis()
     await r.set(
         f"{TOKEN_BLOCKLIST_PREFIX}{jti}",
+        "revoked",
+        ex=expires_in_seconds
+    )
+
+
+async def add_session_to_blocklist(sid: str, expires_in_seconds: int) -> None:
+    """Blocklist a whole session id (SESS-01/SESS-05).
+
+    Every rotation keeps the same ``sid``, so one entry ends the entire cookie
+    chain; the TTL is the session's remaining absolute lifetime.
+    """
+    r = await get_redis()
+    await r.set(
+        f"{SESSION_BLOCKLIST_PREFIX}{sid}",
         "revoked",
         ex=expires_in_seconds
     )

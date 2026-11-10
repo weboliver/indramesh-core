@@ -830,6 +830,11 @@
     "default_text": "IndraMesh Core"
   },
   {
+    "key": "auth.invalid_credentials",
+    "namespace": "auth",
+    "default_text": "Username or password is incorrect."
+  },
+  {
     "key": "auth.login_failed",
     "namespace": "auth",
     "default_text": "Login failed"
@@ -840,9 +845,19 @@
     "default_text": "Password"
   },
   {
+    "key": "auth.password_changed_sign_in",
+    "namespace": "auth",
+    "default_text": "Password changed. Please sign in with your new password."
+  },
+  {
     "key": "auth.password_placeholder",
     "namespace": "auth",
     "default_text": "••••••••"
+  },
+  {
+    "key": "auth.session_expired",
+    "namespace": "auth",
+    "default_text": "Your session has expired. Please sign in again."
   },
   {
     "key": "auth.sign_in",
@@ -855,9 +870,19 @@
     "default_text": "Signing in..."
   },
   {
+    "key": "auth.slow_login_hint",
+    "namespace": "auth",
+    "default_text": "Please wait…"
+  },
+  {
     "key": "auth.subtitle",
     "namespace": "auth",
     "default_text": "Asset Database Management"
+  },
+  {
+    "key": "auth.too_many_attempts",
+    "namespace": "auth",
+    "default_text": "Too many sign-in attempts. Wait a moment and try again."
   },
   {
     "key": "auth.username_placeholder",
@@ -3945,14 +3970,109 @@
     "default_text": "Value Separator"
   },
   {
+    "key": "settings.languages.active_help",
+    "namespace": "settings",
+    "default_text": "The language appears in all selectors right away. Untranslated text falls back to English."
+  },
+  {
+    "key": "settings.languages.active_label",
+    "namespace": "settings",
+    "default_text": "Activate language immediately"
+  },
+  {
+    "key": "settings.languages.add",
+    "namespace": "settings",
+    "default_text": "Add language"
+  },
+  {
+    "key": "settings.languages.code_help",
+    "namespace": "settings",
+    "default_text": "Two or three lowercase letters, optionally with a region: sv or pt-BR."
+  },
+  {
+    "key": "settings.languages.code_label",
+    "namespace": "settings",
+    "default_text": "Language code"
+  },
+  {
+    "key": "settings.languages.code_placeholder",
+    "namespace": "settings",
+    "default_text": "e.g. sv or pt-BR"
+  },
+  {
     "key": "settings.languages.confirm_deactivate",
     "namespace": "settings",
     "default_text": "This language is enabled in schema(s) and has translation(s). {{impact}}"
   },
   {
+    "key": "settings.languages.coverage_open",
+    "namespace": "settings",
+    "default_text": "Open translations for {{name}}"
+  },
+  {
+    "key": "settings.languages.create_description",
+    "namespace": "settings",
+    "default_text": "The language is created without a bundled catalog. Untranslated text stays in English until it is translated."
+  },
+  {
+    "key": "settings.languages.create_duplicate",
+    "namespace": "settings",
+    "default_text": "The language code \"{{code}}\" already exists."
+  },
+  {
+    "key": "settings.languages.create_failed",
+    "namespace": "settings",
+    "default_text": "The language could not be created. Try again."
+  },
+  {
+    "key": "settings.languages.create_invalid_code",
+    "namespace": "settings",
+    "default_text": "Enter a code of two or three letters, optionally with a region (for example pt-BR)."
+  },
+  {
+    "key": "settings.languages.create_submit",
+    "namespace": "settings",
+    "default_text": "Create language"
+  },
+  {
+    "key": "settings.languages.create_title",
+    "namespace": "settings",
+    "default_text": "New language"
+  },
+  {
+    "key": "settings.languages.created",
+    "namespace": "settings",
+    "default_text": "{{name}} added."
+  },
+  {
     "key": "settings.languages.deactivate_impact",
     "namespace": "settings",
     "default_text": "Deactivating hides existing translations and disables the language in schemas until reactivated."
+  },
+  {
+    "key": "settings.languages.delete_confirm",
+    "namespace": "settings",
+    "default_text": "Delete the language \"{{name}}\"? This cannot be undone."
+  },
+  {
+    "key": "settings.languages.delete_failed",
+    "namespace": "settings",
+    "default_text": "The language could not be deleted. Try again."
+  },
+  {
+    "key": "settings.languages.delete_label",
+    "namespace": "settings",
+    "default_text": "Delete {{name}}"
+  },
+  {
+    "key": "settings.languages.delete_referenced",
+    "namespace": "settings",
+    "default_text": "The language is still enabled in one or more schemas. Remove it there first, then delete it."
+  },
+  {
+    "key": "settings.languages.deleted",
+    "namespace": "settings",
+    "default_text": "{{name}} deleted."
   },
   {
     "key": "settings.languages.description",
@@ -3968,6 +4088,26 @@
     "key": "settings.languages.empty_title",
     "namespace": "settings",
     "default_text": "No languages available"
+  },
+  {
+    "key": "settings.languages.name_help",
+    "namespace": "settings",
+    "default_text": "This name appears in every language selector."
+  },
+  {
+    "key": "settings.languages.name_label",
+    "namespace": "settings",
+    "default_text": "Display name (English)"
+  },
+  {
+    "key": "settings.languages.name_placeholder",
+    "namespace": "settings",
+    "default_text": "e.g. Swedish"
+  },
+  {
+    "key": "settings.languages.name_required",
+    "namespace": "settings",
+    "default_text": "Enter a display name."
   },
   {
     "key": "settings.languages.title",

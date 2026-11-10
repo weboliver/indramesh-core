@@ -89,8 +89,18 @@ COPY 00-indramesh-server-settings.sh /docker-entrypoint-initdb.d/00-indramesh-se
 # The Kubernetes wrapper contract this image already carried: the group
 # permission change on the data and socket directories, then the image's own
 # non-root user (arbitrary-UID pods keep working through fsGroup).
+#
+# Phase 323 (D-18, IMG-04): `gosu` is removed from the runtime stage. The
+# official entrypoint calls it only in the `id -u == 0` branch, so a dropped
+# privilege helper is dead weight on the path this image actually takes
+# (`USER 70:0` below). Removing the binary also closes the escalation path: an
+# operator override back to `root` now fails loudly with
+# `exec: gosu: not found` instead of silently serving as root. `rm -f` rather
+# than a package-manager removal — the binary is not apk-managed, so a package
+# removal would be a no-op that only looks like a removal.
 USER root
 RUN apk upgrade --no-cache \
+ && rm -f /usr/local/bin/gosu \
  && chmod 0755 /usr/local/bin/indramesh-postgres-entrypoint.sh \
         /docker-entrypoint-initdb.d/00-indramesh-server-settings.sh \
  && chmod -R g=u /var/lib/postgresql /var/run/postgresql

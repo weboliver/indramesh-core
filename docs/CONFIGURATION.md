@@ -24,32 +24,37 @@ checked in the application lifespan. Never source `.env` as a shell script, and 
 optional have a code or Compose default unless stated otherwise.
 
 The `DB_*` block (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`) is the single authored
-source of database credentials: values are set once there and every consumer derives from it.
-`DB_PORT` is the **host** port Compose publishes (`"${DB_PORT:-5434}:5432"`), and Compose
-overwrites `DB_HOST`/`DB_PORT` to `postgres`/`5432` inside backend, worker, and cutover. The
-`postgres` service's own `POSTGRES_*` variables and the backend/worker/cutover `DB_*` values are
-derived from the same keys, never authored separately. In Kubernetes only `DB_PASSWORD` reaches
-the cluster: the installer writes it into the `indramesh-database` Secret under both
-`POSTGRES_PASSWORD` and `DB_PASSWORD`, while `DB_USER`/`DB_NAME` stay Helm chart values
-(`postgres.user`/`postgres.database`, defaults `postgres`/`indramesh`) — the `.env` `DB_NAME` value
-does not switch an existing namespace's database. An existing `.env` migrates by renaming its old
-`POSTGRES_*` credential keys onto this block, keeping the same values. An installation created
-before the current durable-state layout must be rebuilt rather than upgraded in place; the procedure
-for upgrading a current installation is in [OPERATIONS.md § Upgrade](./OPERATIONS.md#upgrade).
+source of database credentials: values are set once there and every consumer derives from it. The
+runtime identity is split from the administrator identity: `DB_APP_USER`/`DB_APP_PASSWORD` name the
+read/write, DML-only role that the backend and worker query as, while `DB_USER`/`DB_PASSWORD` stay
+the installer, migration and deploy-step identity. `DB_PORT` is the **host** port Compose publishes
+(`"${DB_PORT:-5434}:5432"`), and Compose overwrites `DB_HOST`/`DB_PORT` to `postgres`/`5432` inside
+backend, worker, and cutover. The `postgres` service's own `POSTGRES_*` variables and the
+backend/worker/cutover `DB_*` values are derived from the same keys, never authored separately. In
+Kubernetes the passwords reach the cluster through the `indramesh-database` Secret
+(`DB_PASSWORD`, `DB_APP_PASSWORD`, and `PLUGIN_DB_PASSWORD` where configured), while the non-secret
+role names stay Helm chart values (`postgres.user`/`postgres.appUser`, defaults `postgres`/empty) —
+the `.env` `DB_NAME` value does not switch an existing namespace's database. An existing `.env`
+migrates by renaming its old `POSTGRES_*` credential keys onto this block, keeping the same values.
+An installation created before the current durable-state layout must be rebuilt rather than upgraded
+in place; the procedure for upgrading a current installation is in
+[OPERATIONS.md § Upgrade](./OPERATIONS.md#upgrade).
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `DATABASE_URL` | No | constructed | Explicit async SQLAlchemy URL. It overrides all `DB_*` components. |
+| `DATABASE_URL` | No | constructed | Explicit async SQLAlchemy URL. It overrides all `DB_*` components, including `DB_APP_*`, and therefore disables the runtime/maintenance identity split: the backend and worker log a startup warning when it is set. Remove it to run as `DB_APP_USER`. |
 | `DB_HOST` | No | `postgres` | Database host used when constructing `DATABASE_URL`. Compose overrides it with `postgres` for backend and worker. |
 | `DB_PORT` | No | `5432` | Database port used when constructing `DATABASE_URL`. Compose overrides it with `5432` for backend and worker. |
-| `DB_USER` | No | `postgres` | Database user used when constructing `DATABASE_URL`. |
-| `DB_PASSWORD` | No | `postgres` | Database password used when constructing `DATABASE_URL`. |
+| `DB_USER` | No | `postgres` | Installer, migration and deploy-step identity: used for DDL/DCL, `alembic upgrade head`, the plugin-role bootstrap and `python -m app.db.roles`. It is also the runtime fallback when `DB_APP_USER` is empty. |
+| `DB_PASSWORD` | No | `postgres` | Password for `DB_USER`. |
 | `DB_NAME` | No | `app` | Database name used when constructing `DATABASE_URL`. |
+| `DB_APP_USER` | No | `indramesh_app` in `.env.example` | Non-secret role name the backend and worker query as: read/write DML only, no DDL, no ownership, no superuser rights. An empty value selects the `DB_USER` fallback for an externally managed database whose user is already restricted. Must match `^[A-Za-z_][A-Za-z0-9_]{0,62}$`. |
+| `DB_APP_PASSWORD` | **For the split** | generated | Secret for `DB_APP_USER`. The installer appends the key to an existing `.env` (or adds only that missing key to the `indramesh-database` Secret on Kubernetes), generates the value, and fails closed if it is empty or still holds the `CHANGE_ME` placeholder. A rerun never rotates it. |
 | `DB_POOL_SIZE` | No | `10` | SQLAlchemy async-engine pool size. Compose and Helm pin the backend value to `10`. |
 | `DB_MAX_OVERFLOW` | No | `20` | Connections allowed above `DB_POOL_SIZE`. |
 | `DB_POOL_RECYCLE` | No | `1800` | Seconds before a pooled connection is recycled. |
 | `DB_POOL_PRE_PING` | No | `true` | Enables connection validation before pool checkout. |
-| `PLUGIN_DB_USER` | Conditional | `indramesh_plugin` when a password is configured | Dedicated plugin migration login role, not the runtime `DB_USER`. Must match `^[A-Za-z_][A-Za-z0-9_]{0,62}$`. Setting a user without a password aborts deployment. |
+| `PLUGIN_DB_USER` | Conditional | `indramesh_plugin` when a password is configured | Dedicated plugin migration login role, separate from the runtime `DB_APP_USER` and from `DB_USER`. Must match `^[A-Za-z_][A-Za-z0-9_]{0,62}$`. Setting a user without a password aborts deployment. |
 | `PLUGIN_DB_PASSWORD` | **For restricted plugin migrations** | unset | Password for the dedicated migration role. The shipped Jira plugin requires this boundary; both credentials absent allow only plugins that do not require a restricted role to use the privileged fallback. |
 | `INDRAMESH_PLUGINS_DIR` | No | expanded `~/.indramesh/plugins/` | Directory-scan discovery root. Compose mounts `./plugins` read-only at `/opt/indramesh/plugins`; Helm uses `plugins.mountPath`, with the same path by default. |
 | `VALKEY_PASSWORD` | Compose | — | Password passed to Valkey’s `--requirepass` and embedded in the Compose `VALKEY_URL`. |
@@ -59,7 +64,7 @@ for upgrading a current installation is in [OPERATIONS.md § Upgrade](./OPERATIO
 | `OPENSEARCH_PASSWORD` | Compose | `""` in application code | OpenSearch password. Compose forwards it to the search service as `OPENSEARCH_INITIAL_ADMIN_PASSWORD`, which that service reads **only on the first start of an empty `opensearch_data` volume**; changing it later does not rotate the admin password (see [The search admin password](#the-search-admin-password)). |
 | `JIRA_URL` | No (legacy) | `http://jira:8080` in root template | No longer read by Core; the Jira plugin uses its per-connection URL instead. Retained alongside the dev Jira container and still passed through by Compose. |
 | `BACKEND_PORT` | Compose | — | Host port mapped to backend port `8000`. |
-| `FRONTEND_PORT` | Compose | — | Host port mapped to the Compose frontend port `5173`. |
+| `FRONTEND_PORT` | Compose | `5173` | Host port mapped to the frontend container’s static-server port `8080`. The documented value and its default stay `5173`; only the container port is `8080`, so the base stack’s Caddy image is reachable at the same host port as before. |
 | `HTTP_PORT` | No | `8180` | Host port mapped to Nginx’s HTTP listener. |
 | `HTTPS_PORT` | No | `8443` | Host port mapped to Nginx’s HTTPS listener. |
 | `COMPOSE_SUBNET` | No | `172.28.0.0/16` | Compose `default`-network subnet. The Docker installer checks it against existing Docker networks and host routes and, while both it and `NGINX_TRUSTED_IP` are at their defaults, writes a free range and a matching nginx address into `.env`; an operator-set value is only checked. Set by hand, keep `NGINX_TRUSTED_IP` inside the chosen range. |
@@ -68,9 +73,9 @@ for upgrading a current installation is in [OPERATIONS.md § Upgrade](./OPERATIO
 | `CERT_UID` / `CERT_GID` | No | `1000` | Compose Nginx development-certificate ownership settings. |
 | `COMPOSE_PROJECT_NAME` | No | top-level Compose name `indramesh` | Optional Compose project-name override. Prefer leaving it unset so container naming remains consistent with repository scripts. |
 | `LOCAL_UID` / `LOCAL_GID` | No | `1001` | Build arguments for the Compose backend/worker image user. |
-| `ENVIRONMENT` | No | `production` in backend settings | `development` enables report-only development CSP and request timing. Only exact `production` starts Compose backend without `--reload` and builds/previews the frontend static bundle; all other or missing values use the Compose development commands. |
-| `VITE_ENVIRONMENT` | No | derived from `ENVIRONMENT` | Frontend build-time flag. Compose passes `ENVIRONMENT`; the Kubernetes frontend image receives it as a build argument. It is statically embedded by Vite, not read at runtime. |
-| `JWT_SECRET_KEY` | **Yes** | — | HS256 JWT signing secret. The backend raises `RuntimeError` when it is absent. |
+| `ENVIRONMENT` | No | `production` in backend settings | `development` enables report-only development CSP and request timing. Only exact `production` starts the Compose backend without `--reload`; the base stack’s frontend serves the built bundle statically in every value, because the Caddy runtime image reads no environment at all, while the development overlay runs the Vite dev server. All other or missing values use the Compose development backend commands. |
+| `VITE_ENVIRONMENT` | No | `production` in the Compose base build | Frontend build-time flag, read as the build argument of `deploy/k8s-images/frontend/Dockerfile` — the same Dockerfile the Kubernetes release builds. The Compose base stack sets it to `production`, the development overlay to `development`. It is statically embedded by Vite, not read at runtime. |
+| `JWT_SECRET_KEY` | **Yes** | — | HS256 JWT signing secret, at least **32 characters**. The backend refuses an absent, empty or shorter value at startup with `RuntimeError` (see [Required vs Optional Settings](#required-vs-optional-settings)). |
 | `FERNET_KEY` | **Yes** | — | Fernet key used to encrypt service-account bearer tokens and plugin secret configuration fields. It must be a valid Fernet key; retain it to decrypt existing stored ciphertext. |
 | `FERNET_KEY_OLD` | No | unset | The previous `FERNET_KEY`, held only while a key rotation runs. When set, new writes use `FERNET_KEY` while values encrypted under the old key stay readable. It must be a valid Fernet key; an invalid value aborts startup. Remove it once `python -m app.maintenance rotate-fernet-key` exits `0` — see [DEPLOYMENT.md § Fernet Key Rotation](./DEPLOYMENT.md#fernet-key-rotation). |
 | `CORS_ALLOWED_ORIGINS` | **Yes** | — | Comma-separated trusted origins. It cannot be empty or include `*`. |
@@ -260,7 +265,7 @@ backend:
 
 For a direct backend run, the following values must be present before application startup:
 
-- **`JWT_SECRET_KEY`** must be non-empty.
+- **`JWT_SECRET_KEY`** must be non-empty and at least 32 characters.
 - **`FERNET_KEY`** must be non-empty and accepted by `cryptography.fernet.Fernet`.
 - **`CORS_ALLOWED_ORIGINS`** must contain at least one non-wildcard origin.
 - **`NGINX_TRUSTED_IP`** must be non-empty.
@@ -276,7 +281,7 @@ Startup validation is implemented in `backend/app/main.py`,
 
 | Setting | Validation failure |
 |---|---|
-| `JWT_SECRET_KEY` | `JWT_SECRET_KEY environment variable is required but not set.` |
+| `JWT_SECRET_KEY` | `JWT_SECRET_KEY environment variable is required but not set.` — or, below the floor: `JWT_SECRET_KEY must be at least 32 characters (got <n>).` The same rule runs at startup and in `get_secret_key`, so a misconfigured deployment never serves traffic. |
 | `FERNET_KEY` | `FERNET_KEY environment variable is required but not set.` or `FERNET_KEY is invalid: ...` |
 | `FERNET_KEY_OLD` | `FERNET_KEY_OLD is invalid: ...` — it is only set during a key rotation; either supply the previous key in the same format as `FERNET_KEY` or unset it. |
 | `CORS_ALLOWED_ORIGINS` | Missing value: `CORS_ALLOWED_ORIGINS environment variable is required but not set.` Empty parsed list is also rejected; a wildcard produces `CORS_ALLOWED_ORIGINS must not contain '*'.` |
@@ -305,7 +310,8 @@ values count as absent):
 Configured bootstrap/GRANT failures or privilege drift abort deployment; there is no silent
 fallback. The migration role owns no Core objects and is limited to `SELECT` and `REFERENCES` on
 Core tables, while it can create plugin tables. This isolates migration revisions, not runtime
-plugin code: runtime database access still uses the application connection.
+plugin code: runtime plugin code uses the DML-only application connection (`DB_APP_USER`), so it can
+read and write Core tables but cannot change their schema.
 
 Compose's `backend/start.sh` runs Core migrations, role bootstrap, then plugin migrations before
 Uvicorn. Helm's `templates/migration-job.yaml` bootstraps the role alongside Core migrations and
@@ -321,7 +327,16 @@ unconfigured prevents Jira plugin migration/admission. See
 
 ## Defaults
 
-The backend derives its database URL as follows when `DATABASE_URL` is unset:
+The backend derives two URLs when `DATABASE_URL` is unset. The runtime URL — used for every request
+and by the worker — takes `DB_APP_USER`/`DB_APP_PASSWORD` when `DB_APP_USER` is non-empty, and falls
+back to `DB_USER`/`DB_PASSWORD` otherwise:
+
+```text
+postgresql+asyncpg://{DB_APP_USER}:{DB_APP_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}
+```
+
+The maintenance URL — used only by DDL/DCL paths such as `alembic upgrade head` and
+`python -m app.db.roles` — always uses `DB_USER`/`DB_PASSWORD`:
 
 ```text
 postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}
@@ -422,6 +437,33 @@ keeps the old key readable under `FERNET_KEY_OLD` until
 plugin's connection settings are separate from global manifest-schema settings; `JIRA_URL` is not
 a substitute for configuring those connections.
 
+### Internal connector targets
+
+A connector may legitimately be pointed at a URL that resolves to a non-public address: a Jira
+instance on the Compose network, or an on-prem host in a private range. Core refuses such a URL by
+default — when a Source or Target is saved and again at connect time with a fresh DNS answer —
+because the connector sends its stored credential to whatever that URL addresses. The resolved
+lookup is bounded by `RESOLVE_TIMEOUT_SECONDS` (`3.0`): an unanswered lookup is tolerated at save
+time and refused at connect time.
+
+The waiver is **per endpoint**, carried in that Source's or Target's own `config` object:
+
+```json
+{ "allow_internal_target": true }
+```
+
+- Only the **literal JSON boolean `true`** enables the waiver. `"true"`, `1`, `"yes"` and `null` are
+  all refused: the connector persists submitted `config` unnormalised, so the flag is read with an
+  identity comparison, never truthiness.
+- It is **audited** and read only from the endpoint row's own `config`. There is deliberately no
+  process-wide switch, and no environment variable disables the address check globally.
+- Only a **superuser** may set the flag; a non-superuser is refused with `403`. The decision is made
+  in the service from the acting user's row, so the REST routes and the plugin SDK write path obey
+  the same rule.
+- A flagged endpoint may only have its **URL or connector type** changed by a superuser as well —
+  otherwise a Source administrator could re-point an already-waived endpoint at a different internal
+  host. Renaming a flagged endpoint, or editing unrelated fields, needs no superuser.
+
 ## Per-Environment Overrides
 
 - **Compose development:** layer the mirrored `docker-compose.dev.yml` in the private `.env`'s
@@ -429,9 +471,11 @@ a substitute for configuring those connections.
   source bind mounts. Set `ENVIRONMENT=development` as well to keep Uvicorn reload and request
   timing; that also disables the global rate limiter for test traffic.
 - **Compose production (the shipped default):** `.env.example` sets `ENVIRONMENT=production`, so a
-  fresh clone runs the production shape — `backend/start.sh` runs Uvicorn without `--reload` and the
-  frontend container serves the image-built bundle through `vite preview`. Rebuild the backend and
-  frontend images after changing it.
+  fresh clone runs the production shape — `backend/start.sh` runs Uvicorn without `--reload`, and the
+  frontend container serves the image-built bundle from the Caddy static image
+  (`deploy/k8s-images/frontend/Dockerfile`, container port `8080`) behind nginx. The strict
+  Content-Security-Policy stays with nginx; Caddy sets no headers. The development overlay is the
+  only Vite form. Rebuild the backend and frontend images after changing it.
 - **Kubernetes:** Helm supplies `INDRAMESH_RUNTIME_MODE=kubernetes`, database and service DNS
   values, and non-secret values from `values.yaml`. `scripts/k8s/lib/secrets.sh` reconciles
   sensitive `.env` values into Kubernetes Secrets before Helm workloads consume them. Set

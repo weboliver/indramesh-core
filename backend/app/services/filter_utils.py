@@ -435,7 +435,13 @@ def _collect_attr_ids(node: dict, attr_ids: set) -> None:
             pass
 
 
-async def evaluate_filter_tree(tree: dict, db: AsyncSession) -> Any:
+async def evaluate_filter_tree(
+    tree: dict,
+    db: AsyncSession,
+    *,
+    user_id: str | None = None,
+    is_superuser: bool = False,
+) -> Any:
     """Recursively evaluate a filter tree. Returns a SQLAlchemy clause
     that can be applied directly as query.where(result) — the returned
     clause is already boolean-typed, NOT a subquery.
@@ -444,6 +450,16 @@ async def evaluate_filter_tree(tree: dict, db: AsyncSession) -> Any:
         tree: A dict with 'op' (AND|OR), 'groups' (list), and 'conditions' (list).
             Individual conditions may carry an optional 'negate' bool.
         db: AsyncSession for database lookups
+        user_id: The caller's id. When given and the caller is not a superuser,
+            a condition on an attribute whose type carries a record DENY for
+            that principal — or whose ``object_type_attributes`` row is hidden —
+            is skipped exactly like a condition on an unknown ``attr_id``
+            (D-18 / TRI317-68): identical result set, no error, no marker.
+        is_superuser: The RLR-05 bypass — a superuser pays no predicate and no
+            extra statement. The defaults keep the pre-existing unfiltered
+            reading for callers with no principal (the AQL compiler/resolver,
+            whose filter trees already carry only ids that passed
+            ``visible_attribute_conditions``).
 
     Returns:
         A SQLAlchemy boolean expression (and_/or_ clause) or None if tree is empty
@@ -455,14 +471,26 @@ async def evaluate_filter_tree(tree: dict, db: AsyncSession) -> Any:
     unique_attr_ids = set()
     _collect_attr_ids(tree, unique_attr_ids)
 
-    # Batch-load all OTAs with their AttributeTypes in one query
+    # Batch-load all OTAs with their AttributeTypes in one query. The visibility
+    # predicate rides this same statement (a join plus its clauses) when a
+    # principal is present — one role-resolution in total, never one per
+    # condition — so a denied or hidden id stops matching before the loop below
+    # reaches it.
     attr_lookup = {}  # attr_id → (ObjectTypeAttribute, AttributeType)
     if unique_attr_ids:
-        result = await db.execute(
+        ota_statement = (
             select(ObjectTypeAttribute)
             .options(selectinload(ObjectTypeAttribute.attribute_type))
             .where(ObjectTypeAttribute.id.in_(unique_attr_ids))
         )
+        if user_id is not None and not is_superuser:
+            from app.services.value_visibility import visible_attribute_conditions
+
+            ota_statement = ota_statement.join(
+                AttributeType,
+                ObjectTypeAttribute.attribute_type_id == AttributeType.id,
+            ).where(*await visible_attribute_conditions(db, user_id, False))
+        result = await db.execute(ota_statement)
         for attr in result.scalars():
             attr_lookup[attr.id] = (attr, attr.attribute_type)
 

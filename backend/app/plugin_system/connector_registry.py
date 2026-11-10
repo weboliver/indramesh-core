@@ -83,6 +83,10 @@ class ConnectorTypeDeclaration:
     subset of ``{"source", "target"}`` this connector may be written for. The
     ``requires_*`` fields are each the set of entity kinds for which that core
     field is mandatory (e.g. ``jira`` requires a URL for ``target`` writes).
+    ``requires_public_url`` is the opposite kind of opt-in: the entity kinds
+    whose Core field is a URL this connector will dial, so Core subjects it to
+    the outbound-URL guard (SESS-07). It is empty by default, so a connector
+    that declares nothing keeps today's behaviour exactly.
     ``config_model`` is the connector-owned config contract; when
     ``normalize_config`` is set, the validated defaults are written back (CSV's
     delimiter/encoding), otherwise the submitted config is persisted unchanged.
@@ -97,6 +101,7 @@ class ConnectorTypeDeclaration:
     applies_to: frozenset[str]
     label: str | None = None
     requires_url: frozenset[str] = frozenset()
+    requires_public_url: frozenset[str] = frozenset()
     requires_schema_id: frozenset[str] = frozenset()
     requires_export_folder: frozenset[str] = frozenset()
     config_model: type[BaseModel] | None = None
@@ -177,6 +182,13 @@ def validate_declaration(declaration: ConnectorTypeDeclaration) -> None:
     ):
         raise ConnectorTypeValidationError(
             f"connector type {declaration.name!r} declares a blank label"
+        )
+    # SESS-07: the public-URL opt-in names entity kinds Core can actually guard.
+    # An empty set is valid, so every existing connector declares nothing.
+    if not declaration.requires_public_url <= CONNECTOR_ENTITY_KINDS:
+        raise ConnectorTypeValidationError(
+            f"connector type {declaration.name!r} must declare requires_public_url "
+            "as a subset of {'source', 'target'}"
         )
 
 

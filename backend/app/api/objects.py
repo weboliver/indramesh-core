@@ -19,6 +19,7 @@ from app.schemas.object_file import ObjectFileResponse
 from app.schemas.object_comment import ObjectCommentCreate, ObjectCommentResponse
 from app.services.auth_service import get_current_user, require_permission, require_record_permission
 from app.services.record_permission_service import resolve_record_permission
+from app.services.value_visibility import assert_container_access
 from app.services.filter_utils import build_filter_clause
 from app.services.translation_service import validate_read_language
 from app.api.fields import objects_fields, filter_fields
@@ -100,6 +101,20 @@ async def create_object_route(
     db: AsyncSession = Depends(get_db),
     current_user: UserResponse = Depends(require_permission("objects", "create"))
 ):
+    # AUTHZ-07 (D-01/D-03): the container id arrives in the body, so only the
+    # route can decide. Readability first — an invisible container answers the
+    # route's existing missing-container 404, so it is indistinguishable from a
+    # nonexistent one — then the create action (403). The check precedes the
+    # service call, so no partial Object can survive a refusal.
+    if not current_user.is_superuser:
+        await assert_container_access(
+            str(current_user.id),
+            current_user.is_superuser,
+            entity_type="object_type",
+            container_id=obj.object_type_id,
+            action="create",
+            not_found_detail="Schema or object type not found",
+        )
     try:
         db_object = await create_object(db, obj, current_user.id)
     except ValueLockConflict as e:
@@ -432,6 +447,30 @@ async def update_object_route(
     db: AsyncSession = Depends(get_db),
     current_user: UserResponse = Depends(require_record_permission("objects", "update", "object", "object_id"))
 ):
+    # IN-01 / D-17 (319 D-03): a move into another container gates the TARGET
+    # container, not only the subject object the route dependency already
+    # checked. Readability first — an invisible target answers the route's
+    # existing missing-container 404, so it is indistinguishable from one that
+    # does not exist — then the update action (403). The gate precedes
+    # `update_object(` because the service commits its own transaction: a later
+    # check would refuse after the row was already re-parented. Both
+    # `object_type_id` and `schema_id` are container changes (the latter is the
+    # same re-parenting operation, one line away in the same payload).
+    if not current_user.is_superuser:
+        for entity_type, container_id in (
+            ("object_type", object_update.object_type_id),
+            ("schema", object_update.schema_id),
+        ):
+            if container_id is None:
+                continue
+            await assert_container_access(
+                str(current_user.id),
+                current_user.is_superuser,
+                entity_type=entity_type,
+                container_id=container_id,
+                action="update",
+                not_found_detail="Object not found",
+            )
     try:
         obj = await update_object(db, object_id, object_update, current_user.id)
     except ValueLockConflict as e:

@@ -21,9 +21,15 @@
 #   3. stage the tree through the exclusion pass (version-control/CI metadata)
 #   4. derive the destination name from the manifest, or take the CLI override
 #   5. verify the declared api_version with the Core's own rule in the container
-#   6. refuse an existing destination (never overwrite, no force flag anywhere)
-#   7. copy the STAGED tree into the checkout's plugin directory
-#   8. restart backend and worker so both Registry instances re-scan
+#   6. decide from the installed version: no destination installs, a higher one
+#      replaces it, the same one is a no-op and a lower one is refused. No force
+#      flag anywhere; a destination without a readable three-part version (for
+#      example a directory created by hand) is refused
+#   7. copy the STAGED tree to <name>.new, move the installed plugin aside to
+#      <name>.old, then move <name>.new into place. <name>.old marks an
+#      unfinished update, so a rerun after an abort finishes it either way
+#   8. restart backend and worker so both Registry instances re-scan, then remove
+#      <name>.old as the last writing step
 #
 # Compose scope (D-15, T-311.1-12): every `docker compose` invocation runs with
 # the working directory set to ROOT_DIR — resolved from this script's own
@@ -128,16 +134,52 @@ DECLARED_API="$(plugin_manifest_api_version "$STAGED_DIR")" || exit 1
 plugin_verify_api_docker "$ROOT_DIR" "$DECLARED_API" || exit 1
 
 DEST="$PLUGINS_DIR/$NAME"
-step "install_plugin: checking the destination is free"
+step "install_plugin: checking the installed version"
+# A leftover staging directory from an aborted run is never trusted; the copy
+# below recreates it. `<name>.old` is NOT removed here: it is the marker of an
+# unfinished update and is only removed after the restarts succeed.
+rm -rf "$DEST.new"
+
+IS_INSTALL=1
+IS_UPDATE=0
 if [ -e "$DEST" ]; then
-  die "install_plugin" "$DEST already exists — remove it deliberately first if you mean to replace it (this script never overwrites)"
+  IS_INSTALL=0
+  INSTALLED_VERSION="$(plugin_manifest_version "$DEST")" \
+    || die "install_plugin" "$DEST already exists but carries no readable three-part version in its plugin.toml — refusing to replace a directory this script did not install (remove it deliberately first if you mean to replace it)"
+  NEW_VERSION="$(plugin_manifest_version "$STAGED_DIR")" || exit 1
+  ACTION="$(plugin_update_action "$INSTALLED_VERSION" "$NEW_VERSION")" || exit 1
+  case "$ACTION" in
+    refuse)
+      die "install_plugin" "$DEST is at version $INSTALLED_VERSION and the source carries $NEW_VERSION — refusing a downgrade (plugin migrations only run forward)"
+      ;;
+    same)
+      if [ ! -e "$DEST.old" ]; then
+        step "install_plugin: $NAME is already at version $NEW_VERSION — nothing to do"
+        echo "  The installed plugin is unchanged: no copy and no restart was performed."
+        exit 0
+      fi
+      step "install_plugin: resuming an unfinished update of $NAME to version $NEW_VERSION"
+      ;;
+    replace)
+      step "install_plugin: updating $NAME from version $INSTALLED_VERSION to $NEW_VERSION"
+      IS_UPDATE=1
+      ;;
+  esac
 fi
 
-step "install_plugin: copying the staged plugin to $DEST"
-mkdir -p "$PLUGINS_DIR"
-# The STAGED tree, never the source as found: the exclusion pass above is what
-# keeps version-control and CI metadata out of the plugin directory.
-cp -R "$STAGED_DIR" "$DEST" || die "install_plugin" "copying $STAGED_DIR -> $DEST failed"
+if [ "$IS_INSTALL" = 1 ] || [ "$IS_UPDATE" = 1 ]; then
+  step "install_plugin: copying the staged plugin to $DEST.new"
+  mkdir -p "$PLUGINS_DIR"
+  # The STAGED tree, never the source as found: the exclusion pass above is what
+  # keeps version-control and CI metadata out of the plugin directory. The copy
+  # lands in `<name>.new`, so a half-written tree is never visible as a plugin.
+  cp -R "$STAGED_DIR" "$DEST.new" || die "install_plugin" "copying $STAGED_DIR -> $DEST.new failed"
+  if [ "$IS_INSTALL" = 0 ]; then
+    rm -rf "$DEST.old"
+    mv "$DEST" "$DEST.old" || die "install_plugin" "moving $DEST aside to $DEST.old failed"
+  fi
+  mv "$DEST.new" "$DEST" || die "install_plugin" "moving $DEST.new into place failed"
+fi
 
 step "install_plugin: restarting the backend so PluginRegistry re-scans and the plugin migrations run"
 ( cd "$ROOT_DIR" && docker compose restart backend </dev/null ) || exit 1
@@ -168,6 +210,12 @@ step "install_plugin: restarting the worker so its registry re-scans the migrate
 # .8). A reload re-resolves the name; it is a no-op when the name still points at
 # the same address, and a missing nginx must not fail the install.
 ( cd "$ROOT_DIR" && docker compose exec -T nginx nginx -s reload </dev/null ) >/dev/null 2>&1 || true
+
+# The update marker goes last: while `<name>.old` exists the update is not
+# finished, so a rerun after an abort at any earlier step finishes it instead of
+# reporting "nothing to do". Kept in place until every restart above succeeded.
+step "install_plugin: removing the update marker $DEST.old"
+rm -rf "$DEST.old"
 
 step "install_plugin: done — check the Plugins admin page"
 echo "  GET /api/v1/plugins/$NAME reports the plugin's state once backend and worker are back."

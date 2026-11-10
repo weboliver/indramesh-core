@@ -23,6 +23,13 @@ Jira is a **development-only** Compose integration: its service, its volume and 
 wiring live in the non-mirrored `docker-compose.jira.yml`, which never ships in the public tree and
 never joins the Kubernetes path.
 
+The Compose path is driven by Compose itself, but the two root lifecycle wrappers serve it too: on
+a host **without** a `k3s` systemd unit, `./start` and `./stop` start and stop the existing Compose
+containers (`docker compose start`/`stop`, never `up`/`down`). On a host that has both
+installations, `./start --compose` and `./stop --compose` force the Compose shape while `--k3s`
+forces k3s; a bare `./start` there stays k3s. The k3s-only flags (`--enable`, `--disable`, `--full`)
+are rejected in Compose mode rather than silently ignored.
+
 ### Contributing to Core (the development variant)
 
 A contributor who wants hot reload, the Jira container and the Playwright E2E runner layers the

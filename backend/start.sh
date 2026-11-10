@@ -13,6 +13,15 @@ echo "Bootstrapping plugin database role..."
 # documented weakened fallback, D-09/D-10).
 python -m app.plugin_system.bootstrap_role
 
+echo "Reconciling application database role..."
+# Phase 322 (DEPL-02, D-09): the DML-only runtime role, the keygen definer
+# functions and apscheduler_jobs, all idempotent and fail-closed. Runs after
+# bootstrap_role and before the plugin runner: the plugin child's owner-issued
+# runtime grant needs the application role to exist (a fresh install otherwise
+# fails with "role does not exist"). With DB_APP_USER empty it logs the
+# documented fallback and still installs the functions and the scheduler table.
+python -m app.db.roles
+
 echo "Running plugin database migrations..."
 # Phase 287 (PLUGDB-03/D-16): a SEPARATE command after the core migration. The
 # core `alembic upgrade head` above stays fatal under `set -e`; the runner is

@@ -301,10 +301,9 @@ IMAGE_LICENSES = {
 # The tuple is a membership test applied per `image:` line, so a repository listed before its
 # Compose service exists is inert. The three stateful wrappers are all recorded as soon as the
 # first of them lands, which keeps the generated file stable for the rest of the phase instead of
-# being regenerated once per wrapper; the upstream components the Postgres and OpenSearch wrappers
-# carry are named in OWN_IMAGES_SECTION below, because once a service builds its wrapper the
-# upstream repository no longer reaches the table read from `docker-compose.yml` (the Valkey
-# wrapper's row follows with the plan that makes its service build the wrapper).
+# being regenerated once per wrapper; the upstream components all three wrappers carry are named
+# in OWN_IMAGES_SECTION below, because once a service builds its wrapper the upstream repository
+# no longer reaches the table read from `docker-compose.yml`.
 LOCALLY_BUILT_IMAGE_REPOSITORIES = (
     "indramesh-backend",
     "indramesh-stateful-postgres",
@@ -419,6 +418,13 @@ image:
 | Component | Version (pinned) | License |
 |---|---|---|
 | OpenSearch | 3.9.0 (`opensearchproject/opensearch:3.9.0` base image) | Apache-2.0 |
+
+`indramesh-stateful-valkey` — the wrapper only applies the Alpine package updates and makes
+`/data` group-writable for an arbitrary-UID pod; the server itself is the upstream image:
+
+| Component | Version (pinned) | License |
+|---|---|---|
+| Valkey | 9.1.1 (`valkey/valkey:9.1.1-alpine` base image) | BSD-3-Clause |
 """
 
 K8S_SECTION = """## Kubernetes Deployment Infrastructure

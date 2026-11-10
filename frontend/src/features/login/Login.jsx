@@ -1,8 +1,9 @@
-import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../../shared/hooks/use-auth'
 import { Button } from '../../shared/components/Button'
 import { useTranslation } from 'react-i18next'
+import { SLOW_LOGIN_HINT_MS, NOTICE_DEFAULTS, noticeKeyForSessionParam } from './login-states'
 
 export default function LoginPage() {
   const { t } = useTranslation()
@@ -10,19 +11,60 @@ export default function LoginPage() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [slowHint, setSlowHint] = useState(false)
+  const slowHintTimer = useRef(null)
   const { login } = useAuth()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+
+  const noticeKey = noticeKeyForSessionParam(searchParams.get('session'))
+
+  // The hint belongs to one pending submit; unmounting the form (successful
+  // login, route change) must never leave the timer behind.
+  useEffect(() => () => {
+    if (slowHintTimer.current !== null) {
+      clearTimeout(slowHintTimer.current)
+    }
+  }, [])
+
+  // One copy source for the three failure states: the raw backend `detail`
+  // never reaches the screen, and an unknown account and a wrong password
+  // render the identical string (UI-SPEC §2.3).
+  const errorMessageFor = (err) => {
+    const status = err?.response?.status
+    if (status === 401) {
+      return t('auth.invalid_credentials', 'Username or password is incorrect.')
+    }
+    if (status === 429) {
+      return t('auth.too_many_attempts', 'Too many sign-in attempts. Wait a moment and try again.')
+    }
+    return t('auth.login_failed', 'Login failed')
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
+
+    const stopSlowHintTimer = () => {
+      if (slowHintTimer.current !== null) {
+        clearTimeout(slowHintTimer.current)
+        slowHintTimer.current = null
+      }
+    }
+
     setError('')
+    setSlowHint(false)
     setLoading(true)
+    stopSlowHintTimer()
+    slowHintTimer.current = setTimeout(() => setSlowHint(true), SLOW_LOGIN_HINT_MS)
+
     try {
       await login(username, password)
       navigate('/search')
     } catch (err) {
-       setError(err.response?.data?.detail || t('auth.login_failed', 'Login failed'))
+      setError(errorMessageFor(err))
     } finally {
+      stopSlowHintTimer()
+      setSlowHint(false)
       setLoading(false)
     }
   }
@@ -38,6 +80,16 @@ export default function LoginPage() {
         </div>
 
         <form onSubmit={handleSubmit} className="mt-8 space-y-6">
+          {noticeKey && (
+            <div
+              role="status"
+              data-testid="login-notice"
+              className="rounded-md border border-border bg-muted p-4 text-sm text-foreground"
+            >
+              {t(noticeKey, NOTICE_DEFAULTS[noticeKey])}
+            </div>
+          )}
+
           <div className="space-y-4">
             <div>
               <label htmlFor="username" className="block text-sm font-medium text-foreground">
@@ -70,7 +122,11 @@ export default function LoginPage() {
           </div>
 
           {error && (
-            <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive" data-testid="login-error">
+            <div
+              className="rounded-md bg-destructive/10 p-3 text-sm text-destructive"
+              data-testid="login-error"
+              role="alert"
+            >
               {error}
             </div>
           )}
@@ -84,6 +140,16 @@ export default function LoginPage() {
           >
              {loading ? t('auth.signing_in', 'Signing in...') : t('auth.sign_in', 'Sign in')}
           </Button>
+
+          {slowHint && (
+            <p
+              className="text-xs text-muted-foreground text-center"
+              role="status"
+              data-testid="login-slow-hint"
+            >
+              {t('auth.slow_login_hint', 'Please wait…')}
+            </p>
+          )}
         </form>
       </div>
     </div>

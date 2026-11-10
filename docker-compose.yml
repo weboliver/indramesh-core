@@ -49,10 +49,16 @@ services:
     # backend and worker services use. The image bakes the two restart-time
     # server settings (shared_preload_libraries='age', wal_level=logical) and
     # applies them itself; no `command:` and no `args:` exists for them here (D-12).
+    #
+    # Phase 323 (D-18, IMG-04) adds the wrapper revision `-r1`: the runtime
+    # stage drops `/usr/local/bin/gosu`, so the packaging changed while the
+    # binary content of the base line did not. The revision is what makes the
+    # change land — `scripts/k8s/install.sh` skips the build when the tag is
+    # already in containerd, and Compose does not rebuild an existing tag.
     build:
       context: ./deploy/k8s-images/stateful/postgres
       dockerfile: Dockerfile
-    image: indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7
+    image: indramesh-stateful-postgres:18.4-age1.8.0-pgv0.8.7-r1
     logging: *default_logging
     labels: *log_labels
     env_file:
@@ -79,7 +85,18 @@ services:
     # the valkey_data volume starts EMPTY by design — the cache and the queue are derived
     # state, so the old volume was removed by hand and nothing is carried over.
     # Do NOT revert to redis:7-alpine.
-    image: valkey/valkey:9.1.1-alpine
+    #
+    # Phase 323 (D-19, IMG-05): the service builds the same wrapper the k3s chart
+    # references — `deploy/k8s-images/stateful/valkey/Dockerfile` runs
+    # `apk upgrade --no-cache` and prepares /data for group 0 — and runs it on the
+    # content-version tag `-r1`, like `postgres` and `opensearch`. Running the bare
+    # upstream tag instead would leave the unpatched packages of that tag in the
+    # release. `command`, `environment`, `ports`, `volumes` and `healthcheck` are
+    # unchanged by this: only the image source moved.
+    build:
+      context: ./deploy/k8s-images/stateful/valkey
+      dockerfile: Dockerfile
+    image: indramesh-stateful-valkey:9.1.1-r1
     logging: *default_logging
     labels: *log_labels
     command: ["valkey-server", "--requirepass", "${VALKEY_PASSWORD:?set VALKEY_PASSWORD in .env (see .env.example)}"]
@@ -136,6 +153,14 @@ services:
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
+      # Phase 322 (DEPL-02, D-12): the DML-only runtime identity. Empty
+      # DB_APP_USER selects the documented DB_USER fallback, so a 1.0.0 .env
+      # keeps working; the DB_USER/DB_PASSWORD entries above stay because the
+      # worker's scheduler table is created by the backend's deploy chain and
+      # the plugin-install maintenance path still needs the privileged identity
+      # (D-15). The `:-` form keeps a Compose command quiet without the keys.
+      - DB_APP_USER=${DB_APP_USER:-}
+      - DB_APP_PASSWORD=${DB_APP_PASSWORD:-}
       # Phase 312.1 (D-15/D-16): the URL scheme stays `redis://` — it names the wire
       # protocol, not the service; only service, host and variable names changed.
       - VALKEY_URL=redis://:${VALKEY_PASSWORD}@valkey:6379/0
@@ -160,6 +185,14 @@ services:
       valkey:
         condition: service_healthy
       opensearch:
+        condition: service_healthy
+      # Phase 322 (D-07, Pitfall 4): the worker's SQLAlchemyJobStore.start() calls
+      # jobs_t.create(checkfirst=True) as the DML-only application role, which
+      # cannot CREATE. The backend's start.sh deploy step creates apscheduler_jobs
+      # and the grants, so the worker must not start before that container is
+      # healthy — otherwise the swallowed "APScheduler startup failed" log leaves
+      # scheduled tasks silently dead on a bare `docker compose up -d`.
+      backend:
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -290,15 +323,26 @@ services:
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
+      # Phase 322 (DEPL-02, D-12): the DML-only runtime identity every request
+      # and plugin session uses. Empty DB_APP_USER selects the documented
+      # DB_USER fallback, so a 1.0.0 .env keeps working; the DB_USER/DB_PASSWORD
+      # entries above stay because start.sh runs the deploy chain (migrations,
+      # bootstrap_role, the role deploy step) as the privileged identity (D-15).
+      # The `:-` form keeps a Compose command quiet without the keys; the deploy
+      # step validates the password itself instead of a `:?` guard here.
+      - DB_APP_USER=${DB_APP_USER:-}
+      - DB_APP_PASSWORD=${DB_APP_PASSWORD:-}
       # Phase 287.1 (PLUGDB-07, D-01/D-08): the optional plugin migration role
       # credentials. Only `backend` runs start.sh — the sole caller of
       # bootstrap_role and the plugin runner — so only it declares them here.
       # Both empty is the documented weakened fallback; the role name defaults
       # to indramesh_plugin when PLUGIN_DB_USER is empty. They never replace the
-      # privileged DB_* values above: runtime PluginContext.db() stays
-      # privileged (D-12). NOTE: `env_file: .env` still passes any value present
-      # in the root .env to every service that uses it, worker included; this
-      # block only pins the intended explicit surface for backend.
+      # privileged DB_* values above: the deploy chain still runs as DB_USER
+      # (Phase 322/D-15), while runtime PluginContext.db() resolves the
+      # DB_APP_* identity above (Phase 322/D-08). NOTE: `env_file: .env` still
+      # passes any value present in the root .env to every service that uses
+      # it, worker included; this block only pins the intended explicit surface
+      # for backend.
       - PLUGIN_DB_USER=${PLUGIN_DB_USER}
       - PLUGIN_DB_PASSWORD=${PLUGIN_DB_PASSWORD}
       # Phase 312.1 (D-15/D-16): scheme unchanged (protocol name), names renamed.
@@ -375,10 +419,11 @@ services:
   # Phase 296 (CLEAN-05, D-10): the one-shot final-code cut-over path for the
   # Compose stack. The old API/worker (and every external queue producer) must
   # be stopped by the operator BEFORE this service runs; it then clears the ARQ
-  # queue, runs the Core migration, bootstraps the plugin DB role and purges the
-  # scoped caches, in that fixed fatal order. It is NOT part of the default dev
-  # stack (`maintenance` profile only), never runs the plugin runner, never
-  # calls `docker compose down` and never deletes a volume.
+  # queue, runs the Core migration, bootstraps the plugin DB role, reconciles the
+  # application role and purges the scoped caches, in that fixed fatal order
+  # (Phase 322/D-09). It is NOT part of the default dev stack (`maintenance`
+  # profile only), never runs the plugin runner, never calls `docker compose down`
+  # and never deletes a volume.
   #
   # Operator sequence for the one-way drop:
   #   1. docker compose stop backend worker            # quiesce old producers
@@ -412,6 +457,12 @@ services:
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
+      # Phase 322 (DEPL-02, D-09/D-12): the application identity the deploy step
+      # creates and reconciles. Empty DB_APP_USER selects the DB_USER fallback.
+      # DB_USER/DB_PASSWORD above stay: alembic, bootstrap_role and the deploy
+      # step all run as the privileged identity (D-15).
+      - DB_APP_USER=${DB_APP_USER:-}
+      - DB_APP_PASSWORD=${DB_APP_PASSWORD:-}
       # Phase 287.1 (PLUGDB-07): same optional plugin role credentials the
       # backend declares — only the bootstrap step consumes them.
       - PLUGIN_DB_USER=${PLUGIN_DB_USER}
@@ -423,13 +474,20 @@ services:
       - STORAGE_BUCKET=indramesh
       - INDRAMESH_PLUGINS_DIR=/opt/indramesh/plugins
     # Fatal ordered chain (`sh -ec` + `&&`): clear the queue, then the Core
-    # migration, then the plugin role bootstrap, then the scoped cache purge.
-    # The plugin runner is intentionally absent — it keeps its normal place in
-    # the backend start path.
+    # migration, then the plugin role bootstrap, then the application-role
+    # deploy step, then the scoped cache purge. The plugin runner is
+    # intentionally absent — it keeps its normal place in the backend start path.
+    #
+    # Phase 322 (D-09, Pitfall 3): the deploy step sits between bootstrap_role and
+    # the purge so a cutover never leaves the application role missing or stale.
+    # The leading `DB_APP_USER=` pins clear-queue to DB_USER for that one command:
+    # `fail_orphaned_tasks` opens the runtime session, `env_file: .env` hands the
+    # DB_APP_* keys to this service, and on the first 1.0.1 run the application
+    # role does not exist until `python -m app.db.roles` runs three steps later.
     command:
       - sh
       - -ec
-      - "python -m app.maintenance clear-queue && alembic upgrade head && python -m app.plugin_system.bootstrap_role && python -m app.maintenance purge-cache"
+      - "DB_APP_USER= python -m app.maintenance clear-queue && alembic upgrade head && python -m app.plugin_system.bootstrap_role && python -m app.db.roles && python -m app.maintenance purge-cache"
     depends_on:
       postgres:
         condition: service_healthy
@@ -446,39 +504,36 @@ services:
       - storage_internal
 
   frontend:
+    # Phase 323 (D-14, SESS-10/IMG-06): the base stack builds the same static
+    # Caddy image the k3s release ships — repository-root context, `npm ci` +
+    # `vite build` in the builder stage, then caddy:2.11.9-alpine serving /srv
+    # on container port 8080. One static-server definition for both install
+    # shapes; Caddy sets no security headers, nginx keeps the CSP (D-17).
+    #
+    # An explicit name, because the derived one is shared with the development
+    # image: both services are called `frontend` in the same Compose project, so
+    # without this line `indramesh-frontend` is whichever shape was built last.
+    # That collision shipped a development image into an audit and later pointed
+    # the running dev container at this static Caddy image, which has no npm to
+    # run `npm run dev` (2026-11-08). The k3s build keeps its own name.
+    image: indramesh-release-frontend
     build:
-      context: ./frontend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: deploy/k8s-images/frontend/Dockerfile
       args:
-        # Phase 275 (COMPOSE-PROD-02, D-01/D-03): an exact production build bakes
-        # the static bundle into /srv/frontend-dist (outside the /app bind mount
-        # the dev overlay adds).
-        #
-        # Phase 317.3 (D-03): the base file is the production-shaped quickstart a
-        # new user clones, so the value is the literal `production` and not the
-        # root ENVIRONMENT anymore. The develop overlay
-        # (`docker-compose.dev.yml`) is the only place that builds the
-        # development image back.
-        ENVIRONMENT: production
-    # Phase 311 (D-04): the frontend no longer consumes the shared root environment
-    # file — that handed it the JWT, Fernet and database secrets it never needs. It
-    # receives only the two explicit entries an image build/runtime selection requires.
-    environment:
-      # Phase 275 (D-04/D-05): the mode selects the container command (vite
-      # preview on port 5173 for exact production, vite dev otherwise).
-      # Phase 317.3 (D-03): pinned to production here for the same reason as the
-      # build arg — the base stack serves the built SPA and never the dev server;
-      # the develop overlay overrides both entries back to development.
-      - ENVIRONMENT=production
-      # Phase 272/K8SFIX-03: leitet die eine Root-.env-Variable (ENVIRONMENT)
-      # an Vite weiter, damit der Compose-Stack genauso production fahren kann
-      # wie k8s — kein fester Override auf development.
-      # Phase 317.3 (D-03): the base stack is production, matching the baked bundle.
-      - VITE_ENVIRONMENT=production
+        # The static Dockerfile reads VITE_ENVIRONMENT, not ENVIRONMENT: Vite
+        # bakes the value into the bundle at build time, and the Caddy runtime
+        # stage reads no process environment at all. That is why this service
+        # carries no `environment:` block — it no longer needs one. The
+        # development image (`frontend/Dockerfile`) and the Vite dev server live
+        # in docker-compose.dev.yml alone (D-16).
+        VITE_ENVIRONMENT: production
     logging: *default_logging
     labels: *log_labels
     ports:
-      - "127.0.0.1:${FRONTEND_PORT:-5173}:5173"
+      # The documented host port keeps its value and default (FRONTEND_PORT,
+      # 5173); only the container port moves to the Caddy listener.
+      - "127.0.0.1:${FRONTEND_PORT:-5173}:8080"
 
   nginx:
     # Pinned 2026-08-07: 1.30.x is the stable line (even minor); 1.31.x = mainline (odd minor) — INFRA-01. Do not bump to mainline.
@@ -518,9 +573,12 @@ services:
   # so the app stack starts with every profile off.
   # ==========================================================================
   loki:
-    # Pinned 2026-10-06: grafana/loki:3.7.8 (current stable, TSDB v13 +
-    # structured metadata). No published host port and no nginx route.
-    image: grafana/loki:3.7.8
+    # Pinned 2026-11-04 (Phase 323, D-20): grafana/loki:3.7.9 (TSDB v13 + structured
+    # metadata). 3.7.9 is the smallest release on the running 3.7 line that closes
+    # the HIGH/CRITICAL findings measured in the 1.0.0 image — see
+    # .planning/security/trivy-323-1.0.1.txt. No published host port and no nginx
+    # route.
+    image: grafana/loki:3.7.9
     # Phase 311 (D-16): the log stack is optional through real profile names now;
     # the former deploy-replicas off-switch is gone and profile activation
     # replaces it. An interpolated EMPTY profile string must never be used
@@ -552,8 +610,11 @@ services:
     restart: unless-stopped
 
   alloy:
-    # Pinned 2026-10-06: grafana/alloy:v1.20.1 (moby client v0.6.0).
-    image: grafana/alloy:v1.20.1
+    # Pinned 2026-11-04 (Phase 323, D-20): grafana/alloy:v1.21.3 (moby client
+    # v0.6.0). Smallest 1.21 release that closes the measured findings of the
+    # 1.0.0 image; the 1.20 → 1.21 minor is within the same major line and the
+    # sink fragments were re-checked against it (see the sinks' batching note).
+    image: grafana/alloy:v1.21.3
     # Phase 311 (D-16): the whole log stack lives behind the same two profiles.
     profiles:
       - logging
@@ -563,8 +624,9 @@ services:
     # D-02/OQ1: Alloy has no native include. The entry file is a `cat` of the
     # checked-in base fragment plus exactly one sink fragment selected by
     # $ALLOY_SINK. `$$` is Compose-escaped so the container shell expands it.
-    # NOTE: alloy v1.20.1 takes the config path as a POSITIONAL argument; the
-    # old `--config.file` flag was removed (verified: `unknown flag`).
+    # NOTE: alloy v1.21.3 takes the config path as a POSITIONAL argument; the
+    # old `--config.file` flag was removed (verified: `unknown flag`; unchanged
+    # in the 1.21 line — `alloy run` is `cobra.ExactArgs(1)`).
     # The image ENTRYPOINT is `/bin/alloy`, so the shell must be declared as
     # the entrypoint — a bare `command: [sh, -c, ...]` runs `alloy sh -c ...`
     # and crash-loops with `unknown command "sh"` (found 2026-10-09 while
@@ -659,9 +721,9 @@ services:
     restart: unless-stopped
 
   grafana:
-    # Pinned 2026-10-06: grafana/grafana:13.2.3 (Compose-only; the k8s stack
+    # Pinned 2026-11-08: grafana/grafana:13.2.5 (Compose-only; the k8s stack
     # reuses kube-prometheus-stack's Grafana via additionalDataSources).
-    image: grafana/grafana:13.2.3
+    image: grafana/grafana:13.2.5
     logging: *default_logging
     labels: *log_labels
     # D-07: only with the observability profile, and only bound to the host

@@ -58,11 +58,15 @@ from app.public_api.object_shape import (
     ObjectReadData,
     build_object_shape,
     has_reference_entries,
+    strip_denied_attributes,
     strip_hidden_references,
 )
 from app.services.cache_service import get_cached, set_cached
 from app.services.classification_service import load_classifications
-from app.services.record_permission_service import build_record_permission_filter
+from app.services.record_permission_service import (
+    build_record_permission_filter,
+    resolve_record_permissions_cached,
+)
 from app.services.select_option_service import (
     build_option_map,
     resolve_display_value,
@@ -1233,6 +1237,120 @@ async def record_filter_object_shape(
     if visible is None:
         return shape
     return strip_hidden_references(shape, visible)
+
+
+async def load_visible_attribute_ota_ids(
+    db: AsyncSession,
+    ota_ids,
+    user_id: str,
+    *,
+    is_superuser: bool,
+    role_ids: list[uuid.UUID] | None = None,
+) -> set[str] | None:
+    """`objectTypeAttributeId`s of the shape entries whose attribute type the
+    caller may read (D-10/D-11).
+
+    ``None`` means no filtering applies (superuser, no ids, or ids that are not
+    UUIDs) and costs zero queries. Otherwise: one statement maps the OTA ids to
+    their attribute types, and one call to
+    :func:`resolve_record_permissions_cached` answers the whole distinct
+    attribute-type set through the existing record-permission decision cache —
+    at most one further statement for every miss, never one per attribute type
+    and never one per value.
+    """
+    if is_superuser or not ota_ids:
+        return None
+    parsed_ids: set[uuid.UUID] = set()
+    for raw in ota_ids:
+        try:
+            parsed_ids.add(uuid.UUID(str(raw)))
+        except (TypeError, ValueError):
+            continue
+    if not parsed_ids:
+        return None
+    result = await db.execute(
+        select(ObjectTypeAttribute.id, ObjectTypeAttribute.attribute_type_id).where(
+            ObjectTypeAttribute.id.in_(list(parsed_ids))
+        )
+    )
+    rows = result.all()
+    attribute_type_ids = {row[1] for row in rows if row[1] is not None}
+    decisions = await resolve_record_permissions_cached(
+        user_id,
+        "attribute_type",
+        attribute_type_ids,
+        "read",
+        db=db,
+        role_ids=role_ids,
+    )
+    allowed_type_ids = {
+        type_id for type_id, decision in decisions.items() if decision is not False
+    }
+    return {
+        str(ota_id) for ota_id, type_id in rows if type_id in allowed_type_ids
+    }
+
+
+async def load_denied_attribute_type_ids(
+    db: AsyncSession,
+    attribute_type_ids,
+    user_id: str,
+    *,
+    is_superuser: bool,
+    role_ids: list[uuid.UUID] | None = None,
+) -> set[uuid.UUID]:
+    """Attribute types a caller is DENIED to read, out of ``attribute_type_ids``.
+
+    The `AttributeType.id`-keyed sibling of
+    :func:`load_visible_attribute_ota_ids`, for a path whose definitions
+    already carry ``attribute_type_id`` (the public AQL page): no OTA mapping
+    statement, only the cache-through decision. Superusers and an empty id set
+    return ``set()`` with zero queries.
+    """
+    if is_superuser or not attribute_type_ids:
+        return set()
+    decisions = await resolve_record_permissions_cached(
+        user_id,
+        "attribute_type",
+        list(attribute_type_ids),
+        "read",
+        db=db,
+        role_ids=role_ids,
+    )
+    return {
+        type_id for type_id, decision in decisions.items() if decision is False
+    }
+
+
+async def record_filter_denied_attributes(
+    db: AsyncSession,
+    shape: dict,
+    user_id: str,
+    *,
+    is_superuser: bool,
+    role_ids: list[uuid.UUID] | None = None,
+) -> dict:
+    """Per-caller attribute-type DENY strip, mirroring
+    :func:`record_filter_object_shape` (D-10).
+
+    Runs AFTER the shared cache read, so the cached, caller-independent shape is
+    never made caller-specific: superusers and shapes without ``attributes`` are
+    returned unchanged with zero queries, and the input is never mutated.
+    ``role_ids`` is explicit so a route resolves the caller's roles once for
+    this strip (``record_filter_object_shape`` keeps its own internal
+    resolution, unchanged)."""
+    if is_superuser or "attributes" not in shape:
+        return shape
+    ota_ids = [
+        entry.get("objectTypeAttributeId")
+        for entry in (shape.get("attributes") or [])
+    ]
+    visible = await load_visible_attribute_ota_ids(
+        db, ota_ids, user_id, is_superuser=False, role_ids=role_ids
+    )
+    if visible is None:
+        return shape
+    return strip_denied_attributes(shape, visible)
 
 
 async def list_attribute_names(db: AsyncSession, object_id: uuid.UUID) -> list[str] | None:

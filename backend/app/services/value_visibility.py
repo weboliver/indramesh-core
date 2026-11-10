@@ -19,6 +19,12 @@ allows; that is the intended reading, not a leak.
 Callers must join the tables the clauses reference:
 ``objects`` (or ``object_alias``), ``object_type_attributes`` (or ``ota_alias``)
 and, when the attribute-type clause is not ``None``, ``attribute_types``.
+Callers take their joins from :func:`value_visibility_joins` (the whole tuple)
+or :func:`attribute_visibility_joins` (the attribute-side half) and attach them
+through :func:`apply_value_visibility`; they must not re-derive a join tuple of
+their own, because a second copy drifts silently the moment a fourth table joins
+the predicate. Whoever adds a table to the predicate adds it to
+:func:`value_visibility_joins` — once, and nowhere else.
 
 :func:`visible_attribute_conditions` is the name-space form of the same
 predicate: it answers "may this principal name this attribute at all?" for
@@ -33,7 +39,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Object, ObjectTypeAttribute
+from app.models import AttributeType, Object, ObjectTypeAttribute, ObjectValue
 from app.services.record_permission_service import (
     _resolve_user_role_ids,
     build_record_permission_filter,
@@ -74,6 +80,56 @@ def principal_signature(
         ",".join(sorted(str(role_id) for role_id in (role_ids or []))).encode()
     ).hexdigest()[:16]
     return f"{user_id}:{digest}"
+
+
+def value_visibility_joins() -> tuple:
+    """The three joins an ``ObjectValue`` select needs for the predicate.
+
+    ``objects`` (the object-level DENY), ``object_type_attributes`` (``is_hidden``
+    and the attribute-side half) and ``attribute_types`` (the attribute-type-level
+    DENY), in that fixed order on every call. This is the one definition: every
+    value read path joins through here (or through :func:`apply_value_visibility`)
+    instead of keeping its own copy, so a table added to the predicate can never
+    be joined on one exit and forgotten on another.
+    """
+    return (
+        (Object, Object.id == ObjectValue.object_id),
+        (
+            ObjectTypeAttribute,
+            ObjectTypeAttribute.id == ObjectValue.object_type_attribute_id,
+        ),
+        (
+            AttributeType,
+            AttributeType.id == ObjectTypeAttribute.attribute_type_id,
+        ),
+    )
+
+
+def attribute_visibility_joins() -> tuple:
+    """The attribute-side half of :func:`value_visibility_joins`.
+
+    A slice of the parent tuple, never a second literal: the on-clauses exist
+    once in this module. It serves the consumers that select object type
+    attributes or values without reading ``objects`` — the attribute-type clause
+    and ``is_hidden`` only reference these two tables.
+    """
+    return value_visibility_joins()[1:]
+
+
+def apply_value_visibility(stmt, conditions: list, *, joins: tuple | None = None):
+    """Join the visibility tables and apply the visibility clauses in one call.
+
+    ``joins`` defaults to :func:`value_visibility_joins`; pass
+    :func:`attribute_visibility_joins` for a selection that does not read
+    ``objects``. The clauses arrive as an argument and are never computed here:
+    a caller cannot obtain the joins while silently dropping the conditions it
+    was supposed to apply (D-06).
+    """
+    for target, onclause in value_visibility_joins() if joins is None else joins:
+        stmt = stmt.join(target, onclause)
+    if not conditions:
+        return stmt
+    return stmt.where(*conditions)
 
 
 def _hidden_clause(ota_alias: str):
@@ -197,6 +253,46 @@ async def assert_record_action_allowed(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Permission denied for this attribute type",
             )
+
+
+async def assert_container_access(
+    user_id: str,
+    is_superuser: bool,
+    *,
+    entity_type: str,
+    container_id: uuid.UUID,
+    action: str,
+    not_found_status: int = status.HTTP_404_NOT_FOUND,
+    not_found_detail: str,
+    forbidden_detail: str = "Not authorized.",
+) -> None:
+    """Read-then-action container gate for create/attribute writes (AUTHZ-07, D-03).
+
+    A container the caller cannot read answers ``not_found_status`` with the
+    route's *existing* missing-container detail, so an invisible container is
+    indistinguishable from a nonexistent one; a readable container that denies
+    ``action`` answers 403 with a generic detail. ``resolve_record_permission``
+    already walks object_type -> schema -> source, so one anchor per route is
+    enough — but it does not bypass superusers by itself, hence the early
+    return. ``None`` (no record-level entry) stays permissive: the type-level
+    RBAC decision already happened in the route dependency.
+    """
+    if is_superuser:
+        return
+
+    read_decision = await resolve_record_permission(
+        user_id, entity_type, container_id, "read"
+    )
+    if read_decision is False:
+        raise HTTPException(status_code=not_found_status, detail=not_found_detail)
+
+    action_decision = await resolve_record_permission(
+        user_id, entity_type, container_id, action
+    )
+    if action_decision is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=forbidden_detail
+        )
 
 
 async def visible_object_ids_subquery(

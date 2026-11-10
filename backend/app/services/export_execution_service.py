@@ -20,15 +20,19 @@ from app.models.object import Object
 from app.models.object_value import ObjectValue
 from app.models.object_ref import ObjectRef
 from app.models.object_type_attribute import ObjectTypeAttribute
-from app.models.attribute_type import AttributeType
 from app.models.status import Status
 from app.models.task import Task
 from app.models.user import User
 from app.services.connectors.csv_connector import CsvExportConnector, CsvExportResult
 from app.services.export_service import update_export
-from app.services.object_ref_service import hidden_ref_clause
+from app.services.object_ref_service import (
+    denied_ref_attribute_clause,
+    hidden_ref_clause,
+)
 from app.services.select_option_service import build_option_map
 from app.services.value_visibility import (
+    apply_value_visibility,
+    attribute_visibility_joins,
     resolve_principal_roles,
     visible_attribute_conditions,
     visible_object_ids_subquery,
@@ -143,14 +147,18 @@ async def _value_selection_for_principal(
     The attribute-type record DENY and ``is_hidden`` are applied here, at
     selection time — never to the produced file, so no intermediate CSV carries
     a denied value. A superuser receives no clause (RLR-05 bypass).
+
+    The joins come from :func:`attribute_visibility_joins` — the object-level
+    half is not needed here because the row universe is already scoped through
+    ``object_scope`` (an ``IN (subquery)``), and
+    :func:`visible_attribute_conditions` never emits the object clause. The
+    GraphQL value loader, which composes ``visible_value_conditions``, takes
+    all three pairs instead.
     """
-    statement = (
-        _value_selection_statement(object_type_id, object_scope=object_scope)
-        .join(
-            ObjectTypeAttribute,
-            ObjectTypeAttribute.id == ObjectValue.object_type_attribute_id,
-        )
-        .join(AttributeType, AttributeType.id == ObjectTypeAttribute.attribute_type_id)
+    statement = apply_value_visibility(
+        _value_selection_statement(object_type_id, object_scope=object_scope),
+        [],
+        joins=attribute_visibility_joins(),
     )
     for clause in await visible_attribute_conditions(
         db, str(principal_id), is_superuser, role_ids=role_ids
@@ -334,6 +342,20 @@ async def execute_csv_export(
     hidden_reference_clause = await hidden_ref_clause(db)
     if hidden_reference_clause is not None:
         ref_statement = ref_statement.where(hidden_reference_clause)
+    # AUTHZ-08 / D-08: unlike the hidden clause above, this one *is*
+    # principal-scoped, so it is handed the principal's is_superuser — without
+    # it the clause's own superuser branch never runs and an administrator's
+    # export would lose the references. ``role_ids`` is the pair the selection
+    # already resolved (None for a superuser), so the request keeps one role
+    # resolution.
+    denied_reference_clause = await denied_ref_attribute_clause(
+        db,
+        user_id=str(principal_id),
+        role_ids=role_ids,
+        is_superuser=is_superuser,
+    )
+    if denied_reference_clause is not None:
+        ref_statement = ref_statement.where(denied_reference_clause)
     result = await db.execute(ref_statement)
     all_refs = result.scalars().all()
 

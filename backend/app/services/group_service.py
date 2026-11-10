@@ -181,31 +181,29 @@ async def _group_member_ids(db: AsyncSession, group_id: uuid.UUID) -> list[uuid.
 async def _assert_actor_holds_group_roles(
     db: AsyncSession, group_id: uuid.UUID, actor_id: uuid.UUID
 ) -> None:
-    """TRI317-50 privilege ceiling: a membership hands out every role of the
-    group, so a non-superuser may only grant roles they hold themselves
-    (direct or group-inherited). Superusers are exempt (RLR-05)."""
-    from app.services.user_admin_service import resolve_effective_role_ids
+    """TRI317-50 privilege ceiling — now permission-based (SESS-06 / D-09).
 
-    actor = (
-        await db.execute(select(User).where(User.id == actor_id))
-    ).scalar_one_or_none()
-    if actor is not None and actor.is_superuser:
-        return
-    group_role_ids = set(
+    A membership hands out every role of the group, so the grant path shares
+    the one ceiling helper with direct role assignment: a non-superuser may
+    only grant roles whose granted permissions they hold themselves (direct or
+    group-inherited). Comparing permission sets instead of role ids means a
+    group membership and a direct assignment can never disagree.
+    """
+    from app.services.user_admin_service import assert_actor_may_grant_roles
+
+    group_role_ids = list(
         (
-            await db.execute(select(GroupRole.role_id).where(GroupRole.group_id == group_id))
+            await db.execute(
+                select(GroupRole.role_id).where(GroupRole.group_id == group_id)
+            )
         ).scalars().all()
     )
-    if not group_role_ids:
-        return
-    actor_role_ids = (
-        await resolve_effective_role_ids(db, actor_id) if actor is not None else set()
+    await assert_actor_may_grant_roles(
+        db,
+        group_role_ids,
+        actor_id,
+        detail="Cannot grant a group whose roles you do not hold yourself.",
     )
-    if not group_role_ids <= actor_role_ids:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Cannot grant a group whose roles you do not hold yourself.",
-        )
 
 
 async def add_user_to_group(
