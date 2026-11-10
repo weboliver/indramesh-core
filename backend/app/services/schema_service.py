@@ -36,7 +36,7 @@ from app.services.cache_service import (
     CACHE_TTL_LIST,
     CACHE_TTL_ENTITY,
 )
-from app.services.record_permission_service import build_record_permission_filter
+from app.services.record_permission_service import build_record_permission_filter, delete_dependent_record_permissions
 from app.services.select_option_service import ensure_option_ids
 from app.services.translation_service import delete_dependent_translations
 from app.db.redis import get_arq_pool
@@ -401,6 +401,7 @@ async def delete_schema(db: AsyncSession, schema_id: uuid.UUID, actor_id: uuid.U
     await audit_log(db, "schemas", schema_id, "DELETE", actor_id,
                     old_values=old_values, new_values=None)
     await delete_dependent_translations(db, schema_ids=[schema_id])
+    await delete_dependent_record_permissions(db, schema_ids=[schema_id])
     # D-XX: delete object types in leaf-first order (children before parents) to
     # avoid the CircularDependencyError SQLAlchemy raises when a self-referential
     # parent_id (ondelete=CASCADE) makes the delete graph unorderable. The

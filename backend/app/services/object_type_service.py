@@ -22,7 +22,7 @@ from app.services.object_type_attribute_service import (
     collect_descendant_type_ids,
     _invalidate_descendant_resolved_caches,
 )
-from app.services.record_permission_service import build_record_permission_filter
+from app.services.record_permission_service import build_record_permission_filter, delete_dependent_record_permissions
 from app.services.search_service import refresh_index_mapping
 from app.services.translation_service import resolve_translations, delete_dependent_translations, check_schema_multilingual
 from app.db.redis import get_redis, get_arq_pool
@@ -582,6 +582,9 @@ async def delete_object_type(
     # MULTI-07 / D-15: purge the translations of everything the cascade removes
     # (no DB-level backstop exists for the polymorphic entity_id).
     await delete_dependent_translations(
+        db, object_type_ids=[uuid.UUID(tid) for tid in descendant_type_ids]
+    )
+    await delete_dependent_record_permissions(
         db, object_type_ids=[uuid.UUID(tid) for tid in descendant_type_ids]
     )
     await audit_log(db, "object_types", object_type_id, "DELETE", actor_id,

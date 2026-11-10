@@ -41,7 +41,7 @@ from app.services.cache_service import (
     CACHE_TTL_LIST,
     CACHE_TTL_ENTITY,
 )
-from app.services.record_permission_service import build_record_permission_filter, _batch_check_has_deny_record_permission, _batch_check_has_record_permission
+from app.services.record_permission_service import build_record_permission_filter, _batch_check_has_deny_record_permission, _batch_check_has_record_permission, delete_dependent_record_permissions
 from app.services.object_type_service import resolve_ancestor_ota_by_name
 from app.services.value_lock_service import (
     assert_types_deletable,
@@ -1340,6 +1340,7 @@ async def delete_object(
         origin=effective_origin.as_payload(),
     )
     await delete_dependent_translations(db, object_ids=[object_id])
+    await delete_dependent_record_permissions(db, object_ids=[object_id])
     storage_keys = [f.storage_key for f in obj.files]  # capture before deletion — rows vanish with the CASCADE
     outbox_entry = _new_outbox_entry(
         object_id, obj_type_id, "remove", schema_id=obj_schema_id,

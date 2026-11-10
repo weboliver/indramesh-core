@@ -182,11 +182,18 @@ async def _repair_search_indexes(*, apply: bool, as_json: bool) -> dict:
     code and never raises a repair failure into the dispatcher.
     """
     from app.db import async_session_maker, engine
+    from app.db.opensearch import close_opensearch, init_opensearch
     from app.maintenance import search_index_repair
 
+    # The verb runs outside the application lifespan, so nothing has opened the
+    # search client yet: without this, get_opensearch() raised "OpenSearch not
+    # initialized" and every run ended with exit code 2 (release 1.0.1 manual
+    # acceptance, MT-01). An unreachable search backend still fails the run.
     try:
+        await init_opensearch()
         report = await search_index_repair.run_repair(async_session_maker, apply=apply)
     finally:
+        await close_opensearch()
         await engine.dispose()
     logger.info(
         "search index repair report",

@@ -2,7 +2,9 @@ import re
 import uuid
 from typing import Iterable
 
-from sqlalchemy import text, select, func, bindparam, union
+from sqlalchemy import text, select, func, bindparam, union, and_, or_, any_, cast
+from sqlalchemy import delete as sa_delete
+from sqlalchemy.dialects.postgresql import ARRAY, UUID as PGUUID
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException, status
@@ -636,6 +638,94 @@ async def create_record_permission(
     await invalidate_record_permission_cache(record_entity_type, record_id)
 
     return db_assignment
+
+
+def _uuid_any(ids):
+    return any_(cast(list(ids), ARRAY(PGUUID(as_uuid=True))))
+
+
+async def delete_dependent_record_permissions(
+    db: AsyncSession,
+    *,
+    source_id: uuid.UUID | None = None,
+    schema_ids=(),
+    object_type_ids=(),
+    attribute_type_ids=(),
+    object_ids=(),
+) -> None:
+    """Delete the record permissions of everything a delete in this scope removes.
+
+    ``record_id`` has no foreign key, so a deleted record would otherwise leave
+    its rows behind. Runs inside the caller's transaction (no commit here) and
+    must be called before the delete, while the rows that lead to the ids exist.
+    """
+    schemas = set(schema_ids)
+    if source_id is not None:
+        schemas.update(
+            (await db.execute(select(Schema.id).where(Schema.source_id == source_id))).scalars()
+        )
+
+    types = set(object_type_ids)
+    if schemas:
+        types.update(
+            (
+                await db.execute(
+                    select(ObjectType.id).where(ObjectType.schema_id == _uuid_any(schemas))
+                )
+            ).scalars()
+        )
+    # parent_id is ON DELETE CASCADE and a child may live in another schema.
+    frontier = set(types)
+    while frontier:
+        children = set(
+            (
+                await db.execute(
+                    select(ObjectType.id).where(ObjectType.parent_id == _uuid_any(frontier))
+                )
+            ).scalars()
+        )
+        frontier = children - types
+        types |= frontier
+
+    scopes = []
+    if source_id is not None:
+        scopes.append(
+            and_(RecordPermission.record_entity_type == "source",
+                 RecordPermission.record_id == source_id)
+        )
+    if schemas:
+        scopes.append(
+            and_(RecordPermission.record_entity_type == "schema",
+                 RecordPermission.record_id == _uuid_any(schemas))
+        )
+    if types:
+        scopes.append(
+            and_(RecordPermission.record_entity_type == "object_type",
+                 RecordPermission.record_id == _uuid_any(types))
+        )
+    if attribute_type_ids:
+        scopes.append(
+            and_(RecordPermission.record_entity_type == "attribute_type",
+                 RecordPermission.record_id == _uuid_any(attribute_type_ids))
+        )
+    object_scope = []
+    if object_ids:
+        object_scope.append(Object.id == _uuid_any(object_ids))
+    if types:
+        object_scope.append(Object.object_type_id == _uuid_any(types))
+    if schemas:
+        object_scope.append(Object.schema_id == _uuid_any(schemas))
+    if object_scope:
+        scopes.append(
+            and_(RecordPermission.record_entity_type == "object",
+                 RecordPermission.record_id.in_(select(Object.id).where(or_(*object_scope))))
+        )
+    if scopes:
+        await db.execute(
+            sa_delete(RecordPermission)
+            .where(or_(*scopes))
+            .execution_options(synchronize_session=False)
+        )
 
 
 async def delete_record_permission(

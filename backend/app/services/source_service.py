@@ -27,7 +27,7 @@ from app.services.cache_service import (
     CACHE_TTL_LIST,
     CACHE_TTL_ENTITY,
 )
-from app.services.record_permission_service import build_record_permission_filter
+from app.services.record_permission_service import build_record_permission_filter, delete_dependent_record_permissions
 from app.services.audit_service import audit_log, model_to_dict
 from app.services.keygen_service import drop_schema_sequence
 from app.services.schema_service import (
@@ -304,6 +304,7 @@ async def delete_source(db: AsyncSession, source_id: uuid.UUID, actor_id: uuid.U
     await audit_log(db, "sources", source_id, "DELETE", actor_id,
                     old_values=old_values, new_values=None)
     await delete_dependent_translations(db, source_id=source_id)
+    await delete_dependent_record_permissions(db, source_id=source_id)
     # 246 D-10 lifecycle: drop the per-schema keygen SEQUENCEs with the source.
     schema_result = await db.execute(select(Schema.id).where(Schema.source_id == source_id))
     schema_ids = schema_result.scalars().all()
